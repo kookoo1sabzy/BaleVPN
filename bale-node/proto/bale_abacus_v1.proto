@@ -1,0 +1,105 @@
+syntax = "proto3";
+package bale.abacus.v1;
+
+// Service: bale.abacus.v1.Abacus
+service Abacus {
+  rpc LoadReactions (LoadReactionsRequest) returns (LoadReactionsResponse);
+  rpc MessageSetReaction (MessageSetReactionRequest) returns (MessageSetReactionResponse);
+  rpc MessageRemoveReaction (MessageRemoveReactionRequest) returns (MessageRemoveReactionResponse);
+  rpc GetMessagesReactions (GetMessagesReactionsRequest) returns (GetMessagesReactionsResponse);
+  rpc GetMessageReactionsList (GetMessageReactionsListRequest) returns (GetMessageReactionsListResponse);
+  rpc GetMessagesViews (GetMessagesViewsRequest) returns (GetMessagesViewsResponse);
+  rpc EnableShowReactionFlag (EnableShowReactionFlagRequest) returns (EnableShowReactionFlagResponse);
+  rpc GetShowReactionFlag (GetShowReactionFlagRequest) returns (GetShowReactionFlagResponse);
+  rpc MessageReactionsRead (MessageReactionsReadRequest) returns (MessageReactionsReadResponse);
+}
+
+message LoadReactionsRequest {
+  bytes peer = 1;
+  bool ignoreCountViews = 3;
+}
+
+message LoadReactionsResponse {
+  repeated bytes containers = 1;
+}
+
+message MessageSetReactionRequest {
+  bytes peer = 1;
+  int64 rid = 2;
+  string code = 3;
+  int64 date = 4;
+}
+
+message MessageSetReactionResponse {
+  int32 seq = 1;
+  bytes state = 3;
+}
+
+message MessageRemoveReactionRequest {
+  bytes peer = 1;
+  int64 rid = 2;
+  string code = 3;
+  int64 date = 4;
+}
+
+message MessageRemoveReactionResponse {
+  int32 seq = 1;
+  bytes state = 3;
+}
+
+message GetMessagesReactionsRequest {
+  bytes peer = 1;
+  bytes originPeer = 3;
+}
+
+message GetMessagesReactionsResponse {
+  repeated bytes containers = 1;
+}
+
+message GetMessageReactionsListRequest {
+  bytes peer = 1;
+  int64 rid = 2;
+  int64 date = 3;
+  string code = 4;
+  int32 page = 5;
+  int32 limit = 6;
+}
+
+message GetMessageReactionsListResponse {
+  repeated bytes userReactions = 1;
+}
+
+message GetMessagesViewsRequest {
+  bytes peer = 1;
+  bool increment = 3;
+}
+
+message GetMessagesViewsResponse {
+  repeated bytes containers = 1;
+}
+
+message EnableShowReactionFlagRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetShowReactionFlagRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetShowReactionFlagResponse {
+  int32 userId = 1;
+  bool isEnable = 2;
+}
+
+message MessageReactionsReadRequest {
+  bytes peer = 1;
+  bytes messageId = 2;
+}
+
+message EnableShowReactionFlagResponse {
+  // fields not extracted (shared/external type)
+}
+
+message MessageReactionsReadResponse {
+  // fields not extracted (shared/external type)
+}

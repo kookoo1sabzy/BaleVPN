@@ -1,0 +1,192 @@
+syntax = "proto3";
+package bale.bank.v1;
+
+// Service: bale.bank.v1.Bank
+service Bank {
+  rpc GetCardTransferToken (GetCardTransferTokenRequest) returns (GetCardTransferTokenResponse);
+  rpc GetPayMoneyRequestToken (GetPayMoneyRequestTokenRequest) returns (GetPayMoneyRequestTokenResponse);
+  rpc GetRemainToken (GetRemainTokenRequest) returns (GetRemainTokenResponse);
+  rpc GetPayvandCardList (GetPayvandCardListRequest) returns (GetPayvandCardListResponse);
+  rpc GetPayvandCard (GetPayvandCardRequest) returns (GetPayvandCardResponse);
+  rpc GetPSProxyToken (GetPSProxyTokenRequest) returns (GetPSProxyTokenResponse);
+  rpc GetPSProxyPaymentToken (GetPSProxyPaymentTokenRequest) returns (GetPSProxyPaymentTokenResponse);
+  rpc GetSadadPSPPaymentToken (GetSadadPSPPaymentTokenRequest) returns (GetSadadPSPPaymentTokenResponse);
+  rpc GetOTPToken (GetOTPTokenRequest) returns (GetOTPTokenResponse);
+  rpc GetOTPTokenV2 (GetOTPTokenV2Request) returns (GetOTPTokenV2Response);
+  rpc GetOrganizationPaymentToken (GetOrganizationPaymentTokenRequest) returns (GetOrganizationPaymentTokenResponse);
+  rpc GetPaymentToken (GetPaymentTokenRequest) returns (GetPaymentTokenResponse);
+  rpc GetRecentCharges (GetRecentChargesRequest) returns (GetRecentChargesResponse);
+  rpc BuyFastCharge (BuyFastChargeRequest) returns (BuyFastChargeResponse);
+  rpc GrantBankiAccess (GrantBankiAccessRequest) returns (GrantBankiAccessResponse);
+  rpc GetCardRemain (GetCardRemainRequest) returns (GetCardRemainResponse);
+  rpc GetTokenInvoice (GetTokenInvoiceRequest) returns (GetTokenInvoiceResponse);
+}
+
+message GetCardTransferTokenRequest {
+  bytes msgRid = 2;
+}
+
+message GetCardTransferTokenResponse {
+  string requestEndPoint = 1;
+  string token = 2;
+}
+
+message GetPayMoneyRequestTokenRequest {
+  bytes messagePeer = 1;
+  int64 msgRid = 2;
+  int64 msgDate = 3;
+  int32 recipient = 4;
+}
+
+message GetPayMoneyRequestTokenResponse {
+  string requestEndPoint = 1;
+  string token = 2;
+}
+
+message GetRemainTokenRequest {
+  string cardNumberStartingSix = 1;
+}
+
+message GetRemainTokenResponse {
+  string requestEndPoint = 1;
+  string token = 2;
+}
+
+message GetPayvandCardListRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetPayvandCardListResponse {
+  repeated bytes payvandCards = 1;
+}
+
+message GetPayvandCardRequest {
+  string index = 1;
+}
+
+message GetPayvandCardResponse {
+  string card = 1;
+}
+
+message GetPSProxyTokenRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetPSProxyTokenResponse {
+  string endpoint = 1;
+  string token = 2;
+}
+
+message GetPSProxyPaymentTokenRequest {
+  int64 paymentAmount = 1;
+  bytes msg = 2;
+}
+
+message GetPSProxyPaymentTokenResponse {
+  string endpoint = 1;
+  string token = 2;
+}
+
+message GetSadadPSPPaymentTokenRequest {
+  bytes msg = 1;
+  int64 paymentAmount = 2;
+}
+
+message GetSadadPSPPaymentTokenResponse {
+  string endpoint = 1;
+  string token = 2;
+  string terminalId = 3;
+  string merchantCode = 4;
+}
+
+message GetOTPTokenRequest {
+  string cardNumberStartingSix = 1;
+}
+
+message GetOTPTokenResponse {
+  string requestEndPoint = 1;
+  string token = 2;
+}
+
+message GetOTPTokenV2Request {
+  bytes messagePeer = 1;
+  int64 msgRid = 2;
+  int64 msgDate = 3;
+  string cardNumberStartingSix = 5;
+}
+
+message GetOTPTokenV2Response {
+  string requestEndPoint = 1;
+  string token = 2;
+}
+
+message GetOrganizationPaymentTokenRequest {
+  string organizationId = 1;
+  string invoiceId = 2;
+  int64 amount = 3;
+}
+
+message GetOrganizationPaymentTokenResponse {
+  string token = 1;
+  string billHolderName = 2;
+  double amount = 3;
+}
+
+message GetPaymentTokenRequest {
+  bytes msg = 1;
+}
+
+message GetPaymentTokenResponse {
+  string token = 1;
+  string endpoint = 2;
+  bytes orderId = 5;
+}
+
+message GetRecentChargesRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetRecentChargesResponse {
+  repeated bytes recentCharges = 1;
+}
+
+message BuyFastChargeRequest {
+  int64 amount = 1;
+  int32 operator = 3;
+  int32 chargeType = 4;
+}
+
+message BuyFastChargeResponse {
+  int64 transactionDate = 1;
+  string refrenceNumber = 2;
+}
+
+message GrantBankiAccessRequest {
+  bytes bot = 1;
+  string serviceKey = 2;
+}
+
+message GetCardRemainRequest {
+  string cardNumber = 1;
+  string cvv2 = 2;
+  string expireDate = 3;
+  string pin2 = 4;
+}
+
+message GetCardRemainResponse {
+  string currentBalanceAmount = 1;
+  string availableBalanceAmount = 2;
+}
+
+message GetTokenInvoiceRequest {
+  int32 service = 1;
+}
+
+message GetTokenInvoiceResponse {
+  string endpoint = 1;
+  string token = 2;
+}
+
+message GrantBankiAccessResponse {
+  // fields not extracted (shared/external type)
+}

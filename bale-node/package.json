@@ -1,0 +1,35 @@
+{
+  "name": "bale-node",
+  "version": "1.0.0",
+  "description": "Bale messenger protobuf message codecs",
+  "main": "src/index.js",
+  "bin": "src/ws-client.js",
+  "scripts": {
+    "build": "npx pbjs -t static-module -w commonjs -o src/messages.js proto/*.proto && npx pbts -o src/messages.d.ts src/messages.js",
+    "build-tun": "node-gyp configure build",
+    "ui": "node src/ws-client.js",
+    "package": "pkg . --out-path dist"
+  },
+  "pkg": {
+    "targets": [
+      "node18-macos-arm64",
+      "node18-macos-x64",
+      "node18-linux-x64",
+      "node18-win-x64"
+    ],
+    "outputPath": "dist",
+    "assets": [
+      "node_modules/@livekit/rtc-node/build/**",
+      "node_modules/@livekit/rtc-node/prebuilds/**"
+    ]
+  },
+  "dependencies": {
+    "@livekit/rtc-node": "^0.13.25",
+    "node-addon-api": "^8.0.0",
+    "protobufjs": "^7.4.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}
