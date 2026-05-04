@@ -1,0 +1,26 @@
+syntax = "proto3";
+package bale.message_stream.v1;
+
+// Service: bale.message_stream.v1.MessageStream
+service MessageStream {
+  rpc ReceiveMessageStream (ReceiveMessageStreamRequest) returns (ReceiveMessageStreamResponse);
+  rpc CancelMessageStream (CancelMessageStreamRequest) returns (CancelMessageStreamResponse);
+}
+
+message ReceiveMessageStreamRequest {
+  bytes exPeer = 1;
+  bytes messageId = 2;
+}
+
+message ReceiveMessageStreamResponse {
+  // (no fields extracted — empty or complex message)
+}
+
+message CancelMessageStreamRequest {
+  bytes exPeer = 1;
+  bytes messageId = 2;
+}
+
+message CancelMessageStreamResponse {
+  // (no fields extracted — empty or complex message)
+}

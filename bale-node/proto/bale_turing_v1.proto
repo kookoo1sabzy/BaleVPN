@@ -1,0 +1,27 @@
+syntax = "proto3";
+package bale.turing.v1;
+
+// Service: bale.turing.v1.AI
+service AI {
+  rpc GetTranscript (GetTranscriptRequest) returns (GetTranscriptResponse);
+  rpc SendEvent (SendEventRequest) returns (SendEventResponse);
+}
+
+message GetTranscriptRequest {
+  bytes voice = 1;
+  bytes outPeer = 2;
+  bytes messageId = 3;
+}
+
+message GetTranscriptResponse {
+  bool mustWait = 1;
+  bytes downloadSource = 2;
+}
+
+message SendEventRequest {
+  bytes transcriptReactionEvent = 1;
+}
+
+message SendEventResponse {
+  // fields not extracted (shared/external type)
+}
