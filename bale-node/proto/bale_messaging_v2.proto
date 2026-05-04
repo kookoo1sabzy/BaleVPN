@@ -1,0 +1,441 @@
+syntax = "proto3";
+package bale.messaging.v2;
+
+// Service: bale.messaging.v2.Messaging
+service Messaging {
+  rpc SendMessage (SendMessageRequest) returns (SendMessageResponse);
+  rpc ForwardMessages (ForwardMessagesRequest) returns (ForwardMessagesResponse);
+  rpc SendMultiMediaMessage (SendMultiMediaMessageRequest) returns (SendMultiMediaMessageResponse);
+  rpc UpdateMessage (UpdateMessageRequest) returns (UpdateMessageResponse);
+  rpc MessageReceived (MessageReceivedRequest) returns (MessageReceivedResponse);
+  rpc MessageRead (MessageReadRequest) returns (MessageReadResponse);
+  rpc DeleteMessage (DeleteMessageRequest) returns (DeleteMessageResponse);
+  rpc ClearChat (ClearChatRequest) returns (ClearChatResponse);
+  rpc DeleteChat (DeleteChatRequest) returns (DeleteChatResponse);
+  rpc LoadHistory (LoadHistoryRequest) returns (LoadHistoryResponse);
+  rpc LoadDialogs (LoadDialogsRequest) returns (LoadDialogsResponse);
+  rpc LoadGroupedDialogs (LoadGroupedDialogsRequest) returns (LoadGroupedDialogsResponse);
+  rpc LoadPeerDialogs (LoadPeerDialogsRequest) returns (LoadPeerDialogsResponse);
+  rpc CreateThread (CreateThreadRequest) returns (CreateThreadResponse);
+  rpc GetDiscussionMessage (GetDiscussionMessageRequest) returns (GetDiscussionMessageResponse);
+  rpc GetMessagesRepliesInfo (GetMessagesRepliesInfoRequest) returns (GetMessagesRepliesInfoResponse);
+  rpc PinDialogs (PinDialogsRequest) returns (PinDialogsResponse);
+  rpc LoadPinnedDialogs (LoadPinnedDialogsRequest) returns (LoadPinnedDialogsResponse);
+  rpc UnpinDialogs (UnpinDialogsRequest) returns (UnpinDialogsResponse);
+  rpc ReorderPinnedDialogs (ReorderPinnedDialogsRequest) returns (ReorderPinnedDialogsResponse);
+  rpc MentionRead (MentionReadRequest) returns (MentionReadResponse);
+  rpc CreateFolder (CreateFolderRequest) returns (CreateFolderResponse);
+  rpc CreateReservedFolder (CreateReservedFolderRequest) returns (CreateReservedFolderResponse);
+  rpc LoadFolders (LoadFoldersRequest) returns (LoadFoldersResponse);
+  rpc ReorderFolders (ReorderFoldersRequest) returns (ReorderFoldersResponse);
+  rpc DeleteFolder (DeleteFolderRequest) returns (DeleteFolderResponse);
+  rpc EditFolder (EditFolderRequest) returns (EditFolderResponse);
+  rpc LoadFolderDialogs (LoadFolderDialogsRequest) returns (LoadFolderDialogsResponse);
+  rpc FetchProtectedMessage (FetchProtectedMessageRequest) returns (FetchProtectedMessageResponse);
+  rpc MarkDialogsAsUnread (MarkDialogsAsUnreadRequest) returns (MarkDialogsAsUnreadResponse);
+  rpc MarkDialogsAsRead (MarkDialogsAsReadRequest) returns (MarkDialogsAsReadResponse);
+  rpc PinMessage (PinMessageRequest) returns (PinMessageResponse);
+  rpc UnPinMessages (UnPinMessagesRequest) returns (UnPinMessagesResponse);
+  rpc LoadPinnedMessages (LoadPinnedMessagesRequest) returns (LoadPinnedMessagesResponse);
+  rpc LoadPeers (LoadPeersRequest) returns (LoadPeersResponse);
+  rpc ArchiveDialogs (ArchiveDialogsRequest) returns (ArchiveDialogsResponse);
+  rpc UnArchiveDialogs (UnArchiveDialogsRequest) returns (UnArchiveDialogsResponse);
+  rpc CreateTopic (CreateTopicRequest) returns (CreateTopicResponse);
+  rpc EditTopic (EditTopicRequest) returns (EditTopicResponse);
+  rpc GetTopics (GetTopicsRequest) returns (GetTopicsResponse);
+  rpc GetTopicByID (GetTopicByIDRequest) returns (GetTopicByIDResponse);
+}
+
+message SendMessageRequest {
+  bytes peer = 1;
+  int64 rid = 2;
+  bytes message = 3;
+  bytes quotedMessageReference = 5;
+  bytes exPeer = 6;
+  bool isSilent = 7;
+  bytes threadId = 8;
+}
+
+message ForwardMessagesRequest {
+  bytes peer = 1;
+  bytes groupedId = 4;
+}
+
+message SendMultiMediaMessageRequest {
+  bytes peer = 1;
+  bytes repliedMessage = 3;
+  int64 groupedId = 4;
+}
+
+message UpdateMessageRequest {
+  bytes peer = 1;
+  int64 rid = 2;
+  bytes updatedMessage = 3;
+}
+
+message MessageReceivedRequest {
+  bytes peer = 1;
+  int64 date = 2;
+}
+
+message MessageReadRequest {
+  bytes peer = 1;
+  int64 date = 2;
+  bytes exPeer = 3;
+}
+
+message DeleteMessageRequest {
+  bytes peer = 1;
+  bytes dates = 3;
+}
+
+message ClearChatRequest {
+  bytes peer = 1;
+}
+
+message DeleteChatRequest {
+  bytes peer = 1;
+}
+
+message LoadHistoryRequest {
+  bytes peer = 1;
+  int64 date = 2;
+  int32 loadMode = 4;
+  int32 limit = 5;
+}
+
+message LoadHistoryResponse {
+  repeated bytes history = 1;
+  repeated bytes users = 2;
+  repeated bytes userPeers = 3;
+  repeated bytes groups = 4;
+  repeated bytes groupPeers = 5;
+}
+
+message LoadDialogsRequest {
+  int64 minDate = 1;
+  int32 limit = 2;
+  int32 dialogType = 4;
+  bool excludePinnedDialogs = 5;
+  int32 archiveFilter = 6;
+}
+
+message LoadDialogsResponse {
+  repeated bytes groups = 1;
+  repeated bytes users = 2;
+  repeated bytes dialogs = 3;
+  repeated bytes userPeers = 4;
+  repeated bytes groupPeers = 5;
+}
+
+message LoadGroupedDialogsRequest {
+  int32 archiveFilter = 2;
+}
+
+message LoadGroupedDialogsResponse {
+  repeated bytes dialogs = 1;
+  repeated bytes users = 2;
+  repeated bytes groups = 3;
+  repeated bytes groupPeers = 7;
+}
+
+message LoadPeerDialogsRequest {
+  repeated bytes peers = 1;
+}
+
+message LoadPeerDialogsResponse {
+  repeated bytes dialogs = 1;
+  repeated bytes groups = 2;
+  repeated bytes users = 3;
+  repeated bytes userPeers = 4;
+  repeated bytes groupPeers = 5;
+}
+
+message CreateThreadRequest {
+  bytes peer = 1;
+  int64 date = 2;
+  int64 randomId = 3;
+  string title = 4;
+}
+
+message CreateThreadResponse {
+  int32 threadId = 1;
+}
+
+message GetDiscussionMessageRequest {
+  bytes peer = 1;
+  bytes messageId = 2;
+}
+
+message GetDiscussionMessageResponse {
+  repeated bytes history = 1;
+  repeated bytes users = 2;
+  repeated bytes userPeers = 3;
+}
+
+message GetMessagesRepliesInfoRequest {
+  bytes peer = 1;
+}
+
+message GetMessagesRepliesInfoResponse {
+  repeated bytes containers = 1;
+}
+
+message PinDialogsRequest {
+  repeated bytes peers = 1;
+  int32 folderId = 2;
+}
+
+message PinDialogsResponse {
+  repeated bytes dialogs = 1;
+  repeated bytes peers = 2;
+}
+
+message LoadPinnedDialogsRequest {
+  int32 folderId = 1;
+}
+
+message LoadPinnedDialogsResponse {
+  repeated bytes dialogs = 1;
+}
+
+message UnpinDialogsRequest {
+  repeated bytes peers = 1;
+  int32 folderId = 2;
+}
+
+message ReorderPinnedDialogsRequest {
+  repeated bytes peers = 1;
+  int32 folderId = 2;
+}
+
+message ReorderPinnedDialogsResponse {
+  repeated bytes dialogs = 1;
+  repeated bytes peers = 2;
+}
+
+message MentionReadRequest {
+  bytes peer = 1;
+  bytes messageId = 2;
+}
+
+message CreateFolderRequest {
+  string name = 1;
+}
+
+message CreateFolderResponse {
+  int32 folderId = 1;
+  int32 index = 2;
+}
+
+message CreateReservedFolderRequest {
+  int32 folderId = 1;
+}
+
+message CreateReservedFolderResponse {
+  int32 index = 1;
+}
+
+message LoadFoldersRequest {
+  bool includeMutedUnreadPeers = 1;
+}
+
+message LoadFoldersResponse {
+  repeated bytes folders = 1;
+  repeated bytes unreadPeers = 2;
+}
+
+message ReorderFoldersRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message ReorderFoldersResponse {
+  // (no fields extracted — empty or complex message)
+}
+
+message DeleteFolderRequest {
+  int32 folderId = 1;
+}
+
+message EditFolderRequest {
+  int32 folderId = 1;
+  string name = 2;
+  repeated bytes deletedPeers = 4;
+}
+
+message EditFolderResponse {
+  repeated bytes unreadPeers = 1;
+}
+
+message LoadFolderDialogsRequest {
+  int64 minDate = 1;
+  int32 limit = 2;
+  int32 folderId = 3;
+  int32 archiveFilter = 4;
+}
+
+message LoadFolderDialogsResponse {
+  repeated bytes dialogs = 1;
+}
+
+message FetchProtectedMessageRequest {
+  bytes peer = 1;
+  bytes messageId = 2;
+}
+
+message FetchProtectedMessageResponse {
+  bytes history = 1;
+}
+
+message MarkDialogsAsUnreadRequest {
+  repeated bytes peers = 1;
+}
+
+message MarkDialogsAsReadRequest {
+  repeated bytes peers = 1;
+}
+
+message PinMessageRequest {
+  bytes peer = 1;
+  bytes messageId = 2;
+  bool justMine = 3;
+}
+
+message UnPinMessagesRequest {
+  bytes peer = 1;
+  bool all = 3;
+}
+
+message LoadPinnedMessagesRequest {
+  bytes peer = 1;
+}
+
+message LoadPinnedMessagesResponse {
+  repeated bytes pinnedMessages = 1;
+}
+
+message LoadPeersRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message LoadPeersResponse {
+  repeated bytes exPeers = 1;
+}
+
+message ArchiveDialogsRequest {
+  repeated bytes exPeers = 1;
+}
+
+message UnArchiveDialogsRequest {
+  repeated bytes exPeers = 1;
+}
+
+message CreateTopicRequest {
+  bytes exPeer = 1;
+  string title = 2;
+}
+
+message CreateTopicResponse {
+  bytes topicId = 1;
+}
+
+message EditTopicRequest {
+  bytes exPeer = 1;
+  bytes topicId = 2;
+  string title = 3;
+}
+
+message GetTopicsRequest {
+  bytes exPeer = 1;
+  int64 minDate = 2;
+  int32 limit = 3;
+}
+
+message GetTopicsResponse {
+  repeated bytes topics = 1;
+}
+
+message GetTopicByIDRequest {
+  bytes exPeer = 1;
+  bytes topicId = 2;
+}
+
+message ArchiveDialogsResponse {
+  // fields not extracted (shared/external type)
+}
+
+message ClearChatResponse {
+  // fields not extracted (shared/external type)
+}
+
+message DeleteChatResponse {
+  // fields not extracted (shared/external type)
+}
+
+message DeleteFolderResponse {
+  // fields not extracted (shared/external type)
+}
+
+message DeleteMessageResponse {
+  // fields not extracted (shared/external type)
+}
+
+message EditTopicResponse {
+  // fields not extracted (shared/external type)
+}
+
+message ForwardMessagesResponse {
+  // fields not extracted (shared/external type)
+}
+
+message GetTopicByIDResponse {
+  // fields not extracted (shared/external type)
+}
+
+message MarkDialogsAsReadResponse {
+  // fields not extracted (shared/external type)
+}
+
+message MarkDialogsAsUnreadResponse {
+  // fields not extracted (shared/external type)
+}
+
+message MentionReadResponse {
+  // fields not extracted (shared/external type)
+}
+
+message MessageReadResponse {
+  // fields not extracted (shared/external type)
+}
+
+message MessageReceivedResponse {
+  // fields not extracted (shared/external type)
+}
+
+message PinMessageResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SendMessageResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SendMultiMediaMessageResponse {
+  // fields not extracted (shared/external type)
+}
+
+message UnArchiveDialogsResponse {
+  // fields not extracted (shared/external type)
+}
+
+message UnPinMessagesResponse {
+  // fields not extracted (shared/external type)
+}
+
+message UnpinDialogsResponse {
+  // fields not extracted (shared/external type)
+}
+
+message UpdateMessageResponse {
+  // fields not extracted (shared/external type)
+}

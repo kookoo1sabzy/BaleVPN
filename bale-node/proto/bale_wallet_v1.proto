@@ -1,0 +1,149 @@
+syntax = "proto3";
+package bale.wallet.v1;
+
+// Service: bale.wallet.v1.Wallet
+service Wallet {
+  rpc GetMyWallets (GetMyWalletsRequest) returns (GetMyWalletsResponse);
+  rpc GetWalletChargeToken (GetWalletChargeTokenRequest) returns (GetWalletChargeTokenResponse);
+  rpc PayByWallet (PayByWalletRequest) returns (PayByWalletResponse);
+  rpc GetPaymentTokenByCard (GetPaymentTokenByCardRequest) returns (GetPaymentTokenByCardResponse);
+  rpc VerifyQRCode (VerifyQRCodeRequest) returns (VerifyQRCodeResponse);
+  rpc PayMoneyRequestByWallet (PayMoneyRequestByWalletRequest) returns (PayMoneyRequestByWalletResponse);
+  rpc GetWalletInvoice (GetWalletInvoiceRequest) returns (GetWalletInvoiceResponse);
+  rpc VerifyCashOut (VerifyCashOutRequest) returns (VerifyCashOutResponse);
+  rpc CashOutFromWallet (CashOutFromWalletRequest) returns (CashOutFromWalletResponse);
+  rpc VerifyPeer (VerifyPeerRequest) returns (VerifyPeerResponse);
+  rpc GetWalletContracts (GetWalletContractsRequest) returns (GetWalletContractsResponse);
+  rpc ActivateWallet (ActivateWalletRequest) returns (ActivateWalletResponse);
+  rpc GetMoneyRequestPaymentTokenByCard (GetMoneyRequestPaymentTokenByCardRequest) returns (GetMoneyRequestPaymentTokenByCardResponse);
+}
+
+message GetMyWalletsRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetMyWalletsResponse {
+  repeated bytes wallets = 1;
+}
+
+message GetWalletChargeTokenRequest {
+  string walletId = 1;
+  int64 amount = 2;
+}
+
+message GetWalletChargeTokenResponse {
+  string token = 1;
+  string endpoint = 2;
+  string terminalId = 3;
+  string merchantId = 4;
+}
+
+message PayByWalletRequest {
+  string sourceWallet = 1;
+  string targetWallet = 2;
+  int64 amount = 3;
+  int32 currency = 4;
+}
+
+message GetPaymentTokenByCardRequest {
+  string targetWallet = 1;
+  int64 amount = 2;
+}
+
+message GetPaymentTokenByCardResponse {
+  string token = 1;
+  string endpoint = 2;
+  string terminalId = 3;
+  string merchantId = 4;
+}
+
+message VerifyQRCodeRequest {
+  string targetWalletId = 1;
+}
+
+message VerifyQRCodeResponse {
+  string targetWalletName = 1;
+}
+
+message PayMoneyRequestByWalletRequest {
+  string sourceWalletId = 1;
+  bytes msg = 2;
+  bytes amount = 3;
+}
+
+message GetWalletInvoiceRequest {
+  string walletId = 1;
+}
+
+message GetWalletInvoiceResponse {
+  repeated bytes invoices = 1;
+}
+
+message VerifyCashOutRequest {
+  string walletId = 1;
+  string accountNo = 2;
+  string nationalId = 3;
+}
+
+message VerifyCashOutResponse {
+  string token = 1;
+  string name = 2;
+}
+
+message CashOutFromWalletRequest {
+  string token = 1;
+  int64 amount = 2;
+}
+
+message VerifyPeerRequest {
+  bytes targetPeer = 1;
+}
+
+message VerifyPeerResponse {
+  string targetWalletName = 1;
+  string walletId = 3;
+}
+
+message GetWalletContractsRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetWalletContractsResponse {
+  int64 startDate = 1;
+  int64 endDate = 2;
+  string merchantCustomerUniqueValue = 3;
+  string agreementId = 5;
+  int32 status = 6;
+}
+
+message ActivateWalletRequest {
+  string nationalId = 1;
+}
+
+message GetMoneyRequestPaymentTokenByCardRequest {
+  bytes msg = 1;
+  bytes amount = 2;
+}
+
+message GetMoneyRequestPaymentTokenByCardResponse {
+  string token = 1;
+  string endpoint = 2;
+  string terminalId = 3;
+  string merchantId = 4;
+}
+
+message ActivateWalletResponse {
+  // fields not extracted (shared/external type)
+}
+
+message CashOutFromWalletResponse {
+  // fields not extracted (shared/external type)
+}
+
+message PayByWalletResponse {
+  // fields not extracted (shared/external type)
+}
+
+message PayMoneyRequestByWalletResponse {
+  // fields not extracted (shared/external type)
+}

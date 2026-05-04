@@ -1,0 +1,109 @@
+syntax = "proto3";
+package bale.presence.v1;
+
+// Service: bale.presence.v1.Presence
+service Presence {
+  rpc Typing (TypingRequest) returns (TypingResponse);
+  rpc StopTyping (StopTypingRequest) returns (StopTypingResponse);
+  rpc SetOnline (SetOnlineRequest) returns (SetOnlineResponse);
+  rpc SubscribeToOnline (SubscribeToOnlineRequest) returns (SubscribeToOnlineResponse);
+  rpc SubscribeFromOnline (SubscribeFromOnlineRequest) returns (SubscribeFromOnlineResponse);
+  rpc SubscribeToGroupOnline (SubscribeToGroupOnlineRequest) returns (SubscribeToGroupOnlineResponse);
+  rpc SubscribeFromGroupOnline (SubscribeFromGroupOnlineRequest) returns (SubscribeFromGroupOnlineResponse);
+  rpc GetGroupOnlineCount (GetGroupOnlineCountRequest) returns (GetGroupOnlineCountResponse);
+  rpc GetContactsPresences (GetContactsPresencesRequest) returns (GetContactsPresencesResponse);
+  rpc GetGroupMembersPresences (GetGroupMembersPresencesRequest) returns (GetGroupMembersPresencesResponse);
+  rpc GetUsersPresence (GetUsersPresenceRequest) returns (GetUsersPresenceResponse);
+}
+
+message TypingRequest {
+  bytes peer = 1;
+  int32 typingType = 3;
+}
+
+message StopTypingRequest {
+  bytes peer = 1;
+  int32 typingType = 2;
+}
+
+message SetOnlineRequest {
+  bool isOnline = 1;
+  int64 timeout = 2;
+  int32 deviceType = 3;
+}
+
+message SubscribeToOnlineRequest {
+  repeated bytes users = 1;
+}
+
+message SubscribeFromOnlineRequest {
+  repeated bytes users = 1;
+}
+
+message SubscribeToGroupOnlineRequest {
+  repeated bytes groups = 1;
+}
+
+message SubscribeFromGroupOnlineRequest {
+  repeated bytes groups = 1;
+}
+
+message GetGroupOnlineCountRequest {
+  bytes peer = 1;
+}
+
+message GetGroupOnlineCountResponse {
+  int32 count = 1;
+}
+
+message GetContactsPresencesRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetContactsPresencesResponse {
+  repeated bytes presences = 1;
+}
+
+message GetGroupMembersPresencesRequest {
+  bytes peer = 1;
+}
+
+message GetGroupMembersPresencesResponse {
+  repeated bytes presences = 1;
+}
+
+message GetUsersPresenceRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetUsersPresenceResponse {
+  repeated bytes presences = 1;
+}
+
+message SetOnlineResponse {
+  // fields not extracted (shared/external type)
+}
+
+message StopTypingResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SubscribeFromGroupOnlineResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SubscribeFromOnlineResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SubscribeToGroupOnlineResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SubscribeToOnlineResponse {
+  // fields not extracted (shared/external type)
+}
+
+message TypingResponse {
+  // fields not extracted (shared/external type)
+}
