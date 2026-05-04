@@ -1,0 +1,108 @@
+syntax = "proto3";
+package bale.v1;
+
+// Service: bale.v1.Images
+service Images {
+  rpc AddGif (AddGifRequest) returns (AddGifResponse);
+  rpc RemoveGif (RemoveGifRequest) returns (RemoveGifResponse);
+  rpc GetSavedGifs (GetSavedGifsRequest) returns (GetSavedGifsResponse);
+  rpc UseGif (UseGifRequest) returns (UseGifResponse);
+  rpc LoadOwnStickers (LoadOwnStickersRequest) returns (LoadOwnStickersResponse);
+  rpc AddStickerCollection (AddStickerCollectionRequest) returns (AddStickerCollectionResponse);
+  rpc RemoveStickerCollection (RemoveStickerCollectionRequest) returns (RemoveStickerCollectionResponse);
+  rpc LoadStickerCollection (LoadStickerCollectionRequest) returns (LoadStickerCollectionResponse);
+  rpc AddStickerPack (AddStickerPackRequest) returns (AddStickerPackResponse);
+  rpc RemoveStickerPack (RemoveStickerPackRequest) returns (RemoveStickerPackResponse);
+}
+
+message AddGifRequest {
+  bytes gif = 1;
+  bytes thumb = 2;
+  bytes mimeType = 3;
+}
+
+message RemoveGifRequest {
+  bytes gif = 1;
+}
+
+message GetSavedGifsRequest {
+  bytes offset = 1;
+}
+
+message GetSavedGifsResponse {
+  repeated bytes gifs = 1;
+  bytes offset = 2;
+}
+
+message UseGifRequest {
+  bytes gif = 1;
+  int64 usedAt = 2;
+}
+
+message LoadOwnStickersRequest {
+  bytes offset = 1;
+}
+
+message LoadOwnStickersResponse {
+  repeated bytes ownStickers = 1;
+  bytes offset = 2;
+}
+
+message AddStickerCollectionRequest {
+  int32 id = 1;
+  int64 accessHash = 2;
+}
+
+message AddStickerCollectionResponse {
+  repeated bytes collections = 1;
+  int32 seq = 2;
+  bytes state = 3;
+}
+
+message RemoveStickerCollectionRequest {
+  int32 id = 1;
+  int64 accessHash = 2;
+}
+
+message RemoveStickerCollectionResponse {
+  repeated bytes collections = 1;
+  int32 seq = 2;
+  bytes state = 3;
+}
+
+message LoadStickerCollectionRequest {
+  int32 id = 1;
+  int64 accessHash = 2;
+}
+
+message LoadStickerCollectionResponse {
+  bytes collection = 1;
+}
+
+message AddStickerPackRequest {
+  int32 id = 1;
+}
+
+message RemoveStickerPackRequest {
+  int32 id = 1;
+}
+
+message AddGifResponse {
+  // fields not extracted (shared/external type)
+}
+
+message AddStickerPackResponse {
+  // fields not extracted (shared/external type)
+}
+
+message RemoveGifResponse {
+  // fields not extracted (shared/external type)
+}
+
+message RemoveStickerPackResponse {
+  // fields not extracted (shared/external type)
+}
+
+message UseGifResponse {
+  // fields not extracted (shared/external type)
+}

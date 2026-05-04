@@ -1,0 +1,71 @@
+syntax = "proto3";
+package bale.premium.v1;
+
+// Service: bale.premium.v1.Premium
+service Premium {
+  rpc IsPremium (IsPremiumRequest) returns (IsPremiumResponse);
+  rpc IsPremiumBatch (IsPremiumBatchRequest) returns (IsPremiumBatchResponse);
+  rpc PurchasePackage (PurchasePackageRequest) returns (PurchasePackageResponse);
+  rpc CalculateDiscountedPrice (CalculateDiscountedPriceRequest) returns (CalculateDiscountedPriceResponse);
+  rpc GetPackages (GetPackagesRequest) returns (GetPackagesResponse);
+  rpc GetBadges (GetBadgesRequest) returns (GetBadgesResponse);
+  rpc SetUserBadge (SetUserBadgeRequest) returns (SetUserBadgeResponse);
+}
+
+message IsPremiumRequest {
+  int32 userId = 1;
+  bytes withDetailOption = 2;
+}
+
+message IsPremiumResponse {
+  bytes userStatus = 1;
+}
+
+message IsPremiumBatchRequest {
+  bytes withDetailOption = 2;
+}
+
+message IsPremiumBatchResponse {
+  repeated bytes usersStatus = 1;
+}
+
+message PurchasePackageRequest {
+  int64 packageId = 1;
+}
+
+message PurchasePackageResponse {
+  string sadadPaymentToken = 1;
+}
+
+message CalculateDiscountedPriceRequest {
+  int64 packageId = 1;
+  string couponCode = 2;
+}
+
+message CalculateDiscountedPriceResponse {
+  int64 discountedPrice = 1;
+}
+
+message GetPackagesRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetPackagesResponse {
+  repeated bytes packages = 1;
+}
+
+message GetBadgesRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetBadgesResponse {
+  repeated bytes categories = 1;
+}
+
+message SetUserBadgeRequest {
+  int64 badgeId = 1;
+}
+
+message SetUserBadgeResponse {
+  // fields not extracted (shared/external type)
+}

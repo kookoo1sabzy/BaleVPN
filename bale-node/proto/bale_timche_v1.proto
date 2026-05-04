@@ -1,0 +1,60 @@
+syntax = "proto3";
+package bale.timche.v1;
+
+// Service: bale.timche.v1.Timche
+service Timche {
+  rpc SubmitReview (SubmitReviewRequest) returns (SubmitReviewResponse);
+  rpc GetBotPage (GetBotPageRequest) returns (GetBotPageResponse);
+  rpc GetHomePage (GetHomePageRequest) returns (GetHomePageResponse);
+  rpc GetSectionPage (GetSectionPageRequest) returns (GetSectionPageResponse);
+  rpc AskBotReviewCallback (AskBotReviewCallbackRequest) returns (AskBotReviewCallbackResponse);
+}
+
+message SubmitReviewRequest {
+  int32 botId = 1;
+  int32 origin = 5;
+}
+
+message SubmitReviewResponse {
+  bool shouldAskBaleReview = 1;
+  string baleReviewText = 2;
+}
+
+message GetBotPageRequest {
+  int32 botId = 1;
+}
+
+message GetBotPageResponse {
+  string name = 1;
+  string nickname = 2;
+  int32 activeUsers = 3;
+  string description = 5;
+  string intro = 6;
+  bytes avatar = 7;
+}
+
+message GetHomePageRequest {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetHomePageResponse {
+  repeated bytes sections = 1;
+}
+
+message GetSectionPageRequest {
+  int32 sectionId = 1;
+}
+
+message GetSectionPageResponse {
+  int32 sectionId = 1;
+  string sectionName = 2;
+}
+
+message AskBotReviewCallbackRequest {
+  int32 botId = 1;
+  string payload = 2;
+}
+
+message AskBotReviewCallbackResponse {
+  // (no fields extracted — empty or complex message)
+}
