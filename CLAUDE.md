@@ -8,6 +8,20 @@ A reverse-engineering research project for the **Bale messenger** web app (`web.
 - A Node.js package (`bale-proto/`) for encoding/decoding messages over Bale's WebSocket API, with a SOCKS5 proxy tunnel and WebRTC data-channel transport
 - A Kotlin Multiplatform Android VPN app (`bale-android/`) that runs in either **client mode** (routes the device's traffic through a peer-hosted tunnel) or **server mode** (accepts calls from peers and bridges their traffic to the internet via an in-process userspace TCP/IP stack — no root, no kernel TUN, no iptables)
 
+## Supported features
+
+| Role | Platform | SOCKS5 | VPN (TUN) |
+|---|---|:---:|:---:|
+| Client | Node.js (any OS) | ✓ | — |
+| Client | Android | — | ✓ kernel TUN via `VpnService` |
+| Server | Node.js (any OS) | ✓ | — |
+| Server | Node.js **Linux** | ✓ | ✓ kernel TUN (`setcap cap_net_admin` + iptables MASQUERADE) |
+| Server | Android | — | ✓ in-process userspace TCP/IP NAT (`PacketProcessor`, no root) |
+
+**Most convenient: Android server + Android client** — install APK on both devices, no command line, no firewall rules. The Android server's userspace TCP/IP stack handles routing and NAT inside the app process.
+
+**Best throughput: Linux Node server + Android client** — on Linux the kernel does the IP routing (TUN device) and the NAT (`iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE` — one-time setup, plus `setcap cap_net_admin+eip $(which node)` so Node can manage the TUN without root). Both kernel paths are substantially faster than the userspace alternatives. The Android server's userspace stack is fully featured but slower than kernel TUN; pick it when root or Linux isn't available.
+
 ## Three-Step Pipeline
 
 ### 1. Download web app assets

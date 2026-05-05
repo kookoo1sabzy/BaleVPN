@@ -97,6 +97,24 @@ A connected client picks any of their Bale contacts to act as a tunnel server. T
 
 ---
 
+## Supported features
+
+| Role | Platform | SOCKS5 proxy | VPN (full IP routing) |
+|---|---|:---:|:---:|
+| Client | Node.js — Linux / macOS / Windows | ✓ | — |
+| Client | Android | — | ✓ &nbsp;*(kernel TUN via `VpnService`)* |
+| Server | Node.js — Linux / macOS / Windows | ✓ | — |
+| Server | Node.js — **Linux** | ✓ | ✓ &nbsp;*(kernel TUN; needs `setcap cap_net_admin` + iptables MASQUERADE)* |
+| Server | Android | — | ✓ &nbsp;*(in-process userspace TCP/IP NAT; no root, no kernel TUN, no iptables)* |
+
+> **Most convenient: Android server + Android client.** Two phones, install the APK on both, sign in to Bale, flip the toggle. No root, no command line, no firewall rules — the Android server's in-process userspace TCP/IP stack handles routing and NAT entirely inside the app.
+>
+> **Best throughput: Linux Node server + Android client.** On Linux the kernel does the IP routing (kernel TUN device) and the NAT (`iptables` MASQUERADE rule), both of which are substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
+
+The Node.js side is platform-agnostic for **SOCKS5** in both directions — pick any OS for either end. Full **VPN** routing on the Node side is Linux-only because it relies on the kernel TUN device and `iptables`-managed NAT. The Linux server therefore needs a one-time setup: `setcap cap_net_admin+eip $(which node)` (so the Node process can manage the TUN interface without root) and a single `iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE` rule (so kernel NAT translates client traffic out the host's real interface). The Android app does not expose a SOCKS5 mode; it always uses the system VPN.
+
+---
+
 ## Architecture
 
 ```
