@@ -1,1 +1,10 @@
 bale-node/node_modules/
+
+# Android / Gradle
+bale-android/**/build/
+bale-android/.gradle/
+bale-android/.idea/
+bale-android/local.properties
+bale-android/**/*.iml
+*.jks
+*.keystore
