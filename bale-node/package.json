@@ -4,6 +4,7 @@
   "description": "Bale messenger protobuf message codecs",
   "main": "src/index.js",
   "bin": "src/ws-client.js",
+  "gypfile": false,
   "scripts": {
     "build": "npx pbjs -t static-module -w commonjs -o src/messages.js proto/*.proto && npx pbts -o src/messages.d.ts src/messages.js",
     "build-tun": "node-gyp configure build",
