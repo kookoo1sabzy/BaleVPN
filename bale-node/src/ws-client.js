@@ -29,6 +29,7 @@ process.on('unhandledRejection',   e => console.error('[Process] unhandledReject
 const http      = require('http');
 const https     = require('https');
 const fs        = require('fs');
+const path      = require('path');
 const net       = require('net');
 const dgram     = require('dgram');
 const crypto    = require('crypto');
@@ -137,6 +138,50 @@ function grpcCall(service, method, payloadBuf, token) {
 }
 
 // Exchange auth JWT for the access_token cookie value
+// ── Admission control (server mode) ──────────────────────────────────────────
+//
+// Persisted allow-list of caller user IDs. Mirrors `ai.bale.proxy.AdmissionStore`
+// in the Android app — same semantics, just file-backed instead of SharedPrefs.
+// A caller in this list is auto-answered on incoming call; anyone else lands in
+// the pending map and waits for an Accept/Reject decision via /server/pending/*.
+const ADMISSION_FILE = path.join(__dirname, '..', '.allowed-callers.json');
+
+const AdmissionStore = {
+    _ids: null,  // Set<number> — lazy-loaded
+    _load() {
+        if (this._ids) return this._ids;
+        try {
+            const raw = fs.readFileSync(ADMISSION_FILE, 'utf8');
+            const arr = JSON.parse(raw);
+            this._ids = new Set(arr.filter(n => Number.isInteger(n) && n > 0));
+        } catch { this._ids = new Set(); }
+        return this._ids;
+    },
+    _save() {
+        try { fs.writeFileSync(ADMISSION_FILE, JSON.stringify([...this._ids])); }
+        catch (e) { console.error('[Admission] save failed:', e.message); }
+    },
+    isAllowed(uid) { return Number(uid) > 0 && this._load().has(Number(uid)); },
+    getAll()       { return [...this._load()]; },
+    add(uid) {
+        const n = Number(uid);
+        if (!n || n <= 0) return false;
+        this._load(); this._ids.add(n); this._save();
+        return true;
+    },
+    remove(uid) {
+        const n = Number(uid);
+        const had = this._load().delete(n);
+        if (had) this._save();
+        return had;
+    },
+};
+
+// Pending-call sweep / throttle parameters — match BaleServerService on Android.
+const PENDING_TIMEOUT_MS = 60 * 1000;
+const PENDING_SWEEP_MS   = 15 * 1000;
+const ESTABLISH_GRACE_MS = 8  * 1000;
+
 // Decode a JWT payload (base64url JSON between the two '.' separators). Used by
 // loadSelf() to extract the account owner's user ID without an extra RPC.
 function decodeJwtPayload(jwt) {
@@ -368,6 +413,11 @@ function buildAcceptCallRequest(callId) {
     return new Writer().uint32(8).int64(callId).finish();
 }
 
+// DiscardCall request: same shape as AcceptCall — field 1 (tag 8) = callId int64
+function buildDiscardCallRequest(callId) {
+    return new Writer().uint32(8).int64(callId).finish();
+}
+
 // StartCall request with liveKitCall field to trigger LiveKit mode:
 //   field 1  (tag 10): peer         bytes
 //   field 2  (tag 16): rid          int64
@@ -569,7 +619,7 @@ function decodeCallEnded(buf) {
 //   field 4  (tag 34): url          wrapped-string  (LiveKit server URL)
 //   field 12 (tag 96): isLivekit    bool
 function decodeCallEntity(buf) {
-    const r = new Reader(buf), o = { id: '0', token: '', room: '', url: '', isLivekit: false };
+    const r = new Reader(buf), o = { id: '0', token: '', room: '', url: '', isLivekit: false, callerId: 0 };
     while (r.pos < r.len) {
         const tag = r.uint32();
         switch (tag >>> 3) {
@@ -577,6 +627,11 @@ function decodeCallEntity(buf) {
             case 2:  o.token     = r.string(); break;
             case 3:  o.room      = r.string(); break;
             case 4:  o.url       = decodeWrappedString(r.bytes()); break;
+            // field 8 = adminUid (call initiator). On the callee side this is the
+            // *other party*; we read it as `callerId` to drive admission checks.
+            // (Field 9 is `peer`, which from the callee's perspective decodes to
+            // self — using it would attribute every incoming call to ourselves.)
+            case 8:  o.callerId  = r.int32(); break;
             case 12: o.isLivekit = r.bool(); break;
             default: r.skipType(tag & 7);
         }
@@ -754,6 +809,7 @@ class LiveKitTransport {
         this.onData         = null;
         this.onDisconnected = null;
         this.onDrain        = null;
+        this.hasPeer        = false;  // true once a remote participant joins (or is already present)
         this._urgentQueue   = [];
         this._normalQueue   = [];
         this._sending       = false;
@@ -771,11 +827,16 @@ class LiveKitTransport {
         room.on(RoomEvent.Disconnected, () => {
             this._teardown();
         });
+        room.on(RoomEvent.ParticipantConnected, () => {
+            this.hasPeer = true;
+        });
         room.on(RoomEvent.ParticipantDisconnected, () => {
             if (room.remoteParticipants.size === 0) this._teardown();
         });
         await room.connect(url, token, { autoSubscribe: true });
         this.room = room;
+        // Some peers may already be in the room when we join (server case).
+        if (room.remoteParticipants.size > 0) this.hasPeer = true;
         console.log('[LiveKit] Connected');
     }
 
@@ -925,6 +986,9 @@ class TunnelManager {
         this.sessions         = new Map();
         this.lkTransport      = null;       // client-mode LiveKit connection
         this.lkRooms          = new Map();  // server-mode: callId string → LiveKitTransport
+        // Server-mode admission state — mirrors BaleServerService on Android.
+        this.pendingMap       = new Map();  // callKey string → PendingCall
+        this._pendingSweep    = null;       // setInterval handle
         // TUN packet forwarding (server mode)
         this._tunFd           = null;       // fd for bale0 TUN device, null until first raw IP
         this._tunLk           = null;       // which lkRoom is the active TUN client
@@ -990,6 +1054,8 @@ class TunnelManager {
         for (const [callKey, lk] of this.lkRooms) {
             list.push({
                 callKey,
+                callerId:     lk._callerId   || 0,
+                callerName:   lk._callerName || null,
                 isTunClient:  lk === this._tunLk,
                 connectedAt:  lk._connectedAt,
                 rxPkts:  lk._rxPkts,  rxBytes: lk._rxBytes,
@@ -1017,18 +1083,138 @@ class TunnelManager {
         return true;
     }
 
-    // Server auto-answers all incoming calls and connects LiveKit if available.
-    // callEntity (optional) is from the callStarted push update and may already carry LK credentials.
+    // Server entrypoint for incoming call updates. Mirrors Android
+    // BaleServerService.checkAndHandleCall — gates on AdmissionStore, deduplicates
+    // by callerId, throttles reconnect storms, queues unknown callers as pending.
     async onCallReceived(callId, callEntity) {
         if (this.mode !== 'server') return;
-        const callKey = String(callId);
+        const callKey  = String(callId);
+        const callerId = Number(callEntity?.callerId || 0);
+
         if (this.lkRooms.has(callKey)) {
             console.log(`[Tunnel/S] Ignoring duplicate call notification for ${callId}`);
             return;
         }
-        console.log(`[Tunnel/S] Auto-answering call ${callId}`);
 
-        // Accept the call (needed so caller knows it was answered)
+        // Bale fans out two updates per incoming call: callReceived (sometimes
+        // with empty participants → callerId=0) and callStarted (with adminUid).
+        // Order isn't guaranteed; if we get the callerId=0 variant first, defer —
+        // creating a pending entry now would surface as "unknown caller" in the
+        // UI. The follow-up will carry the real id.
+        if (!callerId) {
+            console.log(`[Tunnel/S] call ${callId} arrived without callerId — deferring`);
+            return;
+        }
+
+        if (AdmissionStore.isAllowed(callerId)) {
+            // Reconnect-storm guard: same caller already has a client whose LK
+            // hasn't completed peer-join AND it's <8s old → drop the new call.
+            // Replacing it before the previous LK can establish creates an endless
+            // cycle where the peer never finishes joining.
+            for (const [, lk] of this.lkRooms) {
+                if (lk._callerId === callerId && !lk.hasPeer) {
+                    const ageMs = Date.now() - lk._connectedAt;
+                    if (ageMs < ESTABLISH_GRACE_MS) {
+                        console.log(`[Tunnel/S] dropping call ${callId} — caller ${callerId} still establishing (age=${ageMs}ms)`);
+                        return;
+                    }
+                }
+            }
+            // If a stale pending entry exists for this callId (admission state
+            // changed mid-flight), clear it before accepting.
+            this.pendingMap.delete(callKey);
+            await this._handleCall(callId, callerId, callEntity);
+        } else {
+            // Dedup pending by callerId — a new call from the same caller replaces
+            // any older pending entry (so the UI doesn't grow stale stacks).
+            for (const [k, p] of this.pendingMap) {
+                if (p.callerId === callerId) {
+                    console.log(`[Tunnel/S] replacing duplicate pending call ${p.callId} from caller ${callerId}`);
+                    this.pendingMap.delete(k);
+                    this.getBale().then(ws => ws?.discardCall(p.callId)).catch(() => {});
+                    break;
+                }
+            }
+            this.pendingMap.set(callKey, {
+                callId:     callKey,
+                callerId,
+                callerName: null,
+                receivedAt: Date.now(),
+                _entity:    callEntity || null,
+            });
+            this._startPendingSweep();
+            console.log(`[Tunnel/S] call ${callId} from caller ${callerId} → PENDING (awaiting admission)`);
+            // Resolve caller name async — mirror Android's fetchAndApplyName path.
+            this.getBale().then(ws => ws?.lookupContactName(callerId)).then(name => {
+                const cur = this.pendingMap.get(callKey);
+                if (cur && name) { cur.callerName = name; }
+            }).catch(() => {});
+        }
+    }
+
+    _startPendingSweep() {
+        if (this._pendingSweep) return;
+        this._pendingSweep = setInterval(() => {
+            const now = Date.now();
+            for (const [k, p] of this.pendingMap) {
+                if (now - p.receivedAt > PENDING_TIMEOUT_MS) {
+                    console.log(`[Tunnel/S] pending call ${p.callId} timed out — auto-rejecting`);
+                    this.rejectPending(p.callId).catch(() => {});
+                }
+            }
+            if (!this.pendingMap.size) {
+                clearInterval(this._pendingSweep);
+                this._pendingSweep = null;
+            }
+        }, PENDING_SWEEP_MS);
+    }
+
+    /** Accept a pending call. If `addToList`, also persist the caller to AdmissionStore. */
+    async acceptPending(callId, addToList = false) {
+        const callKey = String(callId);
+        const pending = this.pendingMap.get(callKey);
+        if (!pending) return false;
+        this.pendingMap.delete(callKey);
+        if (addToList && pending.callerId) AdmissionStore.add(pending.callerId);
+        await this._handleCall(callId, pending.callerId, pending._entity);
+        return true;
+    }
+
+    /** Reject a pending call — sends DiscardCall so the peer's tunnel tears down cleanly. */
+    async rejectPending(callId) {
+        const callKey = String(callId);
+        const pending = this.pendingMap.get(callKey);
+        if (!pending) return false;
+        this.pendingMap.delete(callKey);
+        console.log(`[Tunnel/S] rejecting call ${callId} from caller ${pending.callerId}`);
+        const ws = await this.getBale();
+        try { await ws?.discardCall(callId); } catch (_) {}
+        return true;
+    }
+
+    /** Snapshot of pending calls for UI — id/caller/name/age. */
+    pendingCalls() {
+        return [...this.pendingMap.values()].map(p => ({
+            callId:     p.callId,
+            callerId:   p.callerId,
+            callerName: p.callerName,
+            receivedAt: p.receivedAt,
+        }));
+    }
+
+    /** Snapshot of admission allow-list — IDs only; name resolution is the caller's job. */
+    admissionList() {
+        return AdmissionStore.getAll().map(callerId => ({ callerId }));
+    }
+
+    /**
+     * Internal: actually answer the call, join LK, set up the per-client transport.
+     * Extracted from the old onCallReceived body so it can be reused by acceptPending.
+     */
+    async _handleCall(callId, callerId, callEntity) {
+        const callKey = String(callId);
+        console.log(`[Tunnel/S] Auto-answering call ${callId} caller=${callerId}`);
+
         const ws = await this.getBale();
         if (!ws) { console.error('[Tunnel/S] AcceptCall: no WS available'); return; }
         let resp;
@@ -1045,9 +1231,29 @@ class TunnelManager {
             console.log('[Tunnel/S] Call answered — no LiveKit credentials');
             return;
         }
+
+        // Dedup by callerId: tear down any prior client from the same caller
+        // (local-only — discardCall would also kill the new call we're handling).
+        if (callerId) {
+            for (const [k, lk] of this.lkRooms) {
+                if (lk._callerId === callerId) {
+                    console.log(`[Tunnel/S] replacing existing client ${k} from caller ${callerId} with ${callKey}`);
+                    lk.disconnect();
+                    this.lkRooms.delete(k);
+                    if (this._tunLk === lk) { this._tunLk = null; this._tunClientKey = null; }
+                }
+            }
+        }
+
+        // Resolve caller name for the connected-client UI (best-effort).
+        let callerName = null;
+        try { callerName = await ws.lookupContactName(callerId); } catch (_) {}
+
         console.log(`[Tunnel/S] LiveKit url=${call.url} room=${call.room} token=${call.token.slice(0, 40)}…`);
         const lk = new LiveKitTransport();
         lk._callKey     = callKey;
+        lk._callerId    = callerId;
+        lk._callerName  = callerName;
         lk._connectedAt = Date.now();
         lk._rxPkts = 0; lk._rxBytes = 0;
         lk._txPkts = 0; lk._txBytes = 0;
@@ -1803,6 +2009,12 @@ class BaleWsClient {
         }
     }
 
+    async discardCall(callId) {
+        try {
+            await this._rpcCall('bale.meet.v1.Meet', 'DiscardCall', buildDiscardCallRequest(callId));
+        } catch (e) { console.error(`[DiscardCall] ${callId} failed:`, e.message); }
+    }
+
     async acceptCall(callId) {
         const buf = await this._rpcCall('bale.meet.v1.Meet', 'AcceptCall', buildAcceptCallRequest(callId));
         const resp = decodeCallResponse(buf);
@@ -1829,6 +2041,22 @@ class BaleWsClient {
             });
             this.ws.send(encodeRpcRequest(serviceName, method, payload, idx));
         });
+    }
+
+    // Look up a contact's display name by user ID. Backed by the contacts list
+    // populated on first WS handshake (and refreshed on demand). Bale's privacy
+    // gating means anyone who can call us is necessarily a contact, so this is
+    // sufficient for server-mode caller-name resolution. Mirrors the Android
+    // `BaleWsClient.loadUserName` path. Returns null if the contact list isn't
+    // loaded yet or the uid isn't in it.
+    async lookupContactName(uid) {
+        const n = Number(uid);
+        if (!n || n <= 0) return null;
+        if (!this.peers.length) {
+            try { await this.loadContacts(); } catch (_) {}
+        }
+        const hit = this.peers.find(p => Number(p.id) === n);
+        return hit ? hit.name : null;
     }
 
     // Resolve the account owner (self) to a UserEntity. Pulls the user ID from
@@ -2042,7 +2270,41 @@ const HTML = `<!DOCTYPE html>
     font-size: .72rem; white-space: nowrap;
   }
   .client-row .disc-btn:hover { background: #e53935; color: #fff; }
-  #clientsList .empty { font-size: .78rem; opacity: .45; padding: .3rem .1rem; }
+  #clientsList .empty, #pendingList .empty, #admissionList .empty {
+    font-size: .78rem; opacity: .45; padding: .3rem .1rem;
+  }
+  .pending-row {
+    display: flex; align-items: center; gap: .55rem;
+    padding: .5rem .65rem; border-radius: 8px; background: #fff8e1;
+    border: 1px solid #ffe082; margin-bottom: .35rem;
+    font-size: .78rem; font-family: monospace;
+  }
+  .pending-row .pending-info { flex: 1; display: flex; flex-direction: column; gap: .15rem; }
+  .pending-row .pending-name { font-weight: 600; font-size: .8rem; }
+  .pending-row .pending-age { opacity: .6; }
+  .pending-row button {
+    border: 1px solid; background: none; border-radius: 5px;
+    padding: .2rem .55rem; cursor: pointer; font-size: .72rem; white-space: nowrap;
+  }
+  .pending-row .accept-btn       { color: #2e7d32; border-color: #2e7d32; }
+  .pending-row .accept-btn:hover { background: #2e7d32; color: #fff; }
+  .pending-row .always-btn       { color: #1565c0; border-color: #1565c0; }
+  .pending-row .always-btn:hover { background: #1565c0; color: #fff; }
+  .pending-row .reject-btn       { color: #c62828; border-color: #c62828; }
+  .pending-row .reject-btn:hover { background: #c62828; color: #fff; }
+  .admission-row {
+    display: flex; align-items: center; gap: .55rem;
+    padding: .45rem .65rem; border-radius: 8px;
+    background: #f0f7ff; margin-bottom: .25rem;
+    font-size: .78rem; font-family: monospace;
+  }
+  .admission-row .admission-info { flex: 1; }
+  .admission-row .remove-btn {
+    border: 1px solid #c62828; background: none; color: #c62828;
+    border-radius: 5px; padding: .2rem .55rem; cursor: pointer;
+    font-size: .72rem; white-space: nowrap;
+  }
+  .admission-row .remove-btn:hover { background: #c62828; color: #fff; }
 </style>
 </head>
 <body>
@@ -2127,10 +2389,22 @@ const HTML = `<!DOCTYPE html>
   </div>
   </div>
 
+  <!-- Pending admission requests (server mode) -->
+  <div id="pendingSection" style="display:none; margin-top:1.2rem">
+    <div style="font-weight:600; font-size:.9rem; margin-bottom:.5rem; opacity:.7">Pending requests</div>
+    <div id="pendingList"></div>
+  </div>
+
   <!-- Connected clients (server mode) -->
   <div id="clientsSection" style="display:none; margin-top:1.2rem">
     <div style="font-weight:600; font-size:.9rem; margin-bottom:.5rem; opacity:.7">Connected clients</div>
     <div id="clientsList"></div>
+  </div>
+
+  <!-- Admission allow-list (server mode) -->
+  <div id="admissionSection" style="display:none; margin-top:1.2rem">
+    <div style="font-weight:600; font-size:.9rem; margin-bottom:.5rem; opacity:.7">Allowed callers</div>
+    <div id="admissionList"></div>
   </div>
 </div>
 <script>
@@ -2453,8 +2727,10 @@ async function pollTunnel() {
   try {
     const r = await fetch('/tunnel/status');
     const d = await r.json();
-    const st = document.getElementById('tunnelStatus');
-    const sec = document.getElementById('clientsSection');
+    const st       = document.getElementById('tunnelStatus');
+    const sec      = document.getElementById('clientsSection');
+    const pendSec  = document.getElementById('pendingSection');
+    const admSec   = document.getElementById('admissionSection');
     if (d.mode === 'server') {
       const wsReady = document.getElementById('dot').classList.contains('on');
       st.style.display = '';
@@ -2462,8 +2738,12 @@ async function pollTunnel() {
         ? \`Server — listening for calls | LK rooms: \${d.lkRooms}\`
         : 'Server — waiting for WebSocket connection…';
       st.className = 'entry ' + (wsReady ? 'ok' : 'info');
-      sec.style.display = 'block';
+      sec.style.display     = 'block';
+      pendSec.style.display = 'block';
+      admSec.style.display  = 'block';
       pollClients();
+      pollPending();
+      pollAdmission();
     } else if (d.mode === 'client' && st.style.display !== 'none') {
       const tr = d.transport === 'webrtc'
         ? (d.lkActive ? '🔗 WebRTC' : '⏳ WebRTC connecting…')
@@ -2472,9 +2752,13 @@ async function pollTunnel() {
         ? \`SOCKS5 on 127.0.0.1:\${d.socks5Port} → peer \${d.serverPeer?.id} [\${tr}] | sessions: \${d.sessions}\`
         : 'Client mode — SOCKS5 not started (connect first)';
       st.className = 'entry ok';
-      sec.style.display = 'none';
+      sec.style.display     = 'none';
+      pendSec.style.display = 'none';
+      admSec.style.display  = 'none';
     } else {
-      sec.style.display = 'none';
+      sec.style.display     = 'none';
+      pendSec.style.display = 'none';
+      admSec.style.display  = 'none';
     }
   } catch {}
 }
@@ -2487,17 +2771,25 @@ function fmtAge(ms) {
   return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
 }
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 async function pollClients() {
   try {
     const r = await fetch('/tunnel/clients');
     const list = await r.json();
     const el = document.getElementById('clientsList');
     if (!list.length) { el.innerHTML = '<div class="empty">No clients connected</div>'; return; }
-    el.innerHTML = list.map(c => \`
+    el.innerHTML = list.map(c => {
+      const who = c.callerName
+        ? escapeHtml(c.callerName) + ' <span style="opacity:.5; font-weight:400">(' + c.callerId + ')</span>'
+        : (c.callerId ? 'Caller ' + c.callerId : 'Call ' + c.callKey);
+      return \`
       <div class="client-row">
         <div class="client-dot\${c.isTunClient ? ' active' : ''}"></div>
         <div class="client-info">
-          <span class="client-id">Call \${c.callKey}\${c.isTunClient ? ' · TUN' : ''}</span>
+          <span class="client-id">\${who}\${c.isTunClient ? ' · TUN' : ''}</span>
           <span class="client-stats">
             up \${fmtAge(c.connectedAt)} &nbsp;·&nbsp;
             ↑ \${c.rxPkts}pkt / \${fmtKB(c.rxBytes)} &nbsp;·&nbsp;
@@ -2505,13 +2797,76 @@ async function pollClients() {
           </span>
         </div>
         <button class="disc-btn" onclick="disconnectClient('\${encodeURIComponent(c.callKey)}')">Disconnect</button>
-      </div>\`).join('');
+      </div>\`;
+    }).join('');
   } catch {}
 }
 
 async function disconnectClient(callKey) {
   await fetch('/tunnel/clients/' + callKey + '/disconnect', { method: 'POST' });
   pollClients();
+}
+
+async function pollPending() {
+  try {
+    const r = await fetch('/server/pending');
+    const list = await r.json();
+    const el = document.getElementById('pendingList');
+    if (!list.length) { el.innerHTML = '<div class="empty">No pending requests</div>'; return; }
+    el.innerHTML = list.map(p => {
+      const who = p.callerName
+        ? escapeHtml(p.callerName) + ' <span style="opacity:.5; font-weight:400">(' + p.callerId + ')</span>'
+        : 'Caller ' + p.callerId;
+      return \`
+      <div class="pending-row">
+        <div class="pending-info">
+          <span class="pending-name">\${who}</span>
+          <span class="pending-age">waiting \${fmtAge(p.receivedAt)}</span>
+        </div>
+        <button class="accept-btn" onclick="acceptPending('\${p.callId}', false)">Accept once</button>
+        <button class="always-btn" onclick="acceptPending('\${p.callId}', true)">Allow always</button>
+        <button class="reject-btn" onclick="rejectPending('\${p.callId}')">Reject</button>
+      </div>\`;
+    }).join('');
+  } catch {}
+}
+
+async function acceptPending(callId, addToList) {
+  await fetch('/server/pending/' + encodeURIComponent(callId) + '/accept', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ addToList: !!addToList }),
+  });
+  pollPending(); pollClients(); pollAdmission();
+}
+
+async function rejectPending(callId) {
+  await fetch('/server/pending/' + encodeURIComponent(callId) + '/reject', { method: 'POST' });
+  pollPending();
+}
+
+async function pollAdmission() {
+  try {
+    const r = await fetch('/server/admission');
+    const list = await r.json();
+    const el = document.getElementById('admissionList');
+    if (!list.length) { el.innerHTML = '<div class="empty">No callers on the allow-list</div>'; return; }
+    el.innerHTML = list.map(a => {
+      const who = a.callerName
+        ? escapeHtml(a.callerName) + ' <span style="opacity:.5; font-weight:400">(' + a.callerId + ')</span>'
+        : 'Caller ' + a.callerId;
+      return \`
+      <div class="admission-row">
+        <div class="admission-info">\${who}</div>
+        <button class="remove-btn" onclick="removeAdmission(\${a.callerId})">Remove</button>
+      </div>\`;
+    }).join('');
+  } catch {}
+}
+
+async function removeAdmission(callerId) {
+  await fetch('/server/admission/' + callerId, { method: 'DELETE' });
+  pollAdmission();
 }
 
 setInterval(pollTunnel, 3000);
@@ -2632,6 +2987,21 @@ const BaleConnection = {
 client.addOnCallReceived((callId, callEntity) => {
     client.tunnel.onCallReceived(callId, callEntity)
         .catch(e => console.error('[BaleConnection] onCallReceived dispatch failed:', e.message));
+});
+
+// Clean up pending entries / running clients when Bale tells us the call ended
+// (peer hung up, network drop, etc.). Mirrors Android's onCallEndedRemote.
+client.addOnCallEnded((callId) => {
+    const callKey = String(callId);
+    const t = client.tunnel;
+    if (t.pendingMap.has(callKey)) {
+        console.log(`[Tunnel/S] callEnded ${callId} — dropping pending entry (caller hung up)`);
+        t.pendingMap.delete(callKey);
+    }
+    if (t.lkRooms.has(callKey)) {
+        console.log(`[Tunnel/S] callEnded ${callId} — tearing down active client`);
+        t.disconnectClient(callKey);
+    }
 });
 
 const server = http.createServer(async (req, res) => {
@@ -2906,6 +3276,76 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname.startsWith('/tunnel/clients/') && url.pathname.endsWith('/disconnect')) {
         const callKey = decodeURIComponent(url.pathname.slice('/tunnel/clients/'.length, -'/disconnect'.length));
         const ok = client.tunnel.disconnectClient(callKey);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok }));
+    }
+
+    // ── Server-mode admission control ────────────────────────────────────────
+    // Resolve a callerId to a contact name from the loaded contacts list (best-effort).
+    const resolveCallerName = (uid) => {
+        const peer = client.peers.find(p => Number(p.id) === Number(uid));
+        return peer ? peer.name : null;
+    };
+
+    if (req.method === 'GET' && url.pathname === '/server/pending') {
+        const list = client.tunnel.pendingCalls().map(p => ({
+            ...p,
+            callerName: p.callerName || resolveCallerName(p.callerId),
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(list));
+    }
+
+    if (req.method === 'POST' && url.pathname.startsWith('/server/pending/') && url.pathname.endsWith('/accept')) {
+        const callId = decodeURIComponent(url.pathname.slice('/server/pending/'.length, -'/accept'.length));
+        let body = '';
+        req.on('data', c => body += c);
+        req.on('end', async () => {
+            let addToList = false;
+            try { addToList = !!JSON.parse(body || '{}').addToList; } catch {}
+            const ok = await client.tunnel.acceptPending(callId, addToList);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok }));
+        });
+        return;
+    }
+
+    if (req.method === 'POST' && url.pathname.startsWith('/server/pending/') && url.pathname.endsWith('/reject')) {
+        const callId = decodeURIComponent(url.pathname.slice('/server/pending/'.length, -'/reject'.length));
+        const ok = await client.tunnel.rejectPending(callId);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok }));
+    }
+
+    if (req.method === 'GET' && url.pathname === '/server/admission') {
+        const list = client.tunnel.admissionList().map(e => ({
+            ...e,
+            callerName: resolveCallerName(e.callerId),
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(list));
+    }
+
+    if (req.method === 'POST' && url.pathname === '/server/admission') {
+        let body = '';
+        req.on('data', c => body += c);
+        req.on('end', () => {
+            try {
+                const { callerId } = JSON.parse(body || '{}');
+                const ok = AdmissionStore.add(Number(callerId));
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok }));
+            } catch (e) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: e.message }));
+            }
+        });
+        return;
+    }
+
+    if (req.method === 'DELETE' && url.pathname.startsWith('/server/admission/')) {
+        const callerId = Number(decodeURIComponent(url.pathname.slice('/server/admission/'.length)));
+        const ok = AdmissionStore.remove(callerId);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok }));
     }
