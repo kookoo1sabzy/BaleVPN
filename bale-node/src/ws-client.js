@@ -887,9 +887,24 @@ function lkDecode(buf) {
     return null;
 }
 
+// Tunnel-manager reconnect parameters — match Android (5 attempts, 3s × n back-off, max 30s).
+const TUNNEL_MAX_RECONNECT_ATTEMPTS = 5;
+
 class TunnelManager {
-    constructor(wsc) {
-        this.wsc              = wsc;
+    /**
+     * @param {{
+     *   getBale:               () => Promise<BaleWsClient|null>,
+     *   onTunnelReady?:        () => void,
+     *   onPermanentDisconnect?:() => void,
+     * }} opts
+     */
+    constructor({ getBale, onTunnelReady, onPermanentDisconnect } = {}) {
+        // Resolved fresh on every (re)connect — lets BaleConnection bring a torn-down
+        // WS lazily back up for signaling. After the LK channel is established,
+        // onTunnelReady → reconcile drops the WS again. Mirrors Android's pattern.
+        this.getBale               = getBale || (async () => null);
+        this.onTunnelReady         = onTunnelReady         || (() => {});
+        this.onPermanentDisconnect = onPermanentDisconnect || (() => {});
         this.mode             = null;       // 'client' | 'server' | null
         this.transport        = 'message';  // 'message' | 'webrtc'  (client mode only)
         this.serverPeer       = null;       // { id, type } — set in client mode
@@ -904,11 +919,13 @@ class TunnelManager {
         this._tunClientKey    = null;       // callKey of the active TUN client
         this._tunReadRunning  = false;
         this._tunStatsTimer   = null;
-        this._tunRxPkts       = 0;  this._tunRxBytes = 0;  // client → server (written to bale0)
-        this._tunTxPkts       = 0;  this._tunTxBytes = 0;  // bale0 → client (sent via LiveKit)
+        this._tunRxPkts       = 0;  this._tunRxBytes = 0;
+        this._tunTxPkts       = 0;  this._tunTxBytes = 0;
         // Client reconnect state
-        this._reconnectTimer  = null;
+        this._reconnectTimer   = null;
         this._reconnectAttempt = 0;
+        this._callId           = null;     // callId of our outgoing client-mode call
+        this._callEndedRemover = null;     // deregister our addOnCallEnded subscription
     }
 
     configure(mode, { serverPeerId, serverPeerType, socks5Port, transport } = {}) {
@@ -920,7 +937,10 @@ class TunnelManager {
                 ? { id: Number(serverPeerId), type: Number(serverPeerType) || PEERTYPE_PRIVATE }
                 : null;
             this.socks5Port = Number(socks5Port) || 1080;
-            if (this.wsc.ready && this.serverPeer) {
+            if (this.serverPeer) {
+                // Start SOCKS5 listener now; WebRTC signaling will lazily resolve the
+                // WS via getBale() — this starts the LK channel and fires
+                // onTunnelReady so BaleConnection can drop the WS once it's up.
                 this._startSocks5();
                 if (this.transport === 'webrtc')
                     this.startWebRtcTunnel().catch(e => console.error('[Tunnel/C] WebRTC start:', e.message));
@@ -932,13 +952,12 @@ class TunnelManager {
     }
 
     onWsReady() {
-        if (this.mode === 'client' && this.serverPeer) {
-            if (!this.socks5Srv) this._startSocks5();
-            if (this.transport === 'webrtc' && !this.lkTransport)
-                this.startWebRtcTunnel().catch(e => console.error('[Tunnel/C] WebRTC start:', e.message));
-        } else if (this.mode === 'server') {
-            this._setupTun();
-        }
+        // Server mode pre-creates the TUN as soon as the WS is reachable (the bale0
+        // device must be ready before incoming-call auto-answer can route packets).
+        // Client mode does NOT eagerly start the tunnel here — startWebRtcTunnel is
+        // driven explicitly by configure() / TunnelManager reconnect, both of which
+        // bring the WS up themselves via getBale().
+        if (this.mode === 'server') this._setupTun();
     }
 
     status() {
@@ -998,8 +1017,10 @@ class TunnelManager {
         console.log(`[Tunnel/S] Auto-answering call ${callId}`);
 
         // Accept the call (needed so caller knows it was answered)
+        const ws = await this.getBale();
+        if (!ws) { console.error('[Tunnel/S] AcceptCall: no WS available'); return; }
         let resp;
-        try { resp = await this.wsc.acceptCall(callId); }
+        try { resp = await ws.acceptCall(callId); }
         catch (e) { console.error('[Tunnel/S] AcceptCall failed:', e.message); return; }
 
         // callStarted push carries isLivekit=true but empty token.
@@ -1049,9 +1070,16 @@ class TunnelManager {
     async startWebRtcTunnel() {
         if (this.mode !== 'client' || !this.serverPeer) return;
         if (this.lkTransport) { this.lkTransport.disconnect(); this.lkTransport = null; }
+
+        // Resolve the WS afresh on every (re)connect attempt — the previous one may
+        // have been torn down by reconcile() while we were idle. resolveWs brings it
+        // back up if needed and waits for handshake.
+        const ws = await this.getBale();
+        if (!ws) { console.error('[Tunnel/C] WS unavailable'); this._scheduleReconnect(); return; }
+
         console.log('[Tunnel/C] Starting call for WebRTC tunnel…');
         let resp;
-        try { resp = await this.wsc.startCall(this.serverPeer.id, this.serverPeer.type); }
+        try { resp = await ws.startCall(this.serverPeer.id, this.serverPeer.type); }
         catch (e) {
             console.error('[Tunnel/C] StartCall failed:', e.message);
             this._scheduleReconnect();
@@ -1064,6 +1092,19 @@ class TunnelManager {
             this._scheduleReconnect();
             return;
         }
+
+        // Subscribe to peer-side hangup. Re-register against the live WS instance on
+        // each (re)connect so a WS disconnect→reconnect cycle keeps us hooked in.
+        this._callId = call.id;
+        this._callEndedRemover?.(); this._callEndedRemover = null;
+        this._callEndedRemover = ws.addOnCallEnded((endedId) => {
+            if (String(endedId) === String(this._callId)) {
+                console.log(`[Tunnel/C] Peer ended call ${endedId} — permanent disconnect`);
+                this._stopAll();
+                try { this.onPermanentDisconnect(); } catch (_) {}
+            }
+        });
+
         console.log(`[Tunnel/C] Joining LiveKit room ${call.room}`);
         const lk = new LiveKitTransport();
         lk.onData = (data) => {
@@ -1088,12 +1129,21 @@ class TunnelManager {
         this._reconnectAttempt = 0;
         this.lkTransport = lk;
         console.log('[Tunnel/C] WebRTC tunnel ready');
+        // Hand WS state back to BaleConnection — its rule wants WS down once
+        // the tunnel is live, since steady-state traffic flows over LiveKit.
+        try { this.onTunnelReady(); } catch (e) { console.error('[Tunnel/C] onTunnelReady threw:', e.message); }
     }
 
     _scheduleReconnect() {
         if (this.mode !== 'client' || !this.serverPeer) return;
         if (this._reconnectTimer) return;
         this._reconnectAttempt++;
+        if (this._reconnectAttempt > TUNNEL_MAX_RECONNECT_ATTEMPTS) {
+            console.log(`[Tunnel/C] Reconnect: giving up after ${TUNNEL_MAX_RECONNECT_ATTEMPTS} attempts`);
+            this._stopAll();   // full tunnel reset, like Android's stopVpn on giveup
+            try { this.onPermanentDisconnect(); } catch (_) {}
+            return;
+        }
         const delaySec = Math.min(this._reconnectAttempt * 3, 30);
         console.log(`[Tunnel/C] Reconnect attempt ${this._reconnectAttempt} in ${delaySec}s…`);
         this._reconnectTimer = setTimeout(async () => {
@@ -1330,7 +1380,8 @@ class TunnelManager {
         if (sess.lk) {
             sess.lk.send(lkEncode({ t: 'X', s: sid }));
         } else {
-            this.wsc.sendText(sess.fromUid, PEERTYPE_PRIVATE, tunnelEncode({ t: 'X', s: sid }))
+            this.getBale()
+                .then(ws => ws?.sendText(sess.fromUid, PEERTYPE_PRIVATE, tunnelEncode({ t: 'X', s: sid })))
                 .catch(err => console.error('[Tunnel] send:', err.message));
         }
         this.sessions.delete(key);
@@ -1344,7 +1395,8 @@ class TunnelManager {
             if (obj.t === 'A' || obj.t === 'U') sess.lk.sendUrgent(encoded);
             else sess.lk.send(encoded);
         } else {
-            this.wsc.sendText(sess.fromUid, PEERTYPE_PRIVATE, tunnelEncode(obj))
+            this.getBale()
+                .then(ws => ws?.sendText(sess.fromUid, PEERTYPE_PRIVATE, tunnelEncode(obj)))
                 .catch(err => console.error('[Tunnel] send:', err.message));
         }
     }
@@ -1476,7 +1528,8 @@ class TunnelManager {
             // No fallback to message transport — drop if LiveKit isn't up.
             if (this.lkTransport) this.lkTransport.send(lkEncode(obj));
         } else if (this.serverPeer) {
-            this.wsc.sendText(this.serverPeer.id, this.serverPeer.type, tunnelEncode(obj))
+            this.getBale()
+                .then(ws => ws?.sendText(this.serverPeer.id, this.serverPeer.type, tunnelEncode(obj)))
                 .catch(err => console.error('[Tunnel] send:', err.message));
         }
     }
@@ -1505,10 +1558,17 @@ class TunnelManager {
     _stopAll() {
         if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
         this._reconnectAttempt = 0;
+        this._callEndedRemover?.(); this._callEndedRemover = null;
+        this._callId = null;
         this._tunLk = null;
         if (this.socks5Srv) { this.socks5Srv.close(); this.socks5Srv = null; }
         if (this.lkTransport) { this.lkTransport.disconnect(); this.lkTransport = null; }
         this.hangUpAll();
+        // Full reset — mirrors Android's stopVpn() returning to a no-VPN state.
+        // BaleConnection._desiredUp keys on `serverPeer`, so clearing it lets
+        // reconcile bring the WS back up after a permanent disconnect.
+        this.mode       = null;
+        this.serverPeer = null;
     }
 }
 
@@ -1525,10 +1585,34 @@ class BaleWsClient {
         this.pending       = new Map();
         this.messages      = [];
         this.peers         = [];
-        this.tunnel        = new TunnelManager(this);
+        this.tunnel        = new TunnelManager({
+            getBale:               async () => BaleConnection.resolveWs(),
+            onTunnelReady:         () => BaleConnection.reconcile(),
+            onPermanentDisconnect: () => BaleConnection.onTunnelPermanentDisconnect(),
+        });
         this.accessToken   = ACCESS_TOKEN;
         this.autoReconnect = false;
         this.connecting    = false;
+        // Multi-subscriber call event listeners — survive WS disconnect/reconnect
+        // cycles because they live on this singleton, not on each WebSocket session.
+        this._onCallReceivedListeners = [];
+        this._onCallEndedListeners    = [];
+    }
+
+    addOnCallReceived(cb) {
+        this._onCallReceivedListeners.push(cb);
+        return () => {
+            const i = this._onCallReceivedListeners.indexOf(cb);
+            if (i >= 0) this._onCallReceivedListeners.splice(i, 1);
+        };
+    }
+
+    addOnCallEnded(cb) {
+        this._onCallEndedListeners.push(cb);
+        return () => {
+            const i = this._onCallEndedListeners.indexOf(cb);
+            if (i >= 0) this._onCallEndedListeners.splice(i, 1);
+        };
     }
 
     connect(token) {
@@ -1561,13 +1645,20 @@ class BaleWsClient {
             clearInterval(this.pingTimer);
             this.ready      = false;
             this.connecting = false;
-            this.tunnel.hangUpAll();
+            // Don't tear down LK state on WS drop — server-mode rooms and the
+            // client-mode tunnel are independent of the Bale WS once established.
+            // Hanging them up here would also break the Android-mirror "drop WS
+            // after tunnel-up" rule, which deliberately closes the WS while the
+            // LK channel is in use. hangUpAll() is reserved for explicit stops.
             if (code === 4401) {
                 console.error('[WS] 4401 Unauthenticated — token expired');
                 this.autoReconnect = false;
             } else if (this.autoReconnect) {
                 console.log(`[WS] Closed ${code} — reconnecting in 3 s`);
-                setTimeout(() => this.connect(), 3000);
+                this._reconnectTimer = setTimeout(() => {
+                    this._reconnectTimer = null;
+                    this.connect();
+                }, 3000);
             } else {
                 console.log(`[WS] Closed ${code}`);
             }
@@ -1580,6 +1671,10 @@ class BaleWsClient {
         this.autoReconnect = false;
         this.ready         = false;
         this.connecting    = false;
+        // Cancel any pending inner auto-reconnect — BaleConnection.reconcile() is
+        // the sole authority on lifecycle; a stray timer would race and reopen
+        // the WS after we deliberately closed it.
+        if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
         if (this.ws) { this.ws.close(); this.ws = null; }
         clearInterval(this.pingTimer);
         console.log('[WS] Disconnected by user');
@@ -1661,14 +1756,21 @@ class BaleWsClient {
             console.log(`[Update] ${type}  callId=${callId}`);
             const callEntity = update.callStarted?.call || null;
             if (callId && callId !== '0') {
-                this.tunnel.onCallReceived(callId, callEntity)
-                    .catch(e => console.error('[Update] auto-answer failed:', e.message));
+                for (const cb of this._onCallReceivedListeners.slice()) {
+                    try { cb(callId, callEntity); }
+                    catch (e) { console.error('[Update] onCallReceived subscriber threw:', e.message); }
+                }
             }
         } else if (update.callAccepted) {
             const callId = update.callAccepted?.call?.id;
             console.log(`[Update] callAccepted  callId=${callId}`);
         } else if (update.callEnded) {
-            console.log(`[Update] callEnded  callId=${update.callEnded.callId}`);
+            const callId = update.callEnded.callId;
+            console.log(`[Update] callEnded  callId=${callId}`);
+            for (const cb of this._onCallEndedListeners.slice()) {
+                try { cb(callId); }
+                catch (e) { console.error('[Update] onCallEnded subscriber threw:', e.message); }
+            }
         } else if (update.message) {
             const tif  = update.message;
             const text = tif.message?.textMessage?.text;
@@ -2380,6 +2482,92 @@ setInterval(poll, 2000);
 
 const client = new BaleWsClient();
 
+/**
+ * Owns the single Bale WebSocket and decides when it should be up.
+ *
+ * Mirrors `ai.bale.proxy.BaleConnection` in the Android app — same desired-state
+ * rule, same `reconcile()` reconciliation pattern, same multi-subscriber model
+ * for call-event callbacks. A Node CLI process has no foreground/background, so
+ * the Android `isForeground` input collapses to a constant `true`.
+ *
+ * Inputs:
+ *   - mode (TUNNEL_MODE)            — 'client' | 'server'
+ *   - userInitiatedDisconnect       — sticky flag set by /disconnect, cleared by /connect
+ *   - tunnel.serverPeer (client)    — analog of Android's BaleVpnService.isRunning
+ *
+ * Rules (WS up iff …):
+ *   - server → !userInitiatedDisconnect
+ *   - client → !userInitiatedDisconnect AND tunnel is not active (no serverPeer)
+ *
+ * Bypasses:
+ *   - `resolveWs()` brings the WS up explicitly during signaling, ignoring the
+ *     "client + tunnel up → WS down" rule. After signaling completes,
+ *     `onTunnelReady` (passed to TunnelManager) calls `reconcile()` which drops
+ *     the WS again.
+ */
+const BaleConnection = {
+    client,
+    userInitiatedDisconnect: false,
+
+    get isReady()    { return client.ready === true; },
+    get isUp()       { return client.connecting || client.ready; },
+    get accessToken(){ return client.accessToken; },
+
+    /** Bring the WS up or down to match the desired state. Idempotent. */
+    reconcile() {
+        if (!client.accessToken) return;
+        const want = this._desiredUp();
+        if (want && !this.isUp)        client.connect();
+        else if (!want && this.isUp)   client.disconnect();
+    },
+
+    _desiredUp() {
+        if (this.userInitiatedDisconnect) return false;
+        if (TUNNEL_MODE === 'server') return true;
+        // Client mode: WS not needed while the tunnel is active. The LK channel
+        // carries steady-state traffic; signaling brings the WS up briefly via
+        // resolveWs() and onTunnelReady drops it again. We key on `serverPeer`
+        // (= "user has activated a tunnel") rather than `lkTransport` to mirror
+        // Android's `BaleVpnService.isRunning` — the rule stays stable across
+        // LK disconnect/reconnect cycles instead of bouncing the WS each time.
+        const t = client.tunnel;
+        return !(t.mode === 'client' && t.serverPeer);
+    },
+
+    /**
+     * Lazy WS resolver for `TunnelManager`. Brings the WS up if reconcile() has
+     * torn it down, then waits up to 10 s for handshake completion. Returns null
+     * if no token is set or the handshake never lands. Bypasses reconcile() on
+     * purpose — the rule wants WS down while a tunnel is up, but signaling
+     * needs it briefly.
+     */
+    async resolveWs() {
+        if (!client.accessToken) { console.error('[BaleConnection] No access token'); return null; }
+        // Clear sticky disconnect — the user (re)starting a tunnel is itself an
+        // implicit "I want WS now" override, matching Android's resolveWs.
+        this.userInitiatedDisconnect = false;
+        if (!this.isUp) client.connect();
+        if (!client.ready) {
+            for (let i = 0; i < 20 && !client.ready; i++) await new Promise(r => setTimeout(r, 500));
+        }
+        return client.ready ? client : null;
+    },
+
+    onTunnelPermanentDisconnect() {
+        console.log('[BaleConnection] tunnel permanent disconnect — reconciling WS');
+        this.reconcile();
+    },
+};
+
+// Server-mode auto-answer: subscribe once on the singleton WS client. The listener
+// list survives WS disconnect/reconnect cycles, so this never needs to be re-wired.
+// (Mirrors the Android pattern where BaleServerService installs onCallReceived on
+// BaleConnection and it's invoked across WS lifetimes.)
+client.addOnCallReceived((callId, callEntity) => {
+    client.tunnel.onCallReceived(callId, callEntity)
+        .catch(e => console.error('[BaleConnection] onCallReceived dispatch failed:', e.message));
+});
+
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
 
@@ -2404,11 +2592,14 @@ const server = http.createServer(async (req, res) => {
         req.on('end', () => {
             try {
                 const { token } = JSON.parse(body || '{}');
+                if (token) client.accessToken = token;
                 if (client.connecting || client.ready) {
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     return res.end(JSON.stringify({ ok: true, status: 'already connected' }));
                 }
-                client.connect(token || undefined);
+                // Mirror Android btnWs Connect: clear sticky flag, let reconcile decide.
+                BaleConnection.userInitiatedDisconnect = false;
+                BaleConnection.reconcile();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ ok: true, status: 'connecting' }));
             } catch (e) {
@@ -2420,7 +2611,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/disconnect') {
-        client.disconnect();
+        // Mirror Android btnWs Disconnect: set sticky flag and reconcile.
+        BaleConnection.userInitiatedDisconnect = true;
+        BaleConnection.reconcile();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: true }));
     }
@@ -2658,7 +2851,11 @@ server.listen(HTTP_PORT, () => console.log(`[HTTP] http://localhost:${HTTP_PORT}
 // Auto-configure tunnel mode from command-line arg.
 // For server mode this also creates the bale0 TUN interface immediately.
 if (TUNNEL_MODE === 'server') client.tunnel.configure('server');
-if (ACCESS_TOKEN) client.connect();
+// Bring the WS up via reconcile() (the Android pattern). For client mode at
+// startup, no tunnel is up yet → rule says WS up. For server mode with no
+// sticky disconnect → rule says WS up. Both end up calling client.connect()
+// internally; reconcile is the single source of truth for lifecycle.
+BaleConnection.reconcile();
 
 process.on('SIGINT', () => {
     console.log('\n[WS] Exiting');
