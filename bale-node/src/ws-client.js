@@ -137,6 +137,18 @@ function grpcCall(service, method, payloadBuf, token) {
 }
 
 // Exchange auth JWT for the access_token cookie value
+// Decode a JWT payload (base64url JSON between the two '.' separators). Used by
+// loadSelf() to extract the account owner's user ID without an extra RPC.
+function decodeJwtPayload(jwt) {
+    if (!jwt) return null;
+    const parts = jwt.split('.');
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    try { return JSON.parse(Buffer.from(padded, 'base64').toString('utf8')); }
+    catch { return null; }
+}
+
 function fetchAccessToken(jwt) {
     return new Promise((resolve, reject) => {
         const req = https.request({
@@ -1593,6 +1605,7 @@ class BaleWsClient {
         this.accessToken   = ACCESS_TOKEN;
         this.autoReconnect = false;
         this.connecting    = false;
+        this.self          = null;       // { id, name, nick } — account owner
         // Multi-subscriber call event listeners — survive WS disconnect/reconnect
         // cycles because they live on this singleton, not on each WebSocket session.
         this._onCallReceivedListeners = [];
@@ -1671,6 +1684,7 @@ class BaleWsClient {
         this.autoReconnect = false;
         this.ready         = false;
         this.connecting    = false;
+        this.self          = null;
         // Cancel any pending inner auto-reconnect — BaleConnection.reconcile() is
         // the sole authority on lifecycle; a stray timer would race and reopen
         // the WS after we deliberately closed it.
@@ -1690,6 +1704,7 @@ class BaleWsClient {
                 this._subscribe();
                 this._startPing();
                 this.tunnel.onWsReady();
+                this.loadSelf().catch(e => console.error('[Self] loadSelf failed:', e.message));
                 this.loadContacts().catch(e => console.error('[Contacts] loadContacts failed:', e.message));
             } else {
                 console.error('[WS] Version mismatch');
@@ -1814,6 +1829,45 @@ class BaleWsClient {
             });
             this.ws.send(encodeRpcRequest(serviceName, method, payload, idx));
         });
+    }
+
+    // Resolve the account owner (self) to a UserEntity. Pulls the user ID from
+    // the JWT payload (`sub` / `uid` / etc.) and runs LoadUsers([uid]) — the
+    // user's own ID isn't normally in their contact list so we ask for it
+    // explicitly. Result cached on `this.self` and surfaced via /config.
+    async loadSelf() {
+        const payload = decodeJwtPayload(this.accessToken);
+        if (!payload) { console.warn('[Self] could not decode JWT payload'); return null; }
+        // First-time visibility into the JWT shape so we can spot any field-name surprises.
+        if (!this._jwtPayloadLogged) {
+            this._jwtPayloadLogged = true;
+            console.log('[Self] JWT payload:', JSON.stringify(payload));
+        }
+        // Bale nests the actual user id under a `payload` claim:
+        //   { iss, exp, payload: { user_id, app_id, auth_id, auth_sid, service } }
+        const inner = payload.payload || {};
+        const uid = Number(
+            inner.user_id || inner.userId || inner.uid ||
+            payload.user_id || payload.userId || payload.uid || payload.sub || payload.id ||
+            0
+        );
+        if (!uid) {
+            console.warn('[Self] no numeric user id in JWT — outer:', Object.keys(payload).join(','),
+                         '— inner:', Object.keys(inner).join(','));
+            return null;
+        }
+        try {
+            const buf = await this._rpcCall(
+                'bale.users.v1.Users', 'LoadUsers',
+                buildLoadUsersRequest([{ uid, accessHash: '0' }]),
+            );
+            const loaded = decodeLoadUsersResponse(buf);
+            if (!loaded.users.length) { console.warn(`[Self] LoadUsers returned no entries for uid=${uid}`); return null; }
+            const u = decodeUserEntity(loaded.users[0]);
+            this.self = { id: u.id || uid, name: u.name || '', nick: u.nick || '' };
+            console.log(`[Self] ${this.self.name || '(no name)'}${this.self.nick ? ` @${this.self.nick}` : ''} (${this.self.id})`);
+            return this.self;
+        } catch (e) { console.error('[Self] LoadUsers failed:', e.message); return null; }
     }
 
     async loadContacts() {
@@ -1996,6 +2050,7 @@ const HTML = `<!DOCTYPE html>
   <div class="header">
     <div class="dot" id="dot"></div>
     <h1>Bale Proxy</h1>
+    <span id="selfName" style="margin-left:auto; font-size:.85rem; color:rgba(255,255,255,.85); font-weight:500"></span>
   </div>
   <div class="body">
     <!-- Phone / OTP registration flow -->
@@ -2213,11 +2268,21 @@ async function loadPeers() {
   } catch {}
 }
 
+function renderSelf(self) {
+  const el = document.getElementById('selfName');
+  if (!el) return;
+  if (!self) { el.textContent = ''; return; }
+  const nick = self.nick ? ' @' + self.nick : '';
+  el.textContent = (self.name || '(no name)') + nick;
+  el.title = 'User ID: ' + self.id;
+}
+
 async function poll() {
   try {
     const r = await fetch('/messages?since=0');
-    const { ready } = await r.json();
+    const { ready, self } = await r.json();
     dot.className = 'dot' + (ready ? ' on' : '');
+    renderSelf(self);
     if (ready !== _connected || _connecting) {
       _connected  = ready;
       _connecting = false;
@@ -2462,6 +2527,7 @@ const _savedCfg = loadConfig();
     updateTunnelBadge(d.tunnelMode || 'client');
     _connected  = d.ready;
     _connecting = d.connecting;
+    renderSelf(d.self);
     updateConnBtn();
     if (d.ready) loadPeers();
   } catch {}
@@ -2583,6 +2649,7 @@ const server = http.createServer(async (req, res) => {
             ready:       client.ready,
             connecting:  client.connecting,
             tunnelMode:  TUNNEL_MODE,
+            self:        client.self,
         }));
     }
 
@@ -2623,6 +2690,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
             ready:    client.ready,
+            self:     client.self,
             messages: client.messages.filter(m => m.ts >= since),
         }));
     }
