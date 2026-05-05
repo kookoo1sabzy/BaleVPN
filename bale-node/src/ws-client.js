@@ -914,7 +914,7 @@ class TunnelManager {
     configure(mode, { serverPeerId, serverPeerType, socks5Port, transport } = {}) {
         this._stopAll();
         this.mode      = mode || null;
-        this.transport = transport || 'message';
+        this.transport = transport || 'webrtc';
         if (mode === 'client') {
             this.serverPeer = serverPeerId
                 ? { id: Number(serverPeerId), type: Number(serverPeerType) || PEERTYPE_PRIVATE }
@@ -1472,8 +1472,9 @@ class TunnelManager {
     }
 
     _cliSend(obj) {
-        if (this.transport === 'webrtc' && this.lkTransport) {
-            this.lkTransport.send(lkEncode(obj));
+        if (this.transport === 'webrtc') {
+            // No fallback to message transport — drop if LiveKit isn't up.
+            if (this.lkTransport) this.lkTransport.send(lkEncode(obj));
         } else if (this.serverPeer) {
             this.wsc.sendText(this.serverPeer.id, this.serverPeer.type, tunnelEncode(obj))
                 .catch(err => console.error('[Tunnel] send:', err.message));
@@ -1955,7 +1956,6 @@ const HTML = `<!DOCTYPE html>
       <div>
         <label>Transport</label>
         <select id="tunnelTransport">
-          <option value="message">Messages</option>
           <option value="webrtc" selected>WebRTC — LiveKit data channel</option>
         </select>
       </div>
@@ -2625,7 +2625,7 @@ const server = http.createServer(async (req, res) => {
                 const { socks5Port, serverPeerId, serverPeerType, transport } = JSON.parse(body);
                 client.tunnel.configure(TUNNEL_MODE, { serverPeerId, serverPeerType, socks5Port, transport });
                 const status = TUNNEL_MODE === 'client'
-                    ? `SOCKS5 on 127.0.0.1:${socks5Port || 1080} → peer ${serverPeerId} [${transport || 'message'}]`
+                    ? `SOCKS5 on 127.0.0.1:${socks5Port || 1080} → peer ${serverPeerId} [${transport || 'webrtc'}]`
                     : 'Server mode active — relay + auto-answer calls';
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ ok: true, status }));
