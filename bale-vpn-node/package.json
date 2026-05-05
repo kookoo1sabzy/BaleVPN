@@ -1,5 +1,5 @@
 {
-  "name": "bale-node",
+  "name": "bale-vpn-node",
   "version": "1.0.0",
   "description": "Bale messenger protobuf message codecs",
   "main": "src/index.js",
