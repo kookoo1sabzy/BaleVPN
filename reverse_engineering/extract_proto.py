@@ -4,9 +4,10 @@ and generates .proto files + a Node.js package.
 """
 import re, os, json, textwrap
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-SRC_FILE  = os.path.join(REPO_ROOT, 'static', 'js', 'async', '5100.bbddcd29.js')
-OUT_DIR   = os.path.join(REPO_ROOT, 'bale-vpn-node')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT  = os.path.dirname(SCRIPT_DIR)  # reverse_engineering/ → repo root
+SRC_FILE   = os.path.join(SCRIPT_DIR, 'static', 'js', 'async', '5100.bbddcd29.js')
+OUT_DIR    = os.path.join(REPO_ROOT, 'bale-vpn-node')
 
 with open(SRC_FILE) as f:
     src = f.read()
