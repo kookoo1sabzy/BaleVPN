@@ -3354,7 +3354,27 @@ const server = http.createServer(async (req, res) => {
     res.end();
 });
 
-server.listen(HTTP_PORT, () => console.log(`[HTTP] http://localhost:${HTTP_PORT}`));
+// Cross-platform open-in-browser. macOS: `open`; Windows: `start ""` (the empty
+// title arg keeps `start` from interpreting a quoted URL as the window title);
+// Linux/BSD: `xdg-open`. Failures (no DISPLAY on headless Linux, missing tool)
+// are swallowed — auto-open is a convenience, not a hard requirement.
+function openInBrowser(url) {
+    const { exec } = require('child_process');
+    const cmd = process.platform === 'darwin' ? `open "${url}"`
+              : process.platform === 'win32'  ? `start "" "${url}"`
+              :                                 `xdg-open "${url}"`;
+    exec(cmd, () => {});
+}
+
+server.listen(HTTP_PORT, () => {
+    const url = `http://localhost:${HTTP_PORT}`;
+    console.log(`[HTTP] ${url}`);
+    // Auto-open the UI when running in client mode (the typical interactive
+    // use). Suppressed on a server install where the UI is rarely needed and
+    // a desktop session may not even be present, and via BALE_NO_BROWSER=1
+    // for headless dev iteration.
+    if (TUNNEL_MODE === 'client' && !process.env.BALE_NO_BROWSER) openInBrowser(url);
+});
 
 // Auto-configure tunnel mode from command-line arg.
 // For server mode this also creates the bale0 TUN interface immediately.
