@@ -8,12 +8,24 @@ plugins {
 android {
     namespace  = "ai.bale.proxy"
     compileSdk = 34
+    val tagVersion = System.getenv("BALE_VERSION_NAME")?.takeIf { it.isNotBlank() }
+    val parsedVersionCode = tagVersion
+        ?.split('.')
+        ?.mapNotNull { it.takeWhile(Char::isDigit).toIntOrNull() }
+        ?.let { p ->
+            val major = p.getOrElse(0) { 0 }
+            val minor = p.getOrElse(1) { 0 }
+            val patch = p.getOrElse(2) { 0 }
+            major * 10_000 + minor * 100 + patch
+        }
+        ?.takeIf { it > 0 }
+
     defaultConfig {
         applicationId = "ai.bale.proxy"
         minSdk        = 21
         targetSdk     = 34
-        versionCode   = 1
-        versionName   = "1.0"
+        versionCode   = parsedVersionCode ?: 1
+        versionName   = tagVersion ?: "1.0"
     }
 
     val ksPath = System.getenv("ANDROID_KEYSTORE_PATH")
