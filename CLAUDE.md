@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A reverse-engineering research project for the **Bale messenger** web app (`web.bale.ai`). It extracts protobuf service/message definitions from Bale's minified webpack bundles and provides:
 - A Node.js package (`bale-proto/`) for encoding/decoding messages over Bale's WebSocket API, with a SOCKS5 proxy tunnel and WebRTC data-channel transport
-- A Kotlin Multiplatform Android VPN app (`bale-android/`) that runs in either **client mode** (routes the device's traffic through a peer-hosted tunnel) or **server mode** (accepts calls from peers and bridges their traffic to the internet via an in-process userspace TCP/IP stack — no root, no kernel TUN, no iptables)
+- A Kotlin Multiplatform Android VPN app (`bale-vpn-android/`) that runs in either **client mode** (routes the device's traffic through a peer-hosted tunnel) or **server mode** (accepts calls from peers and bridges their traffic to the internet via an in-process userspace TCP/IP stack — no root, no kernel TUN, no iptables)
 
 ## Supported features
 
@@ -213,14 +213,14 @@ Data-channel messages use compact binary frames instead of JSON/base64:
 
 ---
 
-## Android VPN app (`bale-android/`)
+## Android VPN app (`bale-vpn-android/`)
 
 Kotlin Multiplatform project targeting Android (future: iOS). All business logic lives in `shared/commonMain`; only the LiveKit binding and `VpnService` are platform-specific.
 
 ### Module layout
 
 ```
-bale-android/
+bale-vpn-android/
   shared/                        # KMP library
     commonMain/
       bale/

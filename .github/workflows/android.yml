@@ -18,7 +18,7 @@ jobs:
       ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
     defaults:
       run:
-        working-directory: bale-android
+        working-directory: bale-vpn-android
 
     steps:
       - uses: actions/checkout@v4
@@ -53,11 +53,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: BaleVpn-release-apk
-          path: bale-android/androidApp/build/outputs/apk/release/*.apk
+          path: bale-vpn-android/androidApp/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
       - name: Attach APK to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: bale-android/androidApp/build/outputs/apk/release/*.apk
+          files: bale-vpn-android/androidApp/build/outputs/apk/release/*.apk
