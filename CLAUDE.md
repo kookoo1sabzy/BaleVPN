@@ -26,15 +26,15 @@ A reverse-engineering research project for the **Bale messenger** web app (`web.
 
 ### 1. Download web app assets
 ```bash
-python3 download.py
+python3 reverse_engineering/download.py
 ```
-Downloads the Bale web app JS bundles, HTML, and static files into `static/`. Reads the service worker to discover all async chunk URLs. Skips files that already exist locally. Requires a valid `access_token` cookie hardcoded in the script.
+Downloads the Bale web app JS bundles, HTML, and static files into `reverse_engineering/static/`. Reads the service worker to discover all async chunk URLs. Skips files that already exist locally. Requires a valid `access_token` cookie hardcoded in the script.
 
 ### 2. Extract protobuf definitions
 ```bash
-python3 extract_proto.py
+python3 reverse_engineering/extract_proto.py
 ```
-Parses `static/js/async/5100.bbddcd29.js` (the main protobuf chunk), splits it into webpack modules, finds codec objects with `encode()`/`decode()` methods, and maps them to service/method names via `serviceName`/`methodName` annotations. Writes `.proto` files to `bale-proto/proto/` and regenerates `bale-proto/src/index.js`.
+Parses `reverse_engineering/static/js/async/5100.bbddcd29.js` (the main protobuf chunk), splits it into webpack modules, finds codec objects with `encode()`/`decode()` methods, and maps them to service/method names via `serviceName`/`methodName` annotations. Writes `.proto` files to `bale-vpn-node/proto/` and regenerates `bale-vpn-node/src/index.js`.
 
 ### 3. Build and use the proto package
 ```bash
@@ -121,7 +121,7 @@ Real-time updates flow via `bale.maviz.v1.MavizStream.SubscribeToUpdates` (empty
 - Auth uses the `access_token` JWT cookie scoped to `.bale.ai`.
 - No token-exchange step: send the cookie directly in the WebSocket `Cookie` header.
 - To refresh: Chrome DevTools → Application → Cookies → `https://web.bale.ai` → copy `access_token`.
-- The token is hardcoded in `download.py` and `bale-proto/src/ws-client.js` (`ACCESS_TOKEN` constant) — update both when it expires. WS close code `4401` = expired token.
+- The token is hardcoded in `reverse_engineering/download.py` and `bale-vpn-node/src/ws-client.js` (`ACCESS_TOKEN` constant) — update both when it expires. WS close code `4401` = expired token.
 
 ### SOCKS5 tunnel over Bale messages
 
