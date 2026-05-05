@@ -20,8 +20,9 @@
     ],
     "outputPath": "dist",
     "assets": [
-      "node_modules/@livekit/rtc-node/build/**",
-      "node_modules/@livekit/rtc-node/prebuilds/**"
+      "node_modules/@livekit/rtc-node/dist/**",
+      "node_modules/@livekit/rtc-ffi-bindings/**",
+      "node_modules/@livekit/rtc-ffi-bindings-*/**"
     ]
   },
   "dependencies": {
