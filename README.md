@@ -92,7 +92,7 @@ A connected client picks any of their Bale contacts to act as a tunnel server. T
 | Asset downloader | `download.py` | grabs the Bale web app bundles into `static/` |
 | Proto extractor | `extract_proto.py` | parses webpack chunks → `.proto` files into `bale-node/proto/` |
 | Node.js package | `bale-node/` | WebSocket client + SOCKS5 / WebRTC tunnel + web UI; can run as VPN server (Linux, with TUN) |
-| Android app (Kotlin Multiplatform) | `bale-android/` | dual-mode VPN: **client** (route this device's traffic) or **server** (host other peers' traffic via an in-process userspace TCP/IP stack — no root, no kernel TUN) |
+| Android app (Kotlin Multiplatform) | `bale-vpn-android/` | dual-mode VPN: **client** (route this device's traffic) or **server** (host other peers' traffic via an in-process userspace TCP/IP stack — no root, no kernel TUN) |
 | Static assets snapshot | `static/`, `*.html` | downloaded copy of `web.bale.ai` |
 
 ---
@@ -199,7 +199,7 @@ node src/ws-client.js server
 
 ### 3 · Android app
 
-Open `bale-android/` in Android Studio.
+Open `bale-vpn-android/` in Android Studio.
 
 The app supports SMS authentication, a contacts picker, and **two operating modes** selected via a single toggle:
 
@@ -220,7 +220,7 @@ The server tab also has a **Contacts** screen (Bale only allows calls between co
 |---|---|---|
 | OS | Linux only | Android only |
 | Privileges | needs `setcap cap_net_admin` + iptables MASQUERADE | none — runs as ordinary user |
-| TCP/IP | kernel TUN device (`bale0`) | in-process userspace stack ([`PacketProcessor.kt`](bale-android/shared/src/androidMain/kotlin/ai/bale/proxy/PacketProcessor.kt)) |
+| TCP/IP | kernel TUN device (`bale0`) | in-process userspace stack ([`PacketProcessor.kt`](bale-vpn-android/shared/src/androidMain/kotlin/ai/bale/proxy/PacketProcessor.kt)) |
 | Per-client controls | basic stats | per-client live stats (kbps), bandwidth caps, throttle indicator, admission allow-list, debug log toggle |
 | Pending-call handling | auto-accept | allow / reject notification, deduplicated per caller, 60 s auto-reject |
 | Setup | one-shot iptables rule, then run | install APK, flip toggle to server |

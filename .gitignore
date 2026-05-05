@@ -1,10 +1,10 @@
 bale-node/node_modules/
 
 # Android / Gradle
-bale-android/**/build/
-bale-android/.gradle/
-bale-android/.idea/
-bale-android/local.properties
-bale-android/**/*.iml
+bale-vpn-android/**/build/
+bale-vpn-android/.gradle/
+bale-vpn-android/.idea/
+bale-vpn-android/local.properties
+bale-vpn-android/**/*.iml
 *.jks
 *.keystore
