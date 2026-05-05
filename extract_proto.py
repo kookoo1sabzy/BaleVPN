@@ -4,8 +4,9 @@ and generates .proto files + a Node.js package.
 """
 import re, os, json, textwrap
 
-SRC_FILE = '/Users/kookoo/Documents/bale/test/static/js/async/5100.bbddcd29.js'
-OUT_DIR  = '/Users/kookoo/Documents/bale/test/bale-vpn-node'
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+SRC_FILE  = os.path.join(REPO_ROOT, 'static', 'js', 'async', '5100.bbddcd29.js')
+OUT_DIR   = os.path.join(REPO_ROOT, 'bale-vpn-node')
 
 with open(SRC_FILE) as f:
     src = f.read()

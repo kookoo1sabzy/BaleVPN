@@ -3,7 +3,7 @@ import os
 import time
 
 BASE = "https://web.bale.ai"
-DEST = "/Users/kookoo/Documents/bale/test"
+DEST = os.path.dirname(os.path.abspath(__file__))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
