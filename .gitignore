@@ -1,4 +1,4 @@
-bale-node/node_modules/
+bale-vpn-node/node_modules/
 
 # Android / Gradle
 bale-vpn-android/**/build/

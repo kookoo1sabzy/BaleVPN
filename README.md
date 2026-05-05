@@ -90,8 +90,8 @@ A connected client picks any of their Bale contacts to act as a tunnel server. T
 | Component | Path | Role |
 |---|---|---|
 | Asset downloader | `download.py` | grabs the Bale web app bundles into `static/` |
-| Proto extractor | `extract_proto.py` | parses webpack chunks → `.proto` files into `bale-node/proto/` |
-| Node.js package | `bale-node/` | WebSocket client + SOCKS5 / WebRTC tunnel + web UI; can run as VPN server (Linux, with TUN) |
+| Proto extractor | `extract_proto.py` | parses webpack chunks → `.proto` files into `bale-vpn-node/proto/` |
+| Node.js package | `bale-vpn-node/` | WebSocket client + SOCKS5 / WebRTC tunnel + web UI; can run as VPN server (Linux, with TUN) |
 | Android app (Kotlin Multiplatform) | `bale-vpn-android/` | dual-mode VPN: **client** (route this device's traffic) or **server** (host other peers' traffic via an in-process userspace TCP/IP stack — no root, no kernel TUN) |
 | Static assets snapshot | `static/`, `*.html` | downloaded copy of `web.bale.ai` |
 
@@ -176,12 +176,12 @@ python3 download.py
 python3 extract_proto.py
 ```
 
-This populates `static/` and writes `.proto` files into `bale-node/proto/`. Both scripts need an `access_token` cookie from `web.bale.ai` hardcoded inside (see [CLAUDE.md](CLAUDE.md) → *Authentication*).
+This populates `static/` and writes `.proto` files into `bale-vpn-node/proto/`. Both scripts need an `access_token` cookie from `web.bale.ai` hardcoded inside (see [CLAUDE.md](CLAUDE.md) → *Authentication*).
 
 ### 2 · Node.js side
 
 ```bash
-cd bale-node
+cd bale-vpn-node
 npm install
 npm run build         # compile .proto → src/messages.js
 npm run ui            # web UI at http://localhost:3001
@@ -235,7 +235,7 @@ The Bale WS uses the `access_token` JWT cookie scoped to `.bale.ai`. To refresh:
 
 1. Open `web.bale.ai` in Chrome.
 2. DevTools → Application → Cookies → `https://web.bale.ai` → copy `access_token`.
-3. Paste it into the `ACCESS_TOKEN` constant in `download.py` and `bale-node/src/ws-client.js`.
+3. Paste it into the `ACCESS_TOKEN` constant in `download.py` and `bale-vpn-node/src/ws-client.js`.
 
 WebSocket close code `4401` means the token has expired. Android app users authenticate via SMS OTP and the access token is fetched server-side — no manual update needed there.
 
