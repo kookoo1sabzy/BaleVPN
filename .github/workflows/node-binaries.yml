@@ -1,0 +1,66 @@
+name: Node binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   target: node18-macos-arm64, suffix: macos-arm64, ext: '' }
+          - { os: macos-13,       target: node18-macos-x64,   suffix: macos-x64,   ext: '' }
+          - { os: ubuntu-latest,  target: node18-linux-x64,   suffix: linux-x64,   ext: '' }
+          - { os: windows-latest, target: node18-win-x64,     suffix: win-x64,     ext: '.exe' }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: bale-node
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: npm
+          cache-dependency-path: bale-node/package-lock.json
+
+      - name: Derive version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TUN addon
+        if: matrix.os == 'ubuntu-latest'
+        run: npm run build-tun
+
+      - name: Package binary
+        run: |
+          npx pkg . \
+            --target ${{ matrix.target }} \
+            --output dist/balevpn-${{ steps.ver.outputs.version }}-${{ matrix.suffix }}${{ matrix.ext }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: balevpn-${{ matrix.suffix }}
+          path: bale-node/dist/balevpn-${{ steps.ver.outputs.version }}-${{ matrix.suffix }}${{ matrix.ext }}
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bale-node/dist/balevpn-${{ steps.ver.outputs.version }}-${{ matrix.suffix }}${{ matrix.ext }}
