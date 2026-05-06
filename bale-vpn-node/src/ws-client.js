@@ -2365,9 +2365,9 @@ const HTML = `<!DOCTYPE html>
         </div>
       </div>
       <div>
-        <label>Find peer by phone / name</label>
+        <label>Find peer by phone number</label>
         <div class="tunnel-row">
-          <input id="peerSearch" type="text" placeholder="+98912… or name">
+          <input id="peerSearch" type="tel" placeholder="+98912…" inputmode="tel">
           <button class="refresh-btn" id="peerSearchBtn">Search</button>
         </div>
         <div id="peerResults" style="display:none; margin-top:.35rem; border:1.5px solid #ddd; border-radius:8px; overflow:hidden; font-size:.82rem"></div>
@@ -3108,46 +3108,27 @@ const server = http.createServer(async (req, res) => {
                 console.log(`[Search] query="${query}"`);
                 if (!query) throw new Error('query required');
 
-                // Phone-like query → ImportContacts (global lookup)
-                // Name query → SearchContacts (within contacts)
+                // Phone-only search — name-based lookup is intentionally disabled.
+                // The SearchContacts RPC + decoder are kept in the codebase in case
+                // we re-enable name search later; this route just refuses to call it.
                 const isPhone = /^[+\d][\d\s\-]{5,}$/.test(query.trim());
-                let users = [];
+                if (!isPhone) throw new Error('Search by phone number only (e.g., +98912…)');
 
-                if (isPhone) {
-                    console.log('[Search] using ImportContacts via gRPC-web (phone lookup)');
-                    const buf  = await grpcCall('bale.users.v1.Users', 'ImportContacts', buildImportContactsRequest(query), client.accessToken);
-                    console.log(`[Search] ImportContacts raw ${buf.length} bytes`);
-                    const resp = decodeImportContactsResponse(buf);
-                    // Server returns peer references — do a follow-up LoadUsers to get display names
-                    if (resp.users.length > 0) {
-                        users = resp.users.map(b => decodeUserEntity(b)).filter(u => u.id)
-                            .map(u => ({ id: u.id, name: u.name || '', nick: u.nick || '', type: PEERTYPE_PRIVATE }));
-                    } else if (resp.userPeers.length > 0) {
-                        console.log(`[Search] ImportContacts got ${resp.userPeers.length} peers, loading users…`);
-                        const loadBuf = await client._rpcCall('bale.users.v1.Users', 'LoadUsers', buildLoadUsersRequest(resp.userPeers));
-                        const loaded  = decodeLoadUsersResponse(loadBuf);
-                        users = loaded.users.map(b => decodeUserEntity(b)).filter(u => u.id)
-                            .map(u => ({ id: u.id, name: u.name || '', nick: u.nick || '', type: PEERTYPE_PRIVATE }));
-                    }
-                } else {
-                    console.log('[Search] using SearchContacts via gRPC-web (name lookup)');
-                    const buf  = await grpcCall('bale.users.v1.Users', 'SearchContacts', buildSearchContactsRequest(query), client.accessToken);
-                    console.log(`[Search] SearchContacts raw ${buf.length} bytes`);
-                    const resp = decodeSearchContactsResponse(buf);
-                    // User entities (already full)
+                let users = [];
+                console.log('[Search] using ImportContacts via gRPC-web (phone lookup)');
+                const buf  = await grpcCall('bale.users.v1.Users', 'ImportContacts', buildImportContactsRequest(query), client.accessToken);
+                console.log(`[Search] ImportContacts raw ${buf.length} bytes`);
+                const resp = decodeImportContactsResponse(buf);
+                // Server returns peer references — do a follow-up LoadUsers to get display names
+                if (resp.users.length > 0) {
                     users = resp.users.map(b => decodeUserEntity(b)).filter(u => u.id)
                         .map(u => ({ id: u.id, name: u.name || '', nick: u.nick || '', type: PEERTYPE_PRIVATE }));
-                    // User peers without full entity — load them
-                    if (users.length === 0 && resp.userPeers.length > 0) {
-                        const loadBuf = await client._rpcCall('bale.users.v1.Users', 'LoadUsers', buildLoadUsersRequest(resp.userPeers));
-                        const loaded  = decodeLoadUsersResponse(loadBuf);
-                        users = loaded.users.map(b => decodeUserEntity(b)).filter(u => u.id)
-                            .map(u => ({ id: u.id, name: u.name || '', nick: u.nick || '', type: PEERTYPE_PRIVATE }));
-                    }
-                    // Group peers — include as GROUP type
-                    for (const gp of resp.groupPeers) {
-                        users.push({ id: gp.id, name: `Group ${gp.id}`, nick: '', type: PEERTYPE_GROUP });
-                    }
+                } else if (resp.userPeers.length > 0) {
+                    console.log(`[Search] ImportContacts got ${resp.userPeers.length} peers, loading users…`);
+                    const loadBuf = await client._rpcCall('bale.users.v1.Users', 'LoadUsers', buildLoadUsersRequest(resp.userPeers));
+                    const loaded  = decodeLoadUsersResponse(loadBuf);
+                    users = loaded.users.map(b => decodeUserEntity(b)).filter(u => u.id)
+                        .map(u => ({ id: u.id, name: u.name || '', nick: u.nick || '', type: PEERTYPE_PRIVATE }));
                 }
 
                 console.log(`[Search] returning ${users.length} users`);
