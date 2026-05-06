@@ -47,7 +47,7 @@ npm run ui -- 8080   # listen on a custom port
 npm run ui -- server # start in server mode (TUN + NAT relay)
 ```
 
-The HTTP port can also be passed directly: `node src/ws-client.js 8080`. Defaults to `3001`.
+The HTTP port can also be passed directly: `node src/bale-proxy.js 8080`. Defaults to `3001`.
 
 **Server mode one-time setup** (Linux only):
 ```bash
@@ -56,14 +56,14 @@ The HTTP port can also be passed directly: `node src/ws-client.js 8080`. Default
 sudo setcap cap_net_admin+eip $(which node)
 sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
 # Then start server mode (no sudo needed):
-node src/ws-client.js server
+node src/bale-proxy.js server
 ```
 The server creates `bale0` (`10.8.0.1/24`) on startup, enables `ip_forward`, and auto-answers all incoming LiveKit calls. Android clients are assigned `10.8.0.2/24`.
 
 ## Architecture
 
 ### `bale-proto/` — Node.js package
-- **`src/ws-client.js`** — single entry point: connects to `wss://next-ws.bale.ai/ws/`, subscribes to real-time updates, serves a web UI at `http://localhost:3001`, and manages the tunnel. Three classes: `TunnelManager`, `BaleWsClient`, plus HTTP routes. All `console.log/warn/error` calls are automatically prefixed with `[YYYY-MM-DD HH:MM:SS.mmm]` via a patch at startup.
+- **`src/bale-proxy.js`** — single entry point: connects to `wss://next-ws.bale.ai/ws/`, subscribes to real-time updates, serves a web UI at `http://localhost:3001`, and manages the tunnel. Three classes: `TunnelManager`, `BaleWsClient`, plus HTTP routes. All `console.log/warn/error` calls are automatically prefixed with `[YYYY-MM-DD HH:MM:SS.mmm]` via a patch at startup.
 - **`src/index.js`** — loads all `.proto` files via protobufjs at runtime, exposes `encode(typeName, payload)` → `Buffer` and `decode(typeName, bytes)` → object. Use fully-qualified names like `"bale.messaging.v2.SendMessageRequest"`.
 - **`src/tun.js`** — thin wrapper around the native TUN addon (`build/Release/tun.node`). Exports `open(name)`, `configure(name, ip, prefix)`, `close(fd)`. Only available on Linux after `npm run build-tun`.
 - **`tun_addon/tun.cc`** — Node-API C++ addon: `openTun` (TUNSETIFF ioctl), `configureIf` (SIOCSIFADDR + SIOCSIFNETMASK + SIOCSIFFLAGS ioctls in-process — required because `setcap cap_net_admin` is not inherited by child processes), `closeTun`.
@@ -121,7 +121,7 @@ Real-time updates flow via `bale.maviz.v1.MavizStream.SubscribeToUpdates` (empty
 - Auth uses the `access_token` JWT cookie scoped to `.bale.ai`.
 - No token-exchange step: send the cookie directly in the WebSocket `Cookie` header.
 - To refresh: Chrome DevTools → Application → Cookies → `https://web.bale.ai` → copy `access_token`.
-- The token is hardcoded in `reverse_engineering/download.py` and `bale-vpn-node/src/ws-client.js` (`ACCESS_TOKEN` constant) — update both when it expires. WS close code `4401` = expired token.
+- The token is hardcoded in `reverse_engineering/download.py` and `bale-vpn-node/src/bale-proxy.js` (`ACCESS_TOKEN` constant) — update both when it expires. WS close code `4401` = expired token.
 
 ### SOCKS5 tunnel over Bale messages
 
@@ -191,7 +191,7 @@ Real-time updates flow via `bale.maviz.v1.MavizStream.SubscribeToUpdates` (empty
 2. Connects `LiveKitTransport` with returned credentials; wires `transport.onData` → `onPacket` callback (raw IP packets)
 3. `sendPacket(data)` → `transport.sendUrgent(data)` → LiveKit LOSSY publish
 
-**`@livekit/rtc-node`** is required unconditionally at startup (`require('@livekit/rtc-node')` at top of `ws-client.js`). Install: `cd bale-proto && npm install @livekit/rtc-node`.
+**`@livekit/rtc-node`** is required unconditionally at startup (`require('@livekit/rtc-node')` at top of `livekit.js`). Install: `cd bale-vpn-node && npm install @livekit/rtc-node`.
 
 ### WebRTC binary framing (`lkEncode` / `lkDecode`)
 

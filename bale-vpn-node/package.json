@@ -3,12 +3,12 @@
   "version": "1.0.0",
   "description": "Bale messenger protobuf message codecs",
   "main": "src/index.js",
-  "bin": "src/ws-client.js",
+  "bin": "src/bale-proxy.js",
   "gypfile": false,
   "scripts": {
     "build": "npx pbjs -t static-module -w commonjs -o src/messages.js proto/*.proto && npx pbts -o src/messages.d.ts src/messages.js",
     "build-tun": "node-gyp configure build",
-    "ui": "node src/ws-client.js",
+    "ui": "node src/bale-proxy.js",
     "package": "pkg . --out-path dist"
   },
   "pkg": {
