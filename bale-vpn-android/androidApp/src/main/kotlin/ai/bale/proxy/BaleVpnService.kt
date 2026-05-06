@@ -11,12 +11,15 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import android.system.StructPollfd
 import android.util.Log
+import android.widget.Toast
 import kotlinx.coroutines.*
 import java.io.FileOutputStream
 
@@ -148,8 +151,15 @@ class BaleVpnService : VpnService() {
             }
 
             // 5. Call the peer → get LiveKit credentials → join room
-            mgr.onPermanentDisconnect = {
-                Log.d(TAG, "VPN: permanent disconnect — stopping service")
+            mgr.onPermanentDisconnect = { rejected ->
+                Log.d(TAG, "VPN: permanent disconnect — stopping service (rejected=$rejected)")
+                // Toast the user from the main thread so they understand why
+                // the VPN just dropped — server reject vs. connectivity giveup.
+                val msg = if (rejected) "Server rejected the connection."
+                          else          "Server unreachable — gave up after retries."
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show()
+                }
                 scope.launch { stopVpn() }
             }
             if (!mgr.startWebRtcTunnel()) { Log.e(TAG, "VPN: WebRTC tunnel failed"); return }

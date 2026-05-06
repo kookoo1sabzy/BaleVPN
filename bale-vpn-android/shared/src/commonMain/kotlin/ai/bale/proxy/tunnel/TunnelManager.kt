@@ -25,9 +25,13 @@ class TunnelManager(
      *  Used by callers that want to release the WS now that signaling is done. */
     private val onTunnelReady: () -> Unit = {},
 ) {
-    var config:                TunnelConfig?          = null
-    var onPacket:              ((ByteArray) -> Unit)? = null
-    var onPermanentDisconnect: (() -> Unit)?          = null
+    var config:                TunnelConfig?                       = null
+    var onPacket:              ((ByteArray) -> Unit)?              = null
+    /** Called when the tunnel gives up. `rejected = true` means the server peer
+     *  ended one of our calls (admin Reject, peer hangup, etc.); `rejected =
+     *  false` means we exhausted reconnect attempts. The UI uses this to show
+     *  a clear "Server rejected" notification instead of a generic failure. */
+    var onPermanentDisconnect: ((rejected: Boolean) -> Unit)?      = null
 
     private val scope            = CoroutineScope(dispatcher + SupervisorJob())
     private var transport        = newTransport()
@@ -73,11 +77,11 @@ class TunnelManager(
         callEndedRemover?.invoke()
         callEndedRemover = bale.addOnCallEnded { callId ->
             if (callId in seenCallIds && !stopped) {
-                log("[BaleProxy] WebRTC: callEnded for tracked callId=$callId — stopping")
+                log("[BaleProxy] WebRTC: callEnded for tracked callId=$callId — server rejected, stopping")
                 scope.launch {
                     stopped = true
                     transport.disconnect()
-                    onPermanentDisconnect?.invoke()
+                    onPermanentDisconnect?.invoke(/* rejected = */ true)
                 }
             }
         }
@@ -115,7 +119,7 @@ class TunnelManager(
                 attempt++
                 if (attempt > MAX_RECONNECT_ATTEMPTS) {
                     log("[BaleProxy] Reconnect: giving up after $MAX_RECONNECT_ATTEMPTS attempts")
-                    onPermanentDisconnect?.invoke()
+                    onPermanentDisconnect?.invoke(/* rejected = */ false)
                     break
                 }
                 val delaySec = minOf(attempt * 3, 30)
