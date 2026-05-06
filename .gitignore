@@ -8,3 +8,5 @@ bale-vpn-android/local.properties
 bale-vpn-android/**/*.iml
 *.jks
 *.keystore
+
+.DS_Store
