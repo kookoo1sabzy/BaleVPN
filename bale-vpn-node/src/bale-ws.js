@@ -1,0 +1,384 @@
+'use strict';
+
+// BaleWsClient — owns the singleton WebSocket to next-ws.bale.ai. Wires up:
+//   • Custom binary protobuf framing (handshake / ping / RPC / push updates)
+//   • Multi-subscriber call-event listeners (addOnCallReceived, addOnCallEnded)
+//     that survive WS disconnect/reconnect cycles
+//   • The TunnelManager singleton (created in the constructor with hooks back
+//     to BaleConnection — which is supplied lazily via the `connection` param
+//     to avoid a circular import)
+//   • RPC plumbing (acceptCall, discardCall, startCall, sendText, lookupContactName, loadSelf)
+//   • Inner 3-second auto-reconnect on transient WS drops; cancelled by
+//     explicit `disconnect()`. BaleConnection.reconcile() is the lifecycle
+//     authority — this class doesn't try to override that.
+
+const WebSocket = require('ws');
+const {
+    ACCESS_TOKEN, WS_URL, API_VERSION, PROTO_VERSION,
+    PEERTYPE_PRIVATE, PEERTYPE_GROUP, EXPEERTYPE_PRIVATE, EXPEERTYPE_GROUP,
+} = require('./constants');
+const {
+    encodeHandshake, encodePing, encodeRpcRequest,
+    decodeServerFrame, decodeSubscribeResponse, decodeCallResponse,
+    decodeGetContactsResponse, decodeLoadUsersResponse, decodeUserEntity,
+    buildAcceptCallRequest, buildDiscardCallRequest, buildStartCallRequest,
+    buildGetContactsRequest, buildLoadUsersRequest, buildSendMessageRequest,
+} = require('./wire-codecs');
+const { decodeJwtPayload } = require('./grpc-web');
+const { TunnelManager } = require('./tunnel');
+
+class BaleWsClient {
+    /**
+     * @param {{
+     *   resolveWs:                () => Promise<BaleWsClient|null>,
+     *   reconcile:                () => void,
+     *   onTunnelPermanentDisconnect: () => void,
+     * }} connection — BaleConnection hooks. Passed in (rather than imported)
+     *   so this file doesn't depend on ../bale-connection (which itself
+     *   depends on this class). Wired by the entrypoint after construction.
+     */
+    constructor(connection) {
+        this.ws            = null;
+        this.rpcIndex      = 0;
+        this.pingTimer     = null;
+        this.pingCounter   = 0;
+        this.ready         = false;
+        this.subscribeIdx  = null;
+        this.pending       = new Map();
+        this.messages      = [];
+        this.peers         = [];
+        this.tunnel        = new TunnelManager({
+            getBale:               async () => connection.resolveWs(),
+            onTunnelReady:         () => connection.reconcile(),
+            onPermanentDisconnect: () => connection.onTunnelPermanentDisconnect(),
+        });
+        this.accessToken   = ACCESS_TOKEN;
+        this.autoReconnect = false;
+        this.connecting    = false;
+        this.self          = null;       // { id, name, nick } — account owner
+        // Multi-subscriber call event listeners — survive WS disconnect/reconnect
+        // cycles because they live on this singleton, not on each WebSocket session.
+        this._onCallReceivedListeners = [];
+        this._onCallEndedListeners    = [];
+    }
+
+    addOnCallReceived(cb) {
+        this._onCallReceivedListeners.push(cb);
+        return () => {
+            const i = this._onCallReceivedListeners.indexOf(cb);
+            if (i >= 0) this._onCallReceivedListeners.splice(i, 1);
+        };
+    }
+
+    addOnCallEnded(cb) {
+        this._onCallEndedListeners.push(cb);
+        return () => {
+            const i = this._onCallEndedListeners.indexOf(cb);
+            if (i >= 0) this._onCallEndedListeners.splice(i, 1);
+        };
+    }
+
+    connect(token) {
+        if (token) this.accessToken = token;
+        if (!this.accessToken) throw new Error('No access token set');
+        this.autoReconnect = true;
+        this.connecting    = true;
+        console.log(`[WS] Connecting to ${WS_URL}`);
+        const ws = new WebSocket(WS_URL, {
+            headers: {
+                Cookie:       `access_token=${this.accessToken}`,
+                Origin:       'https://web.bale.ai',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            },
+        });
+        this.ws = ws;
+
+        ws.on('open', () => {
+            this.connecting = false;
+            console.log('[WS] Open — sending handshake');
+            ws.send(encodeHandshake());
+        });
+
+        ws.on('message', (data) => {
+            try { this._onFrame(decodeServerFrame(new Uint8Array(data))); }
+            catch (err) { console.error('[WS] Decode error:', err.message); }
+        });
+
+        ws.on('close', (code) => {
+            clearInterval(this.pingTimer);
+            this.ready      = false;
+            this.connecting = false;
+            // Don't tear down LK state on WS drop — server-mode rooms and the
+            // client-mode tunnel are independent of the Bale WS once established.
+            if (code === 4401) {
+                console.error('[WS] 4401 Unauthenticated — token expired');
+                this.autoReconnect = false;
+            } else if (this.autoReconnect) {
+                console.log(`[WS] Closed ${code} — reconnecting in 3 s`);
+                this._reconnectTimer = setTimeout(() => {
+                    this._reconnectTimer = null;
+                    this.connect();
+                }, 3000);
+            } else {
+                console.log(`[WS] Closed ${code}`);
+            }
+        });
+
+        ws.on('error', (err) => console.error('[WS] Error:', err.message));
+    }
+
+    disconnect() {
+        this.autoReconnect = false;
+        this.ready         = false;
+        this.connecting    = false;
+        this.self          = null;
+        // Cancel any pending inner auto-reconnect — BaleConnection.reconcile()
+        // is the sole authority on lifecycle; a stray timer would race and
+        // reopen the WS after we deliberately closed it.
+        if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+        if (this.ws) { this.ws.close(); this.ws = null; }
+        clearInterval(this.pingTimer);
+        console.log('[WS] Disconnected by user');
+    }
+
+    _onFrame(frame) {
+        if (frame.handshakeResponse) {
+            const hs = frame.handshakeResponse;
+            console.log(`[WS] Handshake: proto=${hs.mkprotoVersion} api=${hs.apiVersion}`);
+            if (hs.mkprotoVersion === PROTO_VERSION && hs.apiVersion === API_VERSION) {
+                this.ready = true;
+                console.log('[WS] Ready — subscribing to updates');
+                this._subscribe();
+                this._startPing();
+                this.tunnel.onWsReady();
+                this.loadSelf().catch(e => console.error('[Self] loadSelf failed:', e.message));
+                this.loadContacts().catch(e => console.error('[Contacts] loadContacts failed:', e.message));
+            } else {
+                console.error('[WS] Version mismatch');
+            }
+        }
+
+        if (frame.response) {
+            const rpc = frame.response;
+            const cb = this.pending.get(rpc.index);
+            if (cb) {
+                this.pending.delete(rpc.index);
+                clearTimeout(cb.timer);
+                if (rpc.error) cb.reject(new Error('RPC error: ' + Buffer.from(rpc.error).toString('hex')));
+                else           cb.resolve(rpc.response || new Uint8Array(0));
+            } else if (rpc.response) {
+                this._processUpdate(rpc.response);
+            }
+        }
+
+        if (frame.update?.update) {
+            this._processUpdate(frame.update.update);
+        }
+
+        if (frame.terminateSession) {
+            console.warn('[WS] Session terminated by server');
+        }
+    }
+
+    _subscribe() {
+        this.subscribeIdx = ++this.rpcIndex;
+        this.ws.send(encodeRpcRequest(
+            'bale.maviz.v1.MavizStream',
+            'SubscribeToUpdates',
+            new Uint8Array(0),
+            this.subscribeIdx,
+        ));
+        console.log(`[WS] SubscribeToUpdates sent (idx=${this.subscribeIdx})`);
+    }
+
+    _startPing() {
+        this.pingTimer = setInterval(() => {
+            if (this.ws.readyState === WebSocket.OPEN)
+                this.ws.send(encodePing(++this.pingCounter));
+        }, 10_000);
+    }
+
+    _processUpdate(buf) {
+        let sub;
+        try { sub = decodeSubscribeResponse(buf); } catch (e) { console.log('[Update] decode error:', e.message); return; }
+        const update = sub.update;
+        if (!update) { console.log('[Update] no xC payload, buf len=', buf.length); return; }
+
+        const type = update.message      ? 'message'
+                   : update.callStarted  ? 'callStarted'
+                   : update.callReceived ? 'callReceived'
+                   : update.callAccepted ? 'callAccepted'
+                   : update.callEnded    ? 'callEnded'
+                   : update._unknownFields ? `unknown(fields=${update._unknownFields.join(',')})`
+                   : 'unknown';
+
+        if (update.callStarted || update.callReceived) {
+            const callId = update.callReceived?.callId || update.callStarted?.call?.id;
+            console.log(`[Update] ${type}  callId=${callId}`);
+            const callEntity = update.callStarted?.call || null;
+            if (callId && callId !== '0') {
+                for (const cb of this._onCallReceivedListeners.slice()) {
+                    try { cb(callId, callEntity); }
+                    catch (e) { console.error('[Update] onCallReceived subscriber threw:', e.message); }
+                }
+            }
+        } else if (update.callAccepted) {
+            const callId = update.callAccepted?.call?.id;
+            console.log(`[Update] callAccepted  callId=${callId}`);
+        } else if (update.callEnded) {
+            const callId = update.callEnded.callId;
+            console.log(`[Update] callEnded  callId=${callId}`);
+            for (const cb of this._onCallEndedListeners.slice()) {
+                try { cb(callId); }
+                catch (e) { console.error('[Update] onCallEnded subscriber threw:', e.message); }
+            }
+        } else if (update.message) {
+            const tif  = update.message;
+            const text = tif.message?.textMessage?.text;
+            if (text) {
+                if (this.tunnel.handleIncoming(text, tif.senderUid)) return;
+                const entry = { dir: 'in', from: tif.senderUid, rid: tif.rid, text, ts: Date.now() };
+                console.log(`[Update] message  from=${entry.from}  "${entry.text}"`);
+                this.messages.push(entry);
+            } else {
+                const msgType = tif.message?.type || 'unknown';
+                console.log(`[Update] message  from=${tif.senderUid}  (${msgType})`);
+            }
+        } else {
+            console.log(`[Update] ${type}`);
+        }
+    }
+
+    async discardCall(callId) {
+        try {
+            await this._rpcCall('bale.meet.v1.Meet', 'DiscardCall', buildDiscardCallRequest(callId));
+        } catch (e) { console.error(`[DiscardCall] ${callId} failed:`, e.message); }
+    }
+
+    async acceptCall(callId) {
+        const buf = await this._rpcCall('bale.meet.v1.Meet', 'AcceptCall', buildAcceptCallRequest(callId));
+        const resp = decodeCallResponse(buf);
+        console.log('[AcceptCall] call:', JSON.stringify(resp.call));
+        if (!resp.call?.token) console.log('[AcceptCall] raw (no token):', Buffer.from(buf).toString('hex'));
+        return resp;
+    }
+
+    async startCall(peerId, peerType) {
+        const rid = String(Date.now());
+        const buf = await this._rpcCall('bale.meet.v1.Meet', 'StartCall', buildStartCallRequest(peerId, peerType, rid));
+        return decodeCallResponse(buf);
+    }
+
+    _rpcCall(serviceName, method, payload) {
+        return new Promise((resolve, reject) => {
+            if (!this.ready) return reject(new Error('Not connected'));
+            const idx   = ++this.rpcIndex;
+            const timer = setTimeout(() => { this.pending.delete(idx); reject(new Error('Timeout')); }, 15_000);
+            this.pending.set(idx, {
+                resolve: (buf) => { clearTimeout(timer); resolve(buf); },
+                reject:  (e)   => { clearTimeout(timer); reject(e); },
+                timer,
+            });
+            this.ws.send(encodeRpcRequest(serviceName, method, payload, idx));
+        });
+    }
+
+    async lookupContactName(uid) {
+        const n = Number(uid);
+        if (!n || n <= 0) return null;
+        if (!this.peers.length) {
+            try { await this.loadContacts(); } catch (_) {}
+        }
+        const hit = this.peers.find(p => Number(p.id) === n);
+        return hit ? hit.name : null;
+    }
+
+    async loadSelf() {
+        const payload = decodeJwtPayload(this.accessToken);
+        if (!payload) { console.warn('[Self] could not decode JWT payload'); return null; }
+        if (!this._jwtPayloadLogged) {
+            this._jwtPayloadLogged = true;
+            console.log('[Self] JWT payload:', JSON.stringify(payload));
+        }
+        // Bale nests the actual user id under a `payload` claim:
+        //   { iss, exp, payload: { user_id, app_id, auth_id, auth_sid, service } }
+        const inner = payload.payload || {};
+        const uid = Number(
+            inner.user_id || inner.userId || inner.uid ||
+            payload.user_id || payload.userId || payload.uid || payload.sub || payload.id ||
+            0
+        );
+        if (!uid) {
+            console.warn('[Self] no numeric user id in JWT — outer:', Object.keys(payload).join(','),
+                         '— inner:', Object.keys(inner).join(','));
+            return null;
+        }
+        try {
+            const buf = await this._rpcCall(
+                'bale.users.v1.Users', 'LoadUsers',
+                buildLoadUsersRequest([{ uid, accessHash: '0' }]),
+            );
+            const loaded = decodeLoadUsersResponse(buf);
+            if (!loaded.users.length) { console.warn(`[Self] LoadUsers returned no entries for uid=${uid}`); return null; }
+            const u = decodeUserEntity(loaded.users[0]);
+            this.self = { id: u.id || uid, name: u.name || '', nick: u.nick || '' };
+            console.log(`[Self] ${this.self.name || '(no name)'}${this.self.nick ? ` @${this.self.nick}` : ''} (${this.self.id})`);
+            return this.self;
+        } catch (e) { console.error('[Self] LoadUsers failed:', e.message); return null; }
+    }
+
+    async loadContacts() {
+        const contactsBuf = await this._rpcCall(
+            'bale.users.v1.Users', 'GetContacts', buildGetContactsRequest()
+        );
+        const contacts = decodeGetContactsResponse(contactsBuf);
+        console.log(`[Contacts] GetContacts: ${contacts.users.length} users, ${contacts.userPeers.length} peers, notChanged=${contacts.isNotChanged}`);
+
+        let peers = [];
+        if (contacts.userPeers.length > 0) {
+            const loadBuf = await this._rpcCall(
+                'bale.users.v1.Users', 'LoadUsers', buildLoadUsersRequest(contacts.userPeers)
+            );
+            const loaded = decodeLoadUsersResponse(loadBuf);
+            for (const b of loaded.users) {
+                const u = decodeUserEntity(b);
+                if (u.id) {
+                    const label = u.name + (u.nick ? ` (@${u.nick})` : '');
+                    peers.push({ id: u.id, name: label, type: PEERTYPE_PRIVATE });
+                }
+            }
+            console.log(`[Contacts] LoadUsers returned ${peers.length} users`);
+        } else if (contacts.users.length > 0) {
+            for (const b of contacts.users) {
+                const u = decodeUserEntity(b);
+                if (u.id) {
+                    const label = u.name + (u.nick ? ` (@${u.nick})` : '');
+                    peers.push({ id: u.id, name: label, type: PEERTYPE_PRIVATE });
+                }
+            }
+            console.log(`[Contacts] Used inline users: ${peers.length}`);
+        }
+
+        peers.sort((a, b) => a.name.localeCompare(b.name));
+        this.peers = peers;
+        return peers;
+    }
+
+    sendText(peerId, peerType, text) {
+        return new Promise((resolve, reject) => {
+            if (!this.ready) return reject(new Error('Not connected to Bale'));
+            const idx        = ++this.rpcIndex;
+            const exPeerType = peerType === PEERTYPE_GROUP ? EXPEERTYPE_GROUP : EXPEERTYPE_PRIVATE;
+            const rid        = String(Date.now());
+            const payload    = buildSendMessageRequest(peerId, peerType, exPeerType, rid, text);
+            const timer      = setTimeout(() => {
+                this.pending.delete(idx);
+                reject(new Error('Request timed out'));
+            }, 10_000);
+            this.pending.set(idx, { resolve, reject, timer });
+            this.ws.send(encodeRpcRequest('bale.messaging.v2.Messaging', 'SendMessage', payload, idx));
+        });
+    }
+}
+
+module.exports = { BaleWsClient };
