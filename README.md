@@ -1,99 +1,46 @@
 # Bale VPN
 
-## راهنمای فارسی کاربر (اپلیکیشن اندروید)
+A peer-to-peer VPN that tunnels IP traffic over the **Bale** messenger's voice-call infrastructure (`web.bale.ai`). One device runs as the *server* (provides internet); another as the *client* (consumes it). To Bale's servers the link looks like a long voice call between two contacts.
+
+The point: when one person has a working / uncensored connection and the other doesn't, the second person can route their traffic through the first — without any extra server, account, payment, or signup. Just install the app on two phones (or a laptop on the server side), make sure the two accounts have each other in their contact list, and connect.
+
+There is no commercial relationship with Bale.
 
 <div dir="rtl">
 
-### این برنامه چه کاری انجام می‌دهد؟
+## دربارهٔ پروژه
 
-این برنامه به شما اجازه می‌دهد اینترنت یک گوشی اندرویدی را از طریق پیام‌رسان **بله** با یک گوشی دیگر به اشتراک بگذارید. یعنی اگر یک نفر اینترنت سالم و پایدار دارد و نفر دیگر نه، فرد دوم می‌تواند تمام ترافیک گوشی‌اش را از طریق گوشی نفر اول به اینترنت بفرستد. این کار با استفاده از زیرساخت تماس صوتی بله انجام می‌شود؛ یعنی برای سرورهای بله این ارتباط شبیه یک تماس صوتی طولانی به نظر می‌رسد. نیازی به روت کردن گوشی، تنظیمات پیچیده یا سرور جداگانه نیست — فقط دو گوشی و دو حساب کاربری بله کافی است.
+این پروژه یک VPN نقطه‌به‌نقطه است که ترافیک IP را روی زیرساخت تماس صوتی پیام‌رسان **بله** عبور می‌دهد. یک دستگاه نقش *سرور* را دارد (اینترنت می‌دهد) و دستگاه دیگر نقش *کلاینت* را (اینترنت می‌گیرد). برای سرورهای بله این ارتباط شبیه یک تماس صوتی طولانی بین دو مخاطب به نظر می‌رسد.
 
-همچنین می‌توانید این اینترنت را روی گوشی کلاینت با دستگاه‌های دیگر خود (مثل لپ‌تاپ یا گوشی دوم) نیز به اشتراک بگذارید — کافی است روی گوشی کلاینت یک برنامه‌ی پراکسی مانند **EveryProxy** نصب کنید و دستگاه‌های دیگر را از طریق وای‌فای به آن متصل کنید.
+هدف: وقتی یک نفر اینترنت سالم دارد و نفر دیگر نه، نفر دوم بدون هیچ سرور یا اشتراک اضافه‌ای می‌تواند ترافیکش را از طریق نفر اول رد کند. فقط کافی است هر دو طرف، هم در بله ثبت‌نام کرده باشند و هم یکدیگر را در فهرست مخاطبین داشته باشند.
 
-### پیش‌نیازها
-
-برای استفاده از این برنامه به دو گوشی اندرویدی نیاز دارید که هر دو در پیام‌رسان **بله** ثبت‌نام کرده باشند و **یکدیگر را در لیست مخاطبین خود داشته باشند** (بله فقط بین مخاطبین اجازه تماس می‌دهد).
-
-- **گوشی سرور**: گوشی‌ای که اینترنت سالم دارد و قرار است اینترنتش را به اشتراک بگذارد.
-- **گوشی کلاینت**: گوشی‌ای که می‌خواهد از اینترنت گوشی سرور استفاده کند.
-
-### ۱. نصب و ورود
-
-پس از نصب فایل APK، برنامه را باز کنید. شماره موبایل خود را وارد کنید، کد پیامکی را تأیید کنید و وارد شوید. این کار را روی **هر دو گوشی** انجام دهید.
-
-<p align="center"><img src="docs/screens/01-login.jpg" alt="صفحه ورود" width="320"></p>
-
-### ۲. استفاده از گوشی کلاینت (مصرف‌کننده اینترنت)
-
-روی گوشی‌ای که می‌خواهد از اینترنت گوشی سرور استفاده کند:
-
-۱. در صفحه اصلی، کلید حالت را روی **کلاینت (Client)** قرار دهید.
-
-۲. روی **انتخاب مخاطب (Select Peer)** بزنید و از فهرست، مخاطبی که نقش سرور دارد را انتخاب کنید.
-
-۳. روی **شروع VPN (Start VPN)** بزنید. اندروید یک پنجره می‌آورد و اجازه ساخت اتصال VPN را می‌خواهد — **تأیید** کنید.
-
-۴. تمام شد. از این لحظه، اینترنت گوشی شما از طریق گوشی سرور تأمین می‌شود. مقدار داده‌ی ارسالی و دریافتی زیر دکمه نمایش داده می‌شود.
-
-<p align="center"><img src="docs/screens/02-client-mode.jpg" alt="حالت کلاینت" width="320"></p>
-
-<p align="center"><img src="docs/screens/03-client-mode-connect-vpn.jpg" alt="اتصال VPN در حالت کلاینت" width="320"></p>
-
-### ۳. تنظیم گوشی سرور (اشتراک‌گذار اینترنت)
-
-روی گوشی‌ای که می‌خواهد اینترنت را به اشتراک بگذارد:
-
-۱. در صفحه اصلی، کلید حالت را روی **سرور (Server)** قرار دهید. سرویس به‌صورت خودکار اجرا می‌شود و منتظر تماس‌های ورودی می‌ماند.
-
-۲. اگر می‌خواهید کسی غیر از مخاطب فعلی هم بتواند وصل شود، روی دکمه **مخاطبین (Contacts)** بزنید و او را با شماره موبایل اضافه کنید.
-
-۳. در صورت تمایل، از منوی **مدیریت کلاینت‌ها (Manage Clients)** سرعت اینترنت هر کاربر را محدود کنید (پیش‌فرض ۳۰۰ کیلوبیت بر ثانیه، حداکثر ۵۰۰).
-
-<p align="center"><img src="docs/screens/04-server-mode.jpg" alt="حالت سرور" width="320"></p>
-
-وقتی شخصی خارج از لیست مجاز بخواهد متصل شود، یک نوتیفیکیشن روی گوشی شما می‌آید تا درخواست را **تأیید** یا **رد** کنید.
-
-<p align="center"><img src="docs/screens/05-pending-request.jpg" alt="اعلان درخواست اتصال" width="320"></p>
-
-از صفحه‌ی **مدیریت کلاینت‌ها** می‌توانید کاربران متصل، مصرف لحظه‌ای آن‌ها و سقف سرعت هرکدام را ببینید و در صورت نیاز یک کاربر را قطع کنید.
-
-<p align="center"><img src="docs/screens/06-manage-clients.jpg" alt="صفحه مدیریت کلاینت‌ها" width="320"></p>
-
-### ۴. به اشتراک گذاشتن اینترنت با دستگاه‌های دیگر (اختیاری)
-
-اگر می‌خواهید همین اینترنت روی لپ‌تاپ یا یک گوشی دیگر هم در دسترس باشد، روی گوشی کلاینت یک برنامه پراکسی مانند **EveryProxy** نصب کنید. این برنامه یک پراکسی HTTP/SOCKS روی گوشی شما راه‌اندازی می‌کند. کافی است گوشی کلاینت را به نقطه‌ی دسترسی (هات‌اسپات) وای‌فای تبدیل کنید (یا دستگاه‌های دیگر را به همان وای‌فای متصل کنید) و در تنظیمات شبکه‌ی آن دستگاه‌ها، آدرس IP و پورت پراکسی گوشی کلاینت را وارد کنید. به این ترتیب همه‌ی دستگاه‌های متصل از همان اینترنت گوشی سرور استفاده می‌کنند.
-
-### ۵. قطع کردن اتصال
-
-- **در حالت کلاینت**: روی دکمه **قطع (Disconnect)** بزنید تا VPN خاموش شود.
-- **در حالت سرور**: کلید حالت را به **کلاینت** برگردانید تا سرویس متوقف شود. اگر می‌خواهید فقط همه کاربران فعلی را قطع کنید بدون توقف سرویس، از دکمه قطع وب‌سوکت استفاده کنید.
-
-### نکات مهم
-
-- تماس‌های بله فقط بین مخاطبین برقرار می‌شود؛ پس هر دو طرف باید شماره یکدیگر را به عنوان مخاطب ذخیره داشته باشند.
-- این برنامه نیاز به روت یا دسترسی خاصی ندارد.
-- در حالت سرور، گوشی باید روشن بماند و برنامه در پس‌زمینه فعال باشد تا کاربران بتوانند متصل شوند.
-- ترافیک در نگاه سرورهای بله شبیه یک تماس صوتی طولانی دیده می‌شود.
+این پروژه هیچ ارتباط تجاری‌ای با بله ندارد.
 
 </div>
 
 ---
 
-Reverse-engineered tooling for the **Bale** messenger (`web.bale.ai`) — extracts the protobuf services from Bale's minified webpack bundles and uses them to build a peer-to-peer VPN that tunnels traffic over Bale's WebRTC voice-call infrastructure.
+## ⚠️ Privacy & encryption
 
-A connected client picks any of their Bale contacts to act as a tunnel server. The TCP/IP traffic rides on the LiveKit data channel that Bale uses for voice-call media — to Bale's servers it looks like a long voice call.
+The LiveKit data channel is encrypted with **DTLS**, so traffic is opaque to passive observers on the network and to ISP middleboxes. **However, Bale's LiveKit server is the SFU/TURN node and has access to the plaintext of the data flowing through the call.** That means:
 
----
+- Bale can see **which destinations you connect to** (IP and port, or hostname if your client sends one — see the [Node SOCKS5 doc](docs/node-en.md#configuring-a-browser-as-a-client) for DNS-leak avoidance).
+- Bale can read the **contents of any traffic that isn't itself end-to-end encrypted**. If you only browse `https://` sites, the payload is opaque to them; if you access plaintext HTTP / DNS / FTP / etc. through the tunnel, they can read it.
 
-## What's in here
+Treat this tunnel like a corporate VPN whose operator you don't fully trust — fine for IP-level reachability (uncensoring), **not adequate as an anonymity or end-to-end privacy layer**. Use TLS at the application level (HTTPS, encrypted DNS, etc.).
 
-| Component | Path | Role |
-|---|---|---|
-| Asset downloader | `reverse_engineering/download.py` | grabs the Bale web app bundles into `reverse_engineering/static/` |
-| Proto extractor | `reverse_engineering/extract_proto.py` | parses webpack chunks → `.proto` files into `bale-vpn-node/proto/` |
-| Node.js package | `bale-vpn-node/` | WebSocket client + SOCKS5 / WebRTC tunnel + web UI; can run as VPN server (Linux, with TUN) |
-| Android app (Kotlin Multiplatform) | `bale-vpn-android/` | dual-mode VPN: **client** (route this device's traffic) or **server** (host other peers' traffic via an in-process userspace TCP/IP stack — no root, no kernel TUN) |
-| Static assets snapshot | `reverse_engineering/static/` | downloaded copy of `web.bale.ai` |
+<div dir="rtl">
+
+### ⚠️ امنیت و رمزنگاری
+
+کانال دادهٔ LiveKit با **DTLS** رمزنگاری می‌شود؛ بنابراین ترافیک از دید ناظرهای مسیر و میدلباکس‌های ISP پنهان است. **اما سرور LiveKit بله نقش SFU/TURN را بازی می‌کند و به دادهٔ رمزگشایی‌شدهٔ تماس دسترسی دارد.** یعنی:
+
+- بله می‌تواند ببیند **شما به چه مقصدی وصل می‌شوید** (IP و پورت، یا نام میزبان اگر کلاینت شما نام بفرستد — برای جلوگیری از نشت DNS به [راهنمای SOCKS5 در نسخهٔ Node](docs/node-fa.md#تنظیم-مرورگر-بهعنوان-کلاینت) مراجعه کنید).
+- بله می‌تواند **محتوای هر ترافیکی را که خودش رمزنگاری انتها به انتها نشده** بخواند. اگر فقط روی `https://` بگردید، محتوا برایشان مبهم است؛ اما اگر از پروتکل‌های متنی (HTTP/DNS/FTP/…) استفاده کنید، قابل خواندن خواهد بود.
+
+این تونل را مثل VPN شرکتی‌ای ببینید که گرداننده‌اش را کاملاً نمی‌شناسید — برای دسترسی IP (دور زدن مسدودی) خوب است، **اما برای ناشناسی یا حریم خصوصی انتها به انتها کافی نیست**. در سطح برنامه از TLS (HTTPS، DNS رمزنگاری‌شده و…) استفاده کنید.
+
+</div>
 
 ---
 
@@ -104,14 +51,37 @@ A connected client picks any of their Bale contacts to act as a tunnel server. T
 | Client | Node.js — Linux / macOS / Windows | ✓ | — |
 | Client | Android | — | ✓ &nbsp;*(kernel TUN via `VpnService`)* |
 | Server | Node.js — Linux / macOS / Windows | ✓ | — |
-| Server | Node.js — **Linux** | ✓ | ✓ &nbsp;*(kernel TUN; needs `setcap cap_net_admin` + iptables MASQUERADE)* |
+| Server | Node.js — **Linux** | ✓ | ✓ &nbsp;*(kernel TUN; needs `setcap cap_net_admin` + `iptables` MASQUERADE)* |
 | Server | Android | — | ✓ &nbsp;*(in-process userspace TCP/IP NAT; no root, no kernel TUN, no iptables)* |
 
-> **Most convenient: Android server + Android client.** Two phones, install the APK on both, sign in to Bale, flip the toggle. No root, no command line, no firewall rules — the Android server's in-process userspace TCP/IP stack handles routing and NAT entirely inside the app.
+> **Easiest start: Android server + Android client.** Two phones, install the APK on both, sign in to Bale, flip the toggle. No root, no command line, no firewall rules.
 >
-> **Best throughput: Linux Node server + Android client.** On Linux the kernel does the IP routing (kernel TUN device) and the NAT (`iptables` MASQUERADE rule), both of which are substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
+> **Most efficient: Linux Node TUN VPN server + Android client.** On Linux the kernel does the IP forwarding (TUN device) and the NAT (`iptables` MASQUERADE rule) — both substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
 
-The Node.js side is platform-agnostic for **SOCKS5** in both directions — pick any OS for either end. Full **VPN** routing on the Node side is Linux-only because it relies on the kernel TUN device and `iptables`-managed NAT. The Linux server therefore needs a one-time setup: `setcap cap_net_admin+eip $(which node)` (so the Node process can manage the TUN interface without root) and a single `iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE` rule (so kernel NAT translates client traffic out the host's real interface). The Android app does not expose a SOCKS5 mode; it always uses the system VPN.
+The Node.js side is platform-agnostic for **SOCKS5** in both directions — pick any OS for either end. Full **VPN** routing on the Node side is Linux-only because it relies on the kernel TUN device and `iptables`-managed NAT. The Android app does not expose a SOCKS5 mode; it always uses the system VPN.
+
+<div dir="rtl">
+
+> **شروع آسان: سرور اندرویدی + کلاینت اندرویدی.** فقط دو گوشی؛ APK را روی هر دو نصب کنید، در بله وارد شوید، و کلید حالت را جابه‌جا کنید. نه روت، نه خط فرمان، نه قواعد دیوارهٔ آتش.
+>
+> **پربازده‌ترین: سرور TUN روی Node لینوکسی + کلاینت اندرویدی.** روی لینوکس، خودِ هستهٔ سیستم‌عامل فوروارد IP را انجام می‌دهد (دستگاه TUN) و NAT را هم با قاعدهٔ `iptables` MASQUERADE اعمال می‌کند — هر دو مسیر به‌مراتب سریع‌تر از جایگزین‌های فضای کاربری هستند. کلاینت اندرویدی هم از طریق `VpnService` استاندارد به یک VPN کاملاً یکپارچهٔ سیستمی وصل می‌شود.
+
+نسخهٔ Node برای **SOCKS5** در هر دو جهت مستقل از سیستم‌عامل است — می‌توانید برای هر طرف هر OS را انتخاب کنید. ولی **مسیریابی کامل VPN** در سمت Node فقط روی لینوکس کار می‌کند، چون به دستگاه TUN هسته و NAT مدیریت‌شده با iptables متکی است. اپلیکیشن اندروید حالت SOCKS5 ندارد و همیشه از VPN سیستمی استفاده می‌کند.
+
+</div>
+
+---
+
+## Detailed guides
+
+Per-platform setup, manuals, and screenshots:
+
+| Platform | English | فارسی |
+|---|---|---|
+| **Android** (client and userspace-TCP/IP server) | [Android user guide](docs/android-en.md) | [راهنمای کاربری اپلیکیشن اندروید](docs/android-fa.md) |
+| **Node.js** — Linux / macOS / Windows (SOCKS5 client + server, Linux TUN VPN server) | [Node.js application guide](docs/node-en.md) | [راهنمای نسخهٔ Node](docs/node-fa.md) |
+
+For protocol internals, wire formats, and architecture details: [CLAUDE.md](CLAUDE.md).
 
 ---
 
@@ -126,124 +96,17 @@ The Node.js side is platform-agnostic for **SOCKS5** in both directions — pick
           ▼                                                   ▼
   ┌───────────────┐    LiveKit "voice call"         ┌───────────────┐
   │  VPN client   │   raw IP packets in the         │  VPN server   │
-  │ (Android app  │   data channel                  │ (Android app  │
-  │  client mode  │ ◄─────────────────────────────► │  server mode  │
-  │   or browser) │                                 │  or Linux Node)│
+  │  (Android,    │   data channel (DTLS)           │  (Android, or │
+  │   or Node     │ ◄─────────────────────────────► │   Node Linux  │
+  │   SOCKS5)     │                                 │   TUN, or     │
+  │               │                                 │   Node SOCKS5)│
   └───────────────┘                                 └───────┬───────┘
                                                             │
                                                             ▼
                                                        open internet
 ```
 
-Both ends speak the **Bale signaling WS** to set up calls, then exchange traffic on the **LiveKit data channel** that Bale provisions for the call. No traffic transits Bale's servers other than what the data channel routes through TURN when peers can't connect directly.
-
----
-
-## Easiest setup: just use the Android app
-
-Install the APK on **two Android devices** (yours + whoever you want to share with) — both signed in to Bale and **already in each other's contacts** (Bale only allows calls between contacts). One device acts as the *server / internet-giver* — it stays on a working internet connection and bridges traffic onto the open net. The other acts as the *client* — it registers as the system VPN and routes its own traffic through the server over the Bale call channel.
-
-```
-   Client device                                        Server device
-   (consumes internet)                                  (provides internet)
-   ┌─────────────────┐                                  ┌─────────────────┐
-   │ Bale app, mode  │                                  │ Bale app, mode  │
-   │     CLIENT      │  ◄─── data via LiveKit ───────►  │     SERVER      │
-   │ Start VPN ──┐   │      (looks like a voice call)   │ (auto-answers)  │
-   └─────────────┼───┘                                  └────────┬────────┘
-                 │                                               │
-                 │  all traffic from this device                 ▼
-                 └────────────────────────────────────────►  open internet
-```
-
-1. **Server device** — open the app, log in, toggle to **Server**. The foreground service starts and waits for incoming calls. Optionally tweak per-client bandwidth caps in *Manage Clients* (default 300 kbps, max 500 kbps).
-2. **Client device** — open the app, log in, toggle to **Client**, tap *Select Peer* and pick the server's contact, then *Start VPN* and grant the system-VPN permission. Done — all traffic on the client device now exits via the server's internet.
-
-Either side can disconnect by toggling modes or pressing the obvious buttons. Pending connection requests (when the caller isn't in the server's allow-list yet) raise a notification on the server device — the user accepts or rejects per call.
-
-**Get the APK**: download the latest release from this repository's [Releases](../../releases) page. No Play Store, no signed root, no special privileges — just install and run.
-
-The rest of this README is for users who want to extract the protos themselves, run the Node.js side, or hack on the codebase.
-
----
-
-## Quick start
-
-### 1 · Get the protos
-
-```bash
-python3 reverse_engineering/download.py
-python3 reverse_engineering/extract_proto.py
-```
-
-This populates `reverse_engineering/static/` and writes `.proto` files into `bale-vpn-node/proto/`. Both scripts need an `access_token` cookie from `web.bale.ai` hardcoded inside (see [CLAUDE.md](CLAUDE.md) → *Authentication*).
-
-### 2 · Node.js side
-
-```bash
-cd bale-vpn-node
-npm install
-npm run build         # compile .proto → src/messages.js
-npm run ui            # web UI at http://localhost:3001
-```
-
-Then open the UI, select a Bale contact, and click **Activate** under "⚡ Tunnel proxy" to start a SOCKS5 proxy on `localhost:1080` that tunnels through them.
-
-To run the Node side as a **VPN server** (Linux only, requires a TUN device):
-
-```bash
-sudo setcap cap_net_admin+eip $(which node)
-sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
-node src/ws-client.js server
-```
-
-### 3 · Android app
-
-Open `bale-vpn-android/` in Android Studio.
-
-The app supports SMS authentication, a contacts picker, and **two operating modes** selected via a single toggle:
-
-- **Client mode** — registers as the system VPN, routes the device's traffic through the selected Bale contact. Explicit Start/Disconnect button.
-- **Server mode** — implicit: as soon as the toggle is on server, a foreground service starts and auto-answers calls from peers, bridging their traffic to the open internet via a fully-userspace TCP/IP stack. No root, no kernel TUN, no iptables. Toggling back to client stops the server.
-
-The TUN read loop uses `Os.poll(2) + Os.read(2)` directly (the VpnService TUN fd is opened in `O_NONBLOCK` mode on modern Android, which `FileInputStream.read` mishandles).
-
-In server mode there's a **Manage Clients** screen that shows every connected peer with live throughput, per-client bandwidth caps (default 300 kbps, max 500 kbps), and an admission allow-list so you decide who's allowed to connect. Pending requests are auto-rejected after 60 s if the user doesn't respond. The WebSocket Disconnect button explicitly disconnects every active client (sending `discardCall` over the still-alive WS so peers tear down immediately); transient WS drops are handled silently by an internal 5 s reconnect loop and don't affect connected clients.
-
-The server tab also has a **Contacts** screen (Bale only allows calls between contacts, so anyone who wants to connect must already be in your contact list). You can add new contacts by phone number and remove existing ones from there.
-
----
-
-## Mode comparison
-
-|  | Node.js server | Android server |
-|---|---|---|
-| OS | Linux only | Android only |
-| Privileges | needs `setcap cap_net_admin` + iptables MASQUERADE | none — runs as ordinary user |
-| TCP/IP | kernel TUN device (`bale0`) | in-process userspace stack ([`PacketProcessor.kt`](bale-vpn-android/shared/src/androidMain/kotlin/ai/bale/proxy/PacketProcessor.kt)) |
-| Per-client controls | basic stats | per-client live stats (kbps), bandwidth caps, throttle indicator, admission allow-list, debug log toggle |
-| Pending-call handling | auto-accept | allow / reject notification, deduplicated per caller, 60 s auto-reject |
-| Setup | one-shot iptables rule, then run | install APK, flip toggle to server |
-
-The Android userspace stack implements a fairly complete modern TCP — full state machine, MSS option, window scaling (RFC 7323), SACK + RFC 6675 IsLost loss detection, RFC 8985 Tail Loss Probe, NewReno step 5, Karn's algorithm, SWS-avoidance, deadline-based timers, fragment reassembly with DoS bounds, and per-direction token-bucket rate limiting with proper backpressure (download → TCP read pause; upload → IP packet hold). See the file header in `PacketProcessor.kt` for the full feature list.
-
----
-
-## Authentication
-
-The Bale WS uses the `access_token` JWT cookie scoped to `.bale.ai`. To refresh:
-
-1. Open `web.bale.ai` in Chrome.
-2. DevTools → Application → Cookies → `https://web.bale.ai` → copy `access_token`.
-3. Paste it into the `ACCESS_TOKEN` constant in `reverse_engineering/download.py` and `bale-vpn-node/src/ws-client.js`.
-
-WebSocket close code `4401` means the token has expired. Android app users authenticate via SMS OTP and the access token is fetched server-side — no manual update needed there.
-
----
-
-## Documentation
-
-[**CLAUDE.md**](CLAUDE.md) is the deep-dive: wire formats, the extracted protobuf services, the SOCKS5-over-Bale-message protocol, the LiveKit binary framing, and the full Android server-mode architecture (PacketProcessor, admission control, bandwidth limits, Manage Clients UI).
+Both ends speak the **Bale signaling WS** to set up the call, then exchange traffic on the **LiveKit data channel** that Bale provisions for that call. The Bale WS is dropped after signaling (and brought back automatically when needed); the LiveKit data channel carries all the steady-state IP / TCP traffic.
 
 ---
 
@@ -271,6 +134,4 @@ If you are unsure whether your intended use is lawful in your jurisdiction, cons
 
 ## License
 
-Released under the [MIT License](LICENSE). See the `LICENSE` file at the root of this repository for the full text.
-
-In short: you're free to use, modify, and redistribute the code for any purpose, including commercial, *provided* the copyright notice and license text are preserved. The software is provided "as is", without warranty of any kind. The disclaimer above applies in addition to (not in place of) the license terms.
+Released under the [MIT License](LICENSE). The software is provided "as is", without warranty of any kind. The disclaimer above applies in addition to (not in place of) the license terms.
