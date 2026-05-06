@@ -106,6 +106,7 @@ function create(client, connection) {
             }
             client.disconnect();
             client.accessToken = '';
+            client.self        = null;
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok: true }));
         }
