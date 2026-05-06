@@ -49,8 +49,16 @@ In **client mode** the binary auto-opens `http://localhost:3001` in your default
 When you launch in client mode, the binary opens `http://localhost:3001` in your default browser. The UI flow:
 
 1. **Sign in** — phone number → SMS code, or paste an `access_token` JWT cookie from `web.bale.ai` directly. Once signed in, the token is persisted in browser `localStorage` so it survives reloads.
+
+   <p align="center"><img src="screens/07-node-login.png" alt="Sign-in screen" width="640"></p>
+
 2. **Tunnel proxy** — pick a Bale contact from the list (or search by phone number to pull in a new one), choose a SOCKS5 port (default 1080), and click **Activate**.
+
+   <p align="center"><img src="screens/10-client-peer-selection.png" alt="Client peer selection" width="640"></p>
+
 3. The status row turns green when the WebRTC tunnel is up. From this point your apps can use `127.0.0.1:1080` as a SOCKS5 proxy and the traffic flows through the chosen contact.
+
+   <p align="center"><img src="screens/11-client-connected.png" alt="Tunnel activated" width="640"></p>
 
 In server mode the UI also shows live **Connected clients**, a **Pending requests** queue with Accept/Reject buttons, and an **Allowed callers** allow-list — see [Server admission control](#server-admission-control) below.
 
@@ -159,12 +167,16 @@ When an Android client connects, it gets `10.8.0.2/24` and routes all of its tra
 
 Whether running as SOCKS5 server or TUN VPN server, every incoming call from a contact who isn't on the allow-list lands in a **pending** queue. The web UI surfaces it as a yellow row with **Accept once / Allow always / Reject** buttons.
 
+<p align="center"><img src="screens/08-server-client-pending.png" alt="Server: pending request" width="640"></p>
+
 - "Accept once" handles this single call but doesn't persist the caller.
 - "Allow always" persists the caller's user-id to `bale-vpn-node/.allowed-callers.json`. Future calls from the same caller auto-accept.
 - "Reject" sends a `DiscardCall` so the caller's tunnel tears down immediately instead of waiting for a timeout.
 - Pending entries auto-reject after 60 s.
 
 Connected clients show their resolved Bale contact name (and user-id) in the **Connected clients** card. Each row has its own Disconnect button.
+
+<p align="center"><img src="screens/09-server-client-connected.png" alt="Server: connected client" width="640"></p>
 
 ---
 

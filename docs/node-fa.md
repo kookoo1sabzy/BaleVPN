@@ -51,8 +51,16 @@ chmod +x balevpn-*-{linux,macos}-*
 وقتی در حالت کلاینت اجرا می‌کنید، فایل اجرایی `http://localhost:3001` را در مرورگر پیش‌فرض باز می‌کند. مراحل کار:
 
 1. **ورود** — شماره تلفن، سپس کد پیامکی؛ یا کوکی JWT `access_token` را از `web.bale.ai` در کادر مربوطه پِیست کنید. توکن در `localStorage` مرورگر ذخیره می‌شود و با بارگذاری مجدد از بین نمی‌رود.
+
+   <p align="center"><img src="screens/07-node-login.png" alt="صفحهٔ ورود" width="640"></p>
+
 2. **پراکسی تونل** — یک مخاطب بله را از فهرست انتخاب کنید (یا با شمارهٔ تلفن جستجو کرده و اضافه کنید)، پورت SOCKS5 را تعیین کنید (پیش‌فرض ۱۰۸۰)، روی **Activate** بزنید.
+
+   <p align="center"><img src="screens/10-client-peer-selection.png" alt="انتخاب مخاطب در حالت کلاینت" width="640"></p>
+
 3. وقتی نوار وضعیت سبز شد، تونل WebRTC برقرار است. از این لحظه می‌توانید برنامه‌های خود را به `127.0.0.1:1080` به‌عنوان پراکسی SOCKS5 وصل کنید.
+
+   <p align="center"><img src="screens/11-client-connected.png" alt="تونل فعال" width="640"></p>
 
 در حالت سرور همین صفحه **کلاینت‌های متصل**، فهرست **درخواست‌های در انتظار تأیید** (با دکمه‌های Accept / Allow always / Reject) و فهرست **مجاز** را نشان می‌دهد.
 
@@ -165,12 +173,16 @@ sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
 
 چه در نقش سرور SOCKS5 و چه TUN VPN، هر تماس ورودی از مخاطبی که در فهرست مجاز نیست، در صف **در انتظار** قرار می‌گیرد. UI آن را به‌شکل ردیف زرد با دکمه‌های **Accept once / Allow always / Reject** نشان می‌دهد.
 
+<p align="center"><img src="screens/08-server-client-pending.png" alt="سرور: درخواست در انتظار تأیید" width="640"></p>
+
 - **Accept once** فقط همین تماس را پذیرش می‌کند.
 - **Allow always** شناسهٔ کاربر را در `bale-vpn-node/.allowed-callers.json` ذخیره می‌کند تا تماس‌های بعدی از همان کاربر خودکار پذیرفته شوند.
 - **Reject** یک `DiscardCall` می‌فرستد تا تونل سمتِ کلاینت بلافاصله بسته شود.
 - ردیف‌های در انتظار، بعد از ۶۰ ثانیه به‌صورت خودکار رد می‌شوند.
 
 کلاینت‌های متصل، نام مخاطب بله‌شان (به همراه شناسهٔ کاربر) را در کارت **Connected clients** نشان می‌دهند. هر ردیف دکمهٔ Disconnect مخصوص خود را دارد.
+
+<p align="center"><img src="screens/09-server-client-connected.png" alt="سرور: کلاینت متصل" width="640"></p>
 
 ---
 
