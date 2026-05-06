@@ -131,7 +131,11 @@ class BaleWsClient {
         this.autoReconnect = false;
         this.ready         = false;
         this.connecting    = false;
-        this.self          = null;
+        // `self` is intentionally NOT cleared here — the user's identity is tied
+        // to the access token, not the socket. Client-mode tunnel activation
+        // drops the WS by design once signaling is done; nulling `self` here
+        // would blank the UI's "signed in as" label every time. `self` is
+        // cleared by the logout path (where the token actually changes).
         // Cancel any pending inner auto-reconnect — BaleConnection.reconcile()
         // is the sole authority on lifecycle; a stray timer would race and
         // reopen the WS after we deliberately closed it.
