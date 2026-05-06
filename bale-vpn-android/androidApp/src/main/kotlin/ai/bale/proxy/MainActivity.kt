@@ -32,6 +32,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvWsStatus:    TextView
     private lateinit var btnWs:         MaterialButton
 
+    private lateinit var tvSelfName:    TextView
+
     // Client section
     private lateinit var layoutClient:  LinearLayout
     private lateinit var tvPeer:        TextView
@@ -60,6 +62,7 @@ class MainActivity : AppCompatActivity() {
         const val VPN_REQUEST = 1
         const val MENU_ABOUT  = 1
         const val ABOUT_EMAIL = "kookoo.sabzy@proton.me"
+        const val ABOUT_REPO  = "https://github.com/kookoo1sabzy/BaleVPN"
     }
 
     private val notifPermLauncher = registerForActivityResult(
@@ -82,6 +85,7 @@ class MainActivity : AppCompatActivity() {
         toggleMode    = findViewById(R.id.toggleMode)
         btnModeClient = findViewById(R.id.btnModeClient)
         btnModeServer = findViewById(R.id.btnModeServer)
+        tvSelfName    = findViewById(R.id.tvSelfName)
         tvWsStatus    = findViewById(R.id.tvWsStatus)
         btnWs         = findViewById(R.id.btnWs)
         layoutClient  = findViewById(R.id.layoutClient)
@@ -233,6 +237,18 @@ class MainActivity : AppCompatActivity() {
             else                          -> "Disconnected"
         }
         tvWsStatus.visibility = View.VISIBLE
+
+        // Logged-in account name — populated by BaleWsClient.loadSelf() once
+        // the WS handshakes. Falls back to "User #<id>" if Bale didn't return
+        // a display name (self isn't usually in your own contact list).
+        val self = BaleConnection.client?.self
+        if (self != null) {
+            val display = self.name?.takeIf { it.isNotBlank() } ?: "User #${self.id}"
+            tvSelfName.text       = "Signed in as $display"
+            tvSelfName.visibility = View.VISIBLE
+        } else {
+            tvSelfName.visibility = View.GONE
+        }
 
         // The WS button only makes sense in server mode — that's where the user might
         // legitimately want to force-tear-down (which also disconnects all clients).
@@ -486,6 +502,23 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { sendEmail(ABOUT_EMAIL) }
         }
 
+        val tvRepoLabel = TextView(this).apply {
+            text     = "Source code:"
+            textSize = 14f
+            gravity  = Gravity.CENTER_HORIZONTAL
+            setPadding(0, (16 * dp).toInt(), 0, (4 * dp).toInt())
+        }
+
+        val tvRepo = TextView(this).apply {
+            text     = ABOUT_REPO
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            gravity  = Gravity.CENTER_HORIZONTAL
+            paintFlags = paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
+            setTextColor(ContextCompat.getColor(context, android.R.color.holo_blue_dark))
+            setOnClickListener { openUrl(ABOUT_REPO) }
+        }
+
         val tvVersion = TextView(this).apply {
             text     = "Version ${appVersion()}"
             textSize = 12f
@@ -497,6 +530,8 @@ class MainActivity : AppCompatActivity() {
         layout.addView(tvMotto)
         layout.addView(tvBody)
         layout.addView(tvEmail)
+        layout.addView(tvRepoLabel)
+        layout.addView(tvRepo)
         layout.addView(tvVersion)
 
         AlertDialog.Builder(this)
@@ -521,6 +556,14 @@ class MainActivity : AppCompatActivity() {
             startActivity(intent)
         } catch (_: ActivityNotFoundException) {
             Toast.makeText(this, "No email app installed; address: $address", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun openUrl(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, "No browser installed; URL: $url", Toast.LENGTH_LONG).show()
         }
     }
 }

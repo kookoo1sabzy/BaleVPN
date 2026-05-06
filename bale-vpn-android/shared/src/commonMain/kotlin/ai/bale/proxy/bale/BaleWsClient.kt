@@ -114,7 +114,12 @@ class BaleWsClient(
                 1 -> handleRpc(r.bytes())
                 2 -> handlePushContainer(r.bytes())
                 4 -> { r.bytes(); rawSend(encodePing()) } // pong
-                5 -> { r.bytes(); ready = true; log("[BaleProxy] WS handshake complete — ready=true"); subscribeUpdates() }
+                5 -> {
+                    r.bytes(); ready = true
+                    log("[BaleProxy] WS handshake complete — ready=true")
+                    subscribeUpdates()
+                    scope.launch { loadSelf() }
+                }
                 else -> r.skip(w)
             }
         }
@@ -367,6 +372,103 @@ class BaleWsClient(
         } catch (_: Exception) { emptyMap() }
         contactNamesByUid = map
         return map[userId]
+    }
+
+    /** Logged-in account info — populated by loadSelf() once the WS is up. */
+    data class SelfInfo(val id: Int, val name: String?)
+
+    @kotlin.concurrent.Volatile
+    var self: SelfInfo? = null
+        private set
+
+    /** Decode the user_id from the JWT payload and resolve a display name via
+     *  Users/LoadUsers over the WebSocket RPC. Bale returns the caller's own
+     *  entity when queried with self uid. `self` is populated whenever the
+     *  JWT decodes — even if LoadUsers fails — so the UI can fall back to
+     *  "User #<id>". Returns null only when the JWT itself is unparseable. */
+    suspend fun loadSelf(): SelfInfo? {
+        val uid = decodeJwtUserId(accessToken) ?: return null
+
+        val peer    = ProtoWriter().int32(1, uid).int64(2, 0L).build()
+        val payload = ProtoWriter().bytes(1, peer).build()
+
+        var name: String? = null
+        try {
+            val resp = rpcCall("bale.users.v1.Users", "LoadUsers", payload)
+            val r = ProtoReader(resp)
+            var entity: ByteArray? = null
+            while (r.hasMore()) {
+                val (f, w) = r.tag()
+                if (f == 1) { entity = r.bytes(); break } else r.skip(w)
+            }
+            if (entity != null) {
+                // UserEntity: field 3 = name string, field 9 = nick wrapped-string
+                val ur = ProtoReader(entity)
+                var en = ""; var enick = ""
+                while (ur.hasMore()) {
+                    val (f, w) = ur.tag()
+                    when (f) {
+                        3 -> en = ur.string()
+                        9 -> {
+                            val nb = ur.bytes()
+                            val nr = ProtoReader(nb)
+                            while (nr.hasMore()) {
+                                val (nf, nw) = nr.tag()
+                                if (nf == 1) enick = nr.string() else nr.skip(nw)
+                            }
+                        }
+                        else -> ur.skip(w)
+                    }
+                }
+                name = en.takeIf { it.isNotBlank() } ?: enick.takeIf { it.isNotBlank() }
+            }
+        } catch (e: Exception) {
+            log("[BaleProxy] loadSelf: LoadUsers RPC failed: ${e::class.simpleName}: ${e.message}")
+        }
+
+        val info = SelfInfo(uid, name)
+        self = info
+        log("[BaleProxy] loadSelf: id=${info.id} name=${info.name ?: "(none)"}")
+        return info
+    }
+
+    private fun decodeJwtUserId(jwt: String): Int? {
+        val parts = jwt.split('.')
+        if (parts.size < 2) return null
+        val bytes = base64UrlDecode(parts[1]) ?: return null
+        val json = bytes.decodeToString()
+        // Same approach as Node's loadSelf: regex pluck `"user_id":<digits>`
+        // from the JSON. Bale nests this under "payload":{…} but a flat regex
+        // catches it regardless of nesting depth.
+        return Regex(""""user_id"\s*:\s*(\d+)""").find(json)?.groupValues?.get(1)?.toIntOrNull()
+    }
+
+    /** Base64url (RFC 4648 §5) decoder. Hand-rolled to keep this file
+     *  free of kotlin.io.encoding.Base64 (still ExperimentalEncodingApi in
+     *  Kotlin 1.9; opt-in placement around a single expression is brittle). */
+    private fun base64UrlDecode(s: String): ByteArray? {
+        val out = ByteArray((s.length * 6) / 8 + 1)
+        var pos = 0
+        var buf = 0
+        var bits = 0
+        for (c in s) {
+            if (c == '=') break
+            val v = when (c) {
+                in 'A'..'Z' -> c - 'A'
+                in 'a'..'z' -> c - 'a' + 26
+                in '0'..'9' -> c - '0' + 52
+                '-', '+'    -> 62
+                '_', '/'    -> 63
+                else        -> return null
+            }
+            buf = (buf shl 6) or v
+            bits += 6
+            if (bits >= 8) {
+                bits -= 8
+                out[pos++] = ((buf shr bits) and 0xFF).toByte()
+            }
+        }
+        return out.copyOf(pos)
     }
 
     private suspend fun grpcWebPost(service: String, method: String, payload: ByteArray): ByteArray {
