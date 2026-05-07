@@ -178,13 +178,17 @@ Real-time updates flow via `bale.maviz.v1.MavizStream.SubscribeToUpdates` (empty
 3. If `call.isLivekit`, creates `LiveKitTransport`, attaches per-client stat fields (`_callKey`, `_connectedAt`, `_rxPkts/_rxBytes/_txPkts/_txBytes`), wires `onDisconnected` → `lkRooms.delete(callKey)`, connects
 4. Each LiveKit data message is decoded with `lkDecode`: recognized SOCKS5 frames go to `_srvMsg()`; unrecognized binary (raw IP packets) goes to `_handleTunPacket()`
 
-**TUN packet forwarding (server)**:
-- `_handleTunPacket(data, lk)` — drops packets destined for `10.8.0.0/24` (intra-subnet isolation), then writes the raw IP packet to the `bale0` fd. Increments per-client and aggregate rx counters. When a new `lk` replaces the previous TUN client, resets the stats counters and restarts the 5-second stats log timer.
-- `_tunReadLoop()` — reads raw IP packets from `bale0` continuously; forwards each to the active `_tunLk` via `sendLossy`. Increments per-client and aggregate tx counters.
-- `_setupTun()` — opens `bale0` (deleting any leftover from a prior run), calls `tun.configure('bale0', '10.8.0.1', 24)` (in-process ioctls), enables `ip_forward`, adds iptables MASQUERADE rule. Safe to call multiple times (no-op if fd already open). Must run as root or with `setcap cap_net_admin`.
-- Stats log every 5 s per connected client: `[TUN] client=<callKey>  rx=Npkt/X.XKB  tx=Npkt/X.XKB`
+**TUN packet forwarding (server) — multi-client via userspace SNAT**:
 
-**Server LiveKit teardown**: `TunnelManager.hangUpAll()` disconnects all `lkRooms`, clears the map, clears `_tunLk`/`_tunClientKey`, and stops the stats timer. Called automatically when the WS closes. `_stopAll()` delegates to `hangUpAll()` internally.
+Every Android client locally configures its TUN as `10.8.0.2/24`. To let multiple clients share `bale0` without conntrack collisions, the server applies a userspace SNAT: on accept, each `lk` gets a distinct lease from `10.8.0.2`–`10.8.0.254` (253 slots, allocated in `onCallReceived`, freed in `lk.onDisconnected`). Inbound packets have `src` rewritten to the lease before they're written to `bale0`; return packets have `dst` rewritten back to `10.8.0.2` before the `'I'` frame is shipped. `adjustCsum`/`rewriteIp` (module scope) handle the IP + L4 (TCP/UDP) checksum fixup via RFC 1624 incremental update, with a no-op short-circuit when the address already matches.
+
+- `_handleTunPacket(data, lk)` — drops packets for `10.8.0.0/24` (intra-subnet isolation), looks up the lease in `_snatByLk`, rewrites src, writes to `bale0`.
+- `_tunReadLoop()` — looks up `_lkBySnat[dst]` for each packet read from `bale0`, rewrites dst back to `10.8.0.2`, sends via `sendLossy`. Packets with no lease are dropped.
+- `_setupTun()` — opens `bale0` (deleting any leftover), configures `10.8.0.1/24` via in-process ioctls, enables `ip_forward`, adds iptables MASQUERADE rule. Idempotent. Needs root or `setcap cap_net_admin`.
+
+The Android server (`BaleServerService`) doesn't need SNAT — its per-client `PacketProcessor` does all NAT in userspace, so multiple clients claiming `10.8.0.2` never collide.
+
+**Server LiveKit teardown**: `TunnelManager.hangUpAll()` disconnects all `lkRooms`, clears the map, sweeps any orphan SNAT leases, and stops the stats timer. Called automatically when the WS closes. `_stopAll()` delegates to `hangUpAll()` internally.
 
 **Client WebRTC flow** (`TunnelManager.startWebRtcTunnel`):
 1. Calls `BaleWsClient.startCall(serverPeerId, serverPeerType)` → `bale.meet.v1.Meet/StartCall`
