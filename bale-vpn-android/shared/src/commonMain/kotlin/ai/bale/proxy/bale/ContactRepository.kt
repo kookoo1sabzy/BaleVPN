@@ -5,6 +5,8 @@ import ai.bale.proxy.proto.ProtoWriter
 import io.ktor.client.*
 import io.ktor.client.call.*
 import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.http.*
 
 private const val GRPC_HOST = "next-ws.bale.ai"
 
@@ -81,6 +83,13 @@ class ContactRepository(
             header("Cookie",       "access_token=$accessToken")
             setBody(body)
         }
+        // Surface HTTP-level errors with a clear message instead of letting a
+        // non-gRPC body fall through to grpcDecode (where it'll throw a cryptic
+        // "toIndex(N) is greater than size (M)" from sliceArray).
+        if (!resp.status.isSuccess()) {
+            val snippet = resp.bodyAsText().take(200)
+            throw Exception("HTTP ${resp.status.value} from $service/$method: $snippet")
+        }
         return grpcDecode(resp.body())
     }
 
@@ -98,6 +107,14 @@ class ContactRepository(
             val len  = ((buf[pos+1].toInt() and 0xFF) shl 24) or ((buf[pos+2].toInt() and 0xFF) shl 16) or
                        ((buf[pos+3].toInt() and 0xFF) shl 8)  or  (buf[pos+4].toInt() and 0xFF)
             pos += 5
+            // Validate before slicing — a corrupt or non-gRPC body slipping in
+            // here would otherwise blow up with the standard sliceArray
+            // "toIndex(...) is greater than size (...)" message, which is
+            // useless for diagnosing what actually went wrong.
+            if (len < 0 || pos + len > buf.size) {
+                throw Exception("malformed gRPC-web frame: flag=0x${flag.toString(16)} " +
+                                "len=$len but only ${buf.size - pos} bytes remain (total=${buf.size})")
+            }
             val frame = buf.sliceArray(pos until pos + len); pos += len
             if (flag and 0x80 == 0) data = frame
             else {
