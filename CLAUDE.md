@@ -41,7 +41,7 @@ Parses `reverse_engineering/static/js/async/5100.bbddcd29.js` (the main protobuf
 cd bale-proto
 npm install
 npm run build        # compiles .proto → src/messages.js + src/messages.d.ts via pbjs/pbts
-npm run build-tun    # compile C++ TUN addon (Linux only, requires node-gyp)
+npm run build-tun    # compile C++ TUN addon (Linux + macOS, requires node-gyp)
 npm run ui           # start WebSocket client + web UI at http://localhost:3001
 npm run ui -- 8080   # listen on a custom port
 npm run ui -- server # start in server mode (TUN + NAT relay)
@@ -49,16 +49,11 @@ npm run ui -- server # start in server mode (TUN + NAT relay)
 
 The HTTP port can also be passed directly: `node src/bale-proxy.js 8080`. Defaults to `3001`.
 
-**Server mode one-time setup** (Linux only):
-```bash
-# Grant the node process CAP_NET_ADMIN so it can manage the TUN device in-process.
-# iptables for MASQUERADE still requires root (run once):
-sudo setcap cap_net_admin+eip $(which node)
-sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
-# Then start server mode (no sudo needed):
-node src/bale-proxy.js server
-```
-The server creates `bale0` (`10.8.0.1/24`) on startup, enables `ip_forward`, and auto-answers all incoming LiveKit calls. Android clients are assigned `10.8.0.2/24`.
+**Server mode one-time setup**:
+- **Linux** — `sudo setcap cap_net_admin+eip $(which node)` (so the addon can manage TUN without root) and `sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE` (NAT rule). Then `node src/bale-proxy.js server`.
+- **macOS** — runs as root: `sudo node src/bale-proxy.js server`. NAT (pf anchor `balevpn`) and IP forwarding are loaded automatically; the WAN interface is auto-detected via `route -n get default`.
+
+The server opens a TUN device on startup (`bale0` on Linux, `utunN` on macOS), assigns `10.8.0.1/24`, enables IP forwarding, installs the platform-specific NAT rule, and auto-answers incoming LiveKit calls. Android clients locally configure `10.8.0.2/24`; the server's userspace SNAT layer maps each client to a unique address from `10.8.0.2`–`10.8.0.254`.
 
 ## Architecture
 

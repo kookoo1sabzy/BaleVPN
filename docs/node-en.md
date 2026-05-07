@@ -7,7 +7,7 @@ The Node.js package (`bale-vpn-node/`) is a single-binary tool that combines:
 - a Bale WebSocket signaling client,
 - a local **web UI** on `http://localhost:3001` — **auto-opened in your default browser** on launch in client mode. All configuration (signing in, picking a peer, activating the tunnel) is done from that page; there is no terminal-based config flow.
 - a **SOCKS5 proxy** mode for both client and server,
-- a **kernel TUN VPN server** mode (Linux only) that lets Android clients connect with full IP routing.
+- a **kernel TUN VPN server** mode (Linux + macOS) that lets Android clients connect with full IP routing.
 
 The same binary runs on Linux, macOS, and Windows. The VPN-server mode is Linux-only because it relies on a kernel TUN device and `iptables` MASQUERADE. Set `BALE_NO_BROWSER=1` if you want to suppress the auto-open (e.g., headless dev).
 
@@ -17,7 +17,7 @@ The same binary runs on Linux, macOS, and Windows. The VPN-server mode is Linux-
 |---|---|---|
 | **SOCKS5 client** | Linux / macOS / Windows | Listens on `127.0.0.1:1080`, tunnels TCP through the chosen Bale contact (the contact must be running a server). |
 | **SOCKS5 server** | Linux / macOS / Windows | Auto-answers Bale calls and relays the caller's TCP traffic. Useful for tunneling without VPN setup. |
-| **VPN server (TUN)** | **Linux only** | Auto-answers Bale calls, terminates raw IP traffic on a `bale0` TUN device, and uses kernel NAT (iptables MASQUERADE) to forward everything to the open internet. |
+| **VPN server (TUN)** | **Linux / macOS** | Auto-answers Bale calls, terminates raw IP traffic on a kernel TUN device (`bale0` on Linux, `utunN` on macOS), and uses kernel NAT (iptables MASQUERADE on Linux, pf on macOS) to forward everything to the open internet. |
 
 Same binary, behaviour selected at startup by command-line argument (`server` for server mode; default is client).
 
@@ -119,13 +119,13 @@ This is the easiest way to give a friend a relay if you don't want to set up a V
 
 ---
 
-## Linux VPN server (TUN) — full IP routing
+## VPN server (TUN) — full IP routing
 
-This is the **highest-throughput** server option. The Node process attaches to a `bale0` Linux TUN device and the kernel handles forwarding + NAT, which is substantially faster than the userspace TCP/IP stack used by the Android server.
+This is the **highest-throughput** server option, available on Linux and macOS. The Node process attaches to a kernel TUN device (`bale0` on Linux, `utunN` on macOS) and the kernel handles forwarding + NAT, which is substantially faster than the userspace TCP/IP stack used by the Android server.
 
-Recommended pairing: **Linux Node TUN server + Android client** for the best connection on the client side (Android `VpnService` ships every IP packet from the device into the tunnel).
+Recommended pairing: **Node TUN server + Android client** for the best connection on the client side (Android `VpnService` ships every IP packet from the device into the tunnel).
 
-### One-time setup
+### Linux — one-time setup
 
 ```bash
 # 1. Allow the released binary to manage TUN interfaces without running as root.
@@ -138,20 +138,26 @@ sudo setcap cap_net_admin+eip ./balevpn-<version>-linux-x64
 sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
 ```
 
-`setcap` is the modern alternative to running as root — the binary keeps the `CAP_NET_ADMIN` capability for the lifetime of the process. The capability is bound to the file, so reapply it whenever you replace the binary with a newer release.
-
-### Run
+Then run:
 
 ```bash
 ./balevpn-<version>-linux-x64 server
 ```
 
-On startup the server:
+### macOS — run with sudo
 
-1. Removes any stale `bale0` interface.
-2. Creates `bale0` and assigns `10.8.0.1/24`.
-3. Enables IPv4 forwarding (`/proc/sys/net/ipv4/ip_forward`).
-4. Verifies the MASQUERADE rule is in place.
+macOS has no `setcap` analog, so server mode runs as root. NAT (pf anchor `balevpn`) and IP forwarding are loaded automatically on startup; the WAN interface is auto-detected via `route -n get default`.
+
+```bash
+sudo ./balevpn-<version>-macos-arm64 server
+```
+
+### What the server does on startup
+
+1. Removes any stale TUN interface from a prior run.
+2. Creates the TUN device and assigns `10.8.0.1/24`.
+3. Enables IPv4 forwarding (`/proc/sys/net/ipv4/ip_forward` on Linux, `net.inet.ip.forwarding` on macOS).
+4. Loads the platform-specific NAT rule (iptables MASQUERADE on Linux, pf anchor on macOS).
 5. Subscribes to Bale incoming-call updates and starts auto-answering.
 
 When an Android client connects, it gets `10.8.0.2/24` and routes all of its traffic into the tunnel. Up to 253 clients can connect simultaneously — the server transparently rewrites each client's source address to a distinct IP in `10.8.0.0/24` so the kernel can disambiguate concurrent flows.
