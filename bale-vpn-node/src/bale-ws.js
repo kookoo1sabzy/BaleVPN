@@ -34,7 +34,7 @@ function persistToken(t) {
 }
 const {
     encodeHandshake, encodePing, encodeRpcRequest,
-    decodeServerFrame, decodeSubscribeResponse, decodeCallResponse,
+    decodeServerFrame, decodeSubscribeResponse, decodeCallResponse, decodeRpcError,
     decodeGetContactsResponse, decodeLoadUsersResponse, decodeUserEntity,
     buildAcceptCallRequest, buildDiscardCallRequest, buildStartCallRequest,
     buildGetContactsRequest, buildLoadUsersRequest, buildSendMessageRequest,
@@ -194,7 +194,13 @@ class BaleWsClient {
             if (cb) {
                 this.pending.delete(rpc.index);
                 clearTimeout(cb.timer);
-                if (rpc.error) cb.reject(new Error('RPC error: ' + Buffer.from(rpc.error).toString('hex')));
+                if (rpc.error) {
+                    const { code, message } = decodeRpcError(Buffer.from(rpc.error));
+                    const err = new Error(`${message} (RPC code ${code})`);
+                    err.rpcCode    = code;
+                    err.rpcMessage = message;
+                    cb.reject(err);
+                }
                 else           cb.resolve(rpc.response || new Uint8Array(0));
             } else if (rpc.response) {
                 this._processUpdate(rpc.response);
