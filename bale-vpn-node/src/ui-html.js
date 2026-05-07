@@ -9,13 +9,22 @@
 // load (unescaped ${…}); browser-side runtime substitutions use the escaped
 // \${…} form to survive the template eval.
 
+const crypto = require('crypto');
 const { MAX_LIMIT_KBPS } = require('./constants');
+
+// Per-process CSRF token. Embedded in the served HTML and required as the
+// X-CSRF-Token header on every mutating request. A drive-by attack from
+// some other origin can't read our HTML (same-origin policy blocks the
+// response body), so it can never extract the token, even though the
+// browser would gladly fire the cross-origin request itself.
+const csrfToken = crypto.randomBytes(32).toString('hex');
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf" content="${csrfToken}">
 <title>Bale Proxy</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -294,6 +303,22 @@ const HTML = `<!DOCTYPE html>
   </div>
 </div>
 <script>
+// Wrap fetch so every mutating request carries the per-process CSRF token
+// embedded in the page's <meta name="csrf">. A cross-origin attacker can't
+// read this token (same-origin policy on the response body) so they can't
+// forge a request that passes the server-side check.
+(function () {
+  const _csrf = document.querySelector('meta[name="csrf"]').content;
+  const _orig = window.fetch.bind(window);
+  window.fetch = (input, init = {}) => {
+    const method = (init.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      init.headers = Object.assign({}, init.headers, { 'X-CSRF-Token': _csrf });
+    }
+    return _orig(input, init);
+  };
+})();
+
 const dot        = document.getElementById('dot');
 const tokenInput = document.getElementById('tokenInput');
 
@@ -962,4 +987,4 @@ setInterval(pollState, 2000);
 </body>
 </html>`;
 
-module.exports = { HTML };
+module.exports = { HTML, csrfToken };
