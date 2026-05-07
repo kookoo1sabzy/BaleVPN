@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - { os: macos-latest,   target: node18-macos-arm64, suffix: macos-arm64, ext: '' }
-          - { os: macos-13,       target: node18-macos-x64,   suffix: macos-x64,   ext: '' }
+          - { os: macos-26-intel, target: node18-macos-x64,   suffix: macos-x64,   ext: '' }
           - { os: ubuntu-latest,  target: node18-linux-x64,   suffix: linux-x64,   ext: '' }
           - { os: windows-latest, target: node18-win-x64,     suffix: win-x64,     ext: '.exe' }
     runs-on: ${{ matrix.os }}
