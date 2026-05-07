@@ -19,6 +19,10 @@ const dgram = require('dgram');
 const dns   = require('dns');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
+// Hoist tun to module scope — _handleTunPacket / _tunReadLoop are on the
+// hot path. A per-packet `require('./tun')` is cached but still a hashmap
+// lookup that's worth avoiding at high packet rates.
+const tun   = require('./tun');
 
 const {
     PEERTYPE_PRIVATE,
@@ -201,6 +205,7 @@ class TunnelManager {
         this._pendingSweep    = null;       // setInterval handle
         // TUN packet forwarding (server mode)
         this._tunFd           = null;
+        this._tunName         = null;       // 'bale0' on Linux, 'utunN' on macOS
         this._tunReadRunning  = false;
         this._tunStatsTimer   = null;
         this._tunRxPkts       = 0;  this._tunRxBytes = 0;
@@ -704,7 +709,7 @@ class TunnelManager {
         rewriteIp(data, 12, snat);
         if (this._tunFd !== null) {
             this._tunRxPkts++; this._tunRxBytes += data.length;
-            fs.write(this._tunFd, data, (err) => {
+            tun.write(this._tunFd, data, (err) => {
                 if (err) console.error('[TUN] Write error:', err.message);
             });
         }
@@ -713,29 +718,8 @@ class TunnelManager {
     _setupTun() {
         if (this._tunFd !== null) return;
         try {
-            const tun = require('./tun');
-            try { execSync('ip tuntap del dev bale0 mode tun', { stdio: 'pipe' }); } catch (_) {}
-            this._tunFd = tun.open('bale0');
-            console.log('[TUN] Opened bale0');
-            tun.configure('bale0', '10.8.0.1', 24);
-            console.log('[TUN] bale0 up  10.8.0.1/24');
-            try {
-                fs.writeFileSync('/proc/sys/net/ipv4/ip_forward', '1');
-                console.log('[TUN] ip_forward enabled');
-            } catch (e) {
-                console.warn('[TUN] Could not enable ip_forward:', e.message);
-            }
-            try {
-                execSync(
-                    'iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null' +
-                    ' || iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE',
-                    { stdio: 'pipe' }
-                );
-                console.log('[TUN] NAT rule ready');
-            } catch (_) {
-                console.warn('[TUN] Could not add iptables NAT rule — run manually:');
-                console.warn('      sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE');
-            }
+            if (process.platform === 'darwin') this._setupTunDarwin(tun);
+            else                                this._setupTunLinux(tun);
             if (!this._tunReadRunning) {
                 this._tunReadRunning = true;
                 this._tunReadLoop();
@@ -746,28 +730,140 @@ class TunnelManager {
         }
     }
 
+    _setupTunLinux(tun) {
+        // Clean up any leftover bale0 from a prior crash.
+        try { execSync('ip tuntap del dev bale0 mode tun', { stdio: 'pipe' }); } catch (_) {}
+        const t = tun.open('bale0');
+        this._tunFd = t.fd; this._tunName = t.name;
+        console.log(`[TUN] Opened ${this._tunName}`);
+        tun.configure(this._tunName, '10.8.0.1', 24);
+        console.log(`[TUN] ${this._tunName} up  10.8.0.1/24`);
+        try {
+            fs.writeFileSync('/proc/sys/net/ipv4/ip_forward', '1');
+            console.log('[TUN] ip_forward enabled');
+        } catch (e) {
+            console.warn('[TUN] Could not enable ip_forward:', e.message);
+        }
+        try {
+            execSync(
+                'iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null' +
+                ' || iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE',
+                { stdio: 'pipe' }
+            );
+            console.log('[TUN] NAT rule ready');
+        } catch (_) {
+            console.warn('[TUN] Could not add iptables NAT rule — run manually:');
+            console.warn('      sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE');
+        }
+    }
+
+    // Clean up everything _setupTun installed: TUN device, kernel route,
+    // pf anchor (macOS), iptables rule isn't removed because it's idempotent
+    // and other tools may rely on it. Idempotent — safe to call repeatedly.
+    _teardownTun() {
+        if (this._tunFd === null) return;
+        const fd = this._tunFd;
+        const name = this._tunName;
+        this._tunFd = null;             // make _tunReadLoop bail on next tick
+        this._tunReadRunning = false;
+        if (process.platform === 'darwin') {
+            // Flush our pf NAT rule. The anchor itself stays (empty) which is
+            // fine — empty anchors are a no-op.
+            try { execSync('pfctl -a com.apple/balevpn -F nat', { stdio: 'pipe' }); } catch (_) {}
+            try { execSync('route -q -n delete -inet 10.8.0.0/24',  { stdio: 'pipe' }); } catch (_) {}
+        } else {
+            try { execSync(`ip tuntap del dev ${name || 'bale0'} mode tun`, { stdio: 'pipe' }); } catch (_) {}
+        }
+        try { tun.close(fd); } catch (_) {}
+        console.log(`[TUN] Cleaned up ${name || 'TUN device'}`);
+    }
+
+    _setupTunDarwin(tun) {
+        if (process.getuid && process.getuid() !== 0) {
+            throw new Error('macOS server mode requires root: re-run with sudo');
+        }
+        // Discover the WAN interface so the pf NAT rule can target it.
+        let wanIf = '';
+        try {
+            const out = execSync('route -n get default 2>/dev/null', { encoding: 'utf8' });
+            const m = out.match(/interface:\s*(\S+)/);
+            wanIf = m ? m[1] : '';
+        } catch (_) {}
+        if (!wanIf) console.warn('[TUN] Could not detect WAN interface — pf NAT rule may need manual edit');
+
+        const t = tun.open();   // kernel picks utunN
+        this._tunFd = t.fd; this._tunName = t.name;
+        console.log(`[TUN] Opened ${this._tunName}`);
+        tun.configure(this._tunName, '10.8.0.1', 24);
+        console.log(`[TUN] ${this._tunName} up  10.8.0.1/24`);
+        try { execSync('sysctl -w net.inet.ip.forwarding=1', { stdio: 'pipe' }); }
+        catch (e) { console.warn('[TUN] Could not enable forwarding:', e.message); }
+
+        // pf NAT: load into the `com.apple/balevpn` sub-anchor. macOS's default
+        // /etc/pf.conf has `nat-anchor "com.apple/*"` and `anchor "com.apple/*"`
+        // references — anchors loaded under `com.apple/...` get auto-evaluated.
+        // A custom top-level anchor (`balevpn` alone) would load successfully
+        // but never fire because nothing in the main ruleset references it.
+        if (wanIf) {
+            const rule = `nat on ${wanIf} from 10.8.0.0/24 to any -> (${wanIf})\n`;
+            try {
+                execSync(`pfctl -a com.apple/balevpn -f -`, { stdio: 'pipe', input: rule });
+            } catch (e) {
+                console.warn('[TUN] pf rule load failed:', e.stderr?.toString().trim() || e.message);
+            }
+            // Enable pf — `pfctl -e` returns non-zero if already enabled, but
+            // prints "pf already enabled" to stderr; we treat both as success.
+            try { execSync('pfctl -e', { stdio: 'pipe' }); }
+            catch (e) {
+                const msg = (e.stderr?.toString() || '').toLowerCase();
+                if (!msg.includes('already enabled')) console.warn('[TUN] pfctl -e:', msg.trim() || e.message);
+            }
+        }
+
+        this._verifyTunDarwin(wanIf);
+    }
+
+    // Print observed system state so a silent-failure setup is visible. Anything
+    // that's WRONG here points at the actual problem (missing route, pf not
+    // enabled, anchor empty, ip_forward=0).
+    _verifyTunDarwin(wanIf) {
+        const probe = (label, cmd) => {
+            try {
+                const out = execSync(cmd, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }).trim();
+                console.log(`[TUN] ${label}: ${out.replace(/\s+/g, ' ').slice(0, 200)}`);
+            } catch (e) {
+                console.warn(`[TUN] ${label}: FAILED — ${(e.stderr || e.message).toString().trim()}`);
+            }
+        };
+        probe('ip_forward',     "sysctl -n net.inet.ip.forwarding");
+        probe('route 10.8.0.2', "route -n get 10.8.0.2 | grep -E 'interface|gateway'");
+        probe('pf status',      "pfctl -s info 2>&1 | head -1");
+        probe('pf NAT rule',    `pfctl -a com.apple/balevpn -s nat 2>&1`);
+        if (wanIf) console.log(`[TUN] NAT WAN interface: ${wanIf}`);
+    }
+
     _tunReadLoop() {
         const buf = Buffer.alloc(65536);
         const read = () => {
             if (this._tunFd === null) { this._tunReadRunning = false; return; }
-            fs.read(this._tunFd, buf, 0, buf.length, null, (err, n) => {
+            tun.read(this._tunFd, buf, (err, pkt) => {
                 if (err) {
                     console.error('[TUN] Read error:', err.message);
                     this._tunReadRunning = false;
                     return;
                 }
-                if (n > 0 && (buf[0] >> 4) === 4) {
+                if (pkt && pkt.length >= 20 && (pkt[0] >> 4) === 4) {
                     // Route by destination IP — return packets for SNAT'd flows
                     // arrive with dst = the client's leased IP. Rewrite back to
                     // the address the client expects (10.8.0.2) before shipping.
-                    const dst = `${buf[16]}.${buf[17]}.${buf[18]}.${buf[19]}`;
+                    const dst = `${pkt[16]}.${pkt[17]}.${pkt[18]}.${pkt[19]}`;
                     const lk  = this._lkBySnat.get(dst);
                     // Download rate limit (internet → client). Drop on empty bucket.
-                    if (lk && (!lk._downBucket || lk._downBucket.take(n))) {
-                        rewriteIp(buf, 16, '10.8.0.2');
-                        this._tunTxPkts++; this._tunTxBytes += n;
-                        lk._txPkts++; lk._txBytes += n;
-                        lk.sendLossy(lkEncode({ t: 'I', data: Buffer.from(buf.slice(0, n)) }));
+                    if (lk && (!lk._downBucket || lk._downBucket.take(pkt.length))) {
+                        rewriteIp(pkt, 16, '10.8.0.2');
+                        this._tunTxPkts++; this._tunTxBytes += pkt.length;
+                        lk._txPkts++; lk._txBytes += pkt.length;
+                        lk.sendLossy(lkEncode({ t: 'I', data: Buffer.from(pkt) }));
                     }
                     // Packets to addresses with no lease (or non-IPv4) are dropped silently.
                 }

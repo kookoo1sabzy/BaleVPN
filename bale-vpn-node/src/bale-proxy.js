@@ -161,9 +161,17 @@ if (TUNNEL_MODE === 'server') client.tunnel.configure('server');
 // internally; reconcile is the single source of truth for lifecycle.
 connection.reconcile();
 
-process.on('SIGINT', () => {
-    console.log('\n[WS] Exiting');
-    const fd = client.tunnel._tunFd;
-    if (fd !== null) { client.tunnel._tunFd = null; require('./tun').close(fd); }
+// Idempotent shutdown — runs the platform-specific TUN teardown (close fd,
+// flush pf anchor on macOS / delete bale0 on Linux, drop route) before exit.
+// SIGTERM gets the same path as SIGINT so systemd / launchd / Docker stop
+// signals don't leave state behind.
+let _shuttingDown = false;
+const shutdown = (signal) => {
+    if (_shuttingDown) return;
+    _shuttingDown = true;
+    console.log(`\n[WS] Exiting (${signal})`);
+    try { client.tunnel._teardownTun(); } catch (e) { console.error('[TUN] Teardown error:', e.message); }
     process.exit(0);
-});
+};
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
