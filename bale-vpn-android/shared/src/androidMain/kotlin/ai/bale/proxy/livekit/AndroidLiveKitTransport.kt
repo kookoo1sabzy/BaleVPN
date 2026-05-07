@@ -4,6 +4,7 @@ import ai.bale.proxy.tunnel.DataTransport
 import android.content.Context
 import android.util.Log
 import io.livekit.android.AudioOptions
+import io.livekit.android.AudioType
 import io.livekit.android.ConnectOptions
 import io.livekit.android.LiveKit
 import io.livekit.android.LiveKitOverrides
@@ -39,11 +40,25 @@ class AndroidLiveKitTransport(
         Log.d(TAG, "LiveKit: connect url=$url")
         // We use the LiveKit room as a pure data-channel transport (raw IP packets +
         // SOCKS5 frames). No microphone, no speaker, no call-style audio routing.
-        // The default AudioSwitchHandler would otherwise request audio focus, switch
-        // the device into MODE_IN_COMMUNICATION, route audio through the earpiece,
-        // and remap the volume keys to in-call volume — turning a tunnel session
-        // into a fake "phone call" from the user's perspective.
-        val overrides = LiveKitOverrides(audioOptions = AudioOptions(audioHandler = NoAudioHandler()))
+        // Two overrides combine to fully suppress the "phone call" experience:
+        //
+        //   audioHandler = NoAudioHandler      → don't manage audio focus or
+        //                                        switch into MODE_IN_COMMUNICATION
+        //   audioOutputType = MediaAudioType   → the WebRTC AudioDeviceModule's
+        //                                        AudioTrack is built with
+        //                                        STREAM_MUSIC / USAGE_MEDIA, so
+        //                                        the volume rocker controls media
+        //                                        volume rather than in-call volume
+        //                                        (Android routes volume keys by
+        //                                        the active AudioTrack's stream
+        //                                        type, even when nothing's
+        //                                        actually playing).
+        val overrides = LiveKitOverrides(
+            audioOptions = AudioOptions(
+                audioHandler    = NoAudioHandler(),
+                audioOutputType = AudioType.MediaAudioType(),
+            ),
+        )
         val r = LiveKit.create(context, overrides = overrides)
         room = r
 
