@@ -56,6 +56,9 @@ class BaleWsClient {
         this.autoReconnect = false;
         this.connecting    = false;
         this.self          = null;       // { id, name, nick } — account owner
+        // Cache for callers we resolve via LoadUsers — covers strangers who
+        // aren't in `peers`. Survives WS reconnect (uid → name is stable).
+        this._userNameCache = new Map();
         // Multi-subscriber call event listeners — survive WS disconnect/reconnect
         // cycles because they live on this singleton, not on each WebSocket session.
         this._onCallReceivedListeners = [];
@@ -294,7 +297,26 @@ class BaleWsClient {
             try { await this.loadContacts(); } catch (_) {}
         }
         const hit = this.peers.find(p => Number(p.id) === n);
-        return hit ? hit.name : null;
+        if (hit) return hit.name;
+        // Strangers (callers not in our contact list) — resolve via LoadUsers
+        // and memoize. Same RPC loadSelf uses. Cached entries survive WS
+        // reconnect since uid→name doesn't change.
+        if (this._userNameCache.has(n)) return this._userNameCache.get(n);
+        try {
+            const buf = await this._rpcCall(
+                'bale.users.v1.Users', 'LoadUsers',
+                buildLoadUsersRequest([{ uid: n, accessHash: '0' }]),
+            );
+            const loaded = decodeLoadUsersResponse(buf);
+            if (loaded.users.length) {
+                const u = decodeUserEntity(loaded.users[0]);
+                const name = u.name || u.nick || null;
+                this._userNameCache.set(n, name);
+                return name;
+            }
+        } catch (e) { console.warn('[Caller] LoadUsers failed for uid=' + n + ':', e.message); }
+        this._userNameCache.set(n, null);  // negative cache so we don't retry repeatedly
+        return null;
     }
 
     async loadSelf() {

@@ -41,6 +41,12 @@ const PENDING_TIMEOUT_MS = 60 * 1000;
 const PENDING_SWEEP_MS   = 15 * 1000;
 const ESTABLISH_GRACE_MS = 8  * 1000;
 
+// Per-client TUN bandwidth caps (server mode) — match Android.
+// 300 kbps / 37500 bytes/sec, 1-second burst.
+const DEFAULT_LIMIT_KBPS = 300;
+const MAX_LIMIT_KBPS     = 1000;
+const THROTTLE_FLAG_MS   = 2000;   // row stays "throttled" 2s after last drop
+
 module.exports = {
     ACCESS_TOKEN,
     WS_URL, GRPC_HOST, API_VERSION, PROTO_VERSION,
@@ -50,6 +56,7 @@ module.exports = {
     TUNNEL_PREFIX, CHUNK_SIZE, LK_CHUNK,
     TUNNEL_MAX_RECONNECT_ATTEMPTS,
     PENDING_TIMEOUT_MS, PENDING_SWEEP_MS, ESTABLISH_GRACE_MS,
+    DEFAULT_LIMIT_KBPS, MAX_LIMIT_KBPS, THROTTLE_FLAG_MS,
     // Helpers
     toLong: v => Number(v.toString()),
 };

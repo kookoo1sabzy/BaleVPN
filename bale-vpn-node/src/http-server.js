@@ -10,6 +10,7 @@
 const http = require('http');
 const {
     TUNNEL_MODE, PEERTYPE_PRIVATE, PEERTYPE_GROUP,
+    MAX_LIMIT_KBPS,
 } = require('./constants');
 const {
     buildStartPhoneAuthRequest, decodeStartPhoneAuthResponse,
@@ -346,17 +347,39 @@ function create(client, connection) {
             return res.end(JSON.stringify({ ok }));
         }
 
+        if (req.method === 'POST' && url.pathname.startsWith('/tunnel/clients/') && url.pathname.endsWith('/limit')) {
+            const callKey = decodeURIComponent(url.pathname.slice('/tunnel/clients/'.length, -'/limit'.length));
+            let body = '';
+            req.on('data', c => body += c);
+            req.on('end', () => {
+                try {
+                    const { upKbps, downKbps } = JSON.parse(body || '{}');
+                    const clamp   = k => Math.max(1, Math.min(MAX_LIMIT_KBPS, Number(k) || 0));
+                    const upBps   = clamp(upKbps)   * 1000 / 8;
+                    const downBps = clamp(downKbps) * 1000 / 8;
+                    const ok = client.tunnel.setClientLimit(callKey, upBps, downBps);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok }));
+                } catch (e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
+            return;
+        }
+
         // ── Server-mode admission control ─────────────────────────────────
-        const resolveCallerName = (uid) => {
-            const peer = client.peers.find(p => Number(p.id) === Number(uid));
-            return peer ? peer.name : null;
-        };
+        // Resolve a caller's display name. Checks the contact list first,
+        // then falls back to a memoized LoadUsers RPC for strangers (same
+        // path TunnelManager uses for connected-clients rows). Async so we
+        // can await the RPC when the entry isn't cached yet.
+        const resolveCallerName = (uid) => client.lookupContactName(uid);
 
         if (req.method === 'GET' && url.pathname === '/server/pending') {
-            const list = client.tunnel.pendingCalls().map(p => ({
+            const list = await Promise.all(client.tunnel.pendingCalls().map(async p => ({
                 ...p,
-                callerName: p.callerName || resolveCallerName(p.callerId),
-            }));
+                callerName: p.callerName || await resolveCallerName(p.callerId),
+            })));
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify(list));
         }
@@ -383,10 +406,10 @@ function create(client, connection) {
         }
 
         if (req.method === 'GET' && url.pathname === '/server/admission') {
-            const list = client.tunnel.admissionList().map(e => ({
+            const list = await Promise.all(client.tunnel.admissionList().map(async e => ({
                 ...e,
-                callerName: resolveCallerName(e.callerId),
-            }));
+                callerName: await resolveCallerName(e.callerId),
+            })));
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify(list));
         }
