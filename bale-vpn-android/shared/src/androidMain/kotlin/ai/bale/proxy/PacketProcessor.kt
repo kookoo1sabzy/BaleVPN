@@ -247,6 +247,13 @@ class PacketProcessor(
         val proto = pkt[9].toInt() and 0xFF
         val srcI  = ip4Int(pkt, 12)
         val dstI  = ip4Int(pkt, 16)
+        // Egress filter — drop traffic to private / loopback / link-local /
+        // multicast destinations so a tunnelled client can't reach the
+        // server's localhost, LAN, or cloud-metadata endpoints.
+        if (isBlockedDst(dstI)) {
+            dbg { "drop: blocked dst ${ip4Str(dstI)} proto=$proto" }
+            return
+        }
         when (proto) {
             6  -> handleTcp(pkt, ihl, srcI, dstI)
             17 -> handleUdp(pkt, ihl, srcI, dstI)
@@ -1781,6 +1788,27 @@ private fun ip4Int(b: ByteArray, o: Int) =
     ((b[o+2].toInt() and 0xFF) shl 8)  or  (b[o+3].toInt() and 0xFF)
 
 private fun ip4Int(a: InetAddress) = ip4Int(a.address, 0)
+
+/**
+ * Reject traffic whose destination is on a private, loopback, link-local, or
+ * multicast range. Without this filter a connected VPN client could open
+ * sockets to the *server's* local services (anything on 127.0.0.1, the
+ * device's own LAN at 192.168.x.x, etc.) and — most dangerously — to cloud
+ * metadata endpoints (169.254.169.254 on AWS/GCP/Azure exposes IAM
+ * credentials). Public destinations (the actual point of the VPN) pass.
+ */
+private fun isBlockedDst(dstI: Int): Boolean {
+    val a = (dstI ushr 24) and 0xFF
+    val b = (dstI ushr 16) and 0xFF
+    return a == 0                     ||  // 0.0.0.0/8         "this network"
+           a == 10                    ||  // 10.0.0.0/8        private (incl. tunnel subnet)
+           (a == 100 && (b and 0xC0) == 64) || // 100.64.0.0/10     CGNAT
+           a == 127                   ||  // 127.0.0.0/8       loopback
+           (a == 169 && b == 254)     ||  // 169.254.0.0/16    link-local + cloud metadata
+           (a == 172 && (b and 0xF0) == 16) || // 172.16.0.0/12  private
+           (a == 192 && b == 168)     ||  // 192.168.0.0/16    private
+           a >= 224                       // 224.0.0.0/4       multicast + reserved
+}
 
 private fun ip4Str(ip: Int) =
     "${(ip ushr 24) and 0xFF}.${(ip ushr 16) and 0xFF}.${(ip ushr 8) and 0xFF}.${ip and 0xFF}"
