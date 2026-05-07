@@ -380,9 +380,11 @@ document.getElementById('verifyBtn').addEventListener('click', async (e) => {
       body: JSON.stringify({ code, transactionHash: _txHash }),
     });
     const d = await r.json();
-    if (d.ok && d.token) {
+    if (d.ok && !d.needsSignup) {
+      // Server already set the token internally and triggered reconcile;
+      // we just refresh UI state to flip into the VPN menu.
       showAuthStatus('Logging in…', 'info');
-      await performLogin(d.token);
+      await pollState();
     } else if (d.ok && d.needsSignup) {
       document.getElementById('signupRow').style.display = '';
       document.getElementById('nameInput').focus();
@@ -407,9 +409,10 @@ document.getElementById('signupBtn').addEventListener('click', async (e) => {
       body: JSON.stringify({ name, transactionHash: _txHash }),
     });
     const d = await r.json();
-    if (d.ok && d.token) {
+    if (d.ok) {
+      // Server set the token internally; refresh UI to enter the VPN menu.
       showAuthStatus('Account created — logging in…', 'info');
-      await performLogin(d.token);
+      await pollState();
     } else {
       showAuthStatus(d.error || 'Registration failed', 'err');
       e.target.disabled = false;
@@ -419,9 +422,11 @@ document.getElementById('signupBtn').addEventListener('click', async (e) => {
 
 // ── LocalStorage persistence ──────────────────────────────────────────────────
 
+// localStorage holds only non-sensitive UI prefs. The access token lives on
+// the server (persisted to .bale-token, mode 0600) — never in the browser,
+// so XSS can't exfiltrate it via localStorage.
 function saveConfig() {
   localStorage.setItem('bale_cfg', JSON.stringify({
-    token:     tokenInput.value,
     peer:      document.getElementById('tunnelPeer').value,
     port:      document.getElementById('socks5Port').value,
     transport: document.getElementById('tunnelTransport').value,
@@ -431,7 +436,6 @@ function saveConfig() {
 function loadConfig() {
   let cfg;
   try { cfg = JSON.parse(localStorage.getItem('bale_cfg') || '{}'); } catch { cfg = {}; }
-  if (cfg.token)     tokenInput.value = cfg.token;
   if (cfg.port)      document.getElementById('socks5Port').value = cfg.port;
   if (cfg.transport) document.getElementById('tunnelTransport').value = cfg.transport;
   return cfg;
@@ -463,7 +467,7 @@ function renderSelf(self) {
 // are no other mode/flag globals to keep in sync.
 let _state = null;
 
-const hasToken  = () => !!_state?.token;
+const hasToken  = () => !!_state?.tokenSet;
 const isAlive   = () => _tunnelMode === 'client' ? !!_state?.clientActivated : !!_state?.wsReady;
 const roomReady = () => !!_state?.clientRoomReady;
 
@@ -585,8 +589,10 @@ function refreshActivateBtn() {
 
 async function performLogin(token) {
   if (!token) return;
-  tokenInput.value = token;
-  saveConfig();
+  // Don't echo the pasted token back into a UI field or persist it in
+  // localStorage — it's sensitive and only travels through the POST body
+  // to the backend, which keeps it server-side from there on.
+  tokenInput.value = '';
   try {
     const r = await fetch('/connect', {
       method:  'POST',
@@ -963,21 +969,14 @@ async function removeAdmission(callerId) {
 }
 
 // Restore persisted config (localStorage → form fields), then do an initial
-// state fetch and start the single 2-s render loop.
+// state fetch and start the single 2-s render loop. The token is no longer
+// part of localStorage — the backend persists it itself in .bale-token, so
+// after a restart the WS comes back up automatically without the UI needing
+// to push anything across.
 loadConfig();
-(async () => {
-  await pollState();
-  // After backend restart the in-memory accessToken is empty even though the
-  // UI's localStorage still has it — push it across so reconcile() can bring
-  // the WS up automatically (otherwise the user sees "logged in" UI but no
-  // working WebSocket).
-  if (!_state?.token && tokenInput.value.trim()) {
-    performLogin(tokenInput.value.trim());
-  }
-})();
+pollState();
 
-// Save on any field change
-tokenInput.addEventListener('input', saveConfig);
+// Save on any field change (token field intentionally not wired — it's not persisted client-side)
 document.getElementById('socks5Port').addEventListener('input', saveConfig);
 document.getElementById('tunnelTransport').addEventListener('change', saveConfig);
 document.getElementById('tunnelPeer').addEventListener('change', saveConfig);

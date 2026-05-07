@@ -1,4 +1,6 @@
 bale-vpn-node/node_modules/
+bale-vpn-node/.bale-token
+bale-vpn-node/.allowed-callers.json
 
 # Android / Gradle
 bale-vpn-android/**/build/
