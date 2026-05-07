@@ -273,7 +273,13 @@ class MainActivity : AppCompatActivity() {
 
         if (mode == "client") tickClient(wsReady) else tickServer(wsReady)
 
-        btnLogout.isEnabled = !serviceRunning
+        // Disable logout only while the VPN *client* is actively routing traffic —
+        // an accidental tap there would dump the user into the login screen with the
+        // tunnel half-torn-down. Server mode runs as a permanent foreground service,
+        // so gating on serviceRunning here would mean the button is ALWAYS disabled
+        // in server mode. logout() already calls stopServer() / disconnectAllClients()
+        // cleanly before clearing prefs.
+        btnLogout.isEnabled = !BaleVpnService.isRunning
     }
 
     // ── Client tick ───────────────────────────────────────────────────────────
