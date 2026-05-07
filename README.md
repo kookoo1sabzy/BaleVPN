@@ -24,10 +24,13 @@ There is no commercial relationship with Bale.
 
 The LiveKit data channel is encrypted with **DTLS**, so traffic is opaque to passive observers on the network and to ISP middleboxes. **However, Bale's LiveKit server is the SFU/TURN node and has access to the plaintext of the data flowing through the call.** That means:
 
+- Bale can see **who relays for whom** — every tunnel session is a Bale voice call between two accounts, so Bale's call records reveal the social graph (which account uses which relay, when, for how long).
 - Bale can see **which destinations you connect to** (IP and port, or hostname if your client sends one — see the [Node SOCKS5 doc](docs/node-en.md#configuring-a-browser-as-a-client) for DNS-leak avoidance).
 - Bale can read the **contents of any traffic that isn't itself end-to-end encrypted**. If you only browse `https://` sites, the payload is opaque to them; if you access plaintext HTTP / DNS / FTP / etc. through the tunnel, they can read it.
 
 Treat this tunnel like a corporate VPN whose operator you don't fully trust — fine for IP-level reachability (uncensoring), **not adequate as an anonymity or end-to-end privacy layer**. Use TLS at the application level (HTTPS, encrypted DNS, etc.).
+
+**Recommendation from the author:** register the Bale account used with this tool on a *virtual phone number* rather than your primary one, so the call metadata above can't be tied back to your real identity. Bale accepts non-Iranian numbers — the typical path is: get a virtual number that can receive SMS, register a Telegram account on it (Telegram OTP arrives by SMS), then register Bale on the same number — Bale's OTP is delivered through your Telegram account.
 
 <div dir="rtl">
 
@@ -35,10 +38,13 @@ Treat this tunnel like a corporate VPN whose operator you don't fully trust — 
 
 کانال دادهٔ LiveKit با **DTLS** رمزنگاری می‌شود؛ بنابراین ترافیک از دید ناظرهای مسیر و میدلباکس‌های ISP پنهان است. **اما سرور LiveKit بله نقش SFU/TURN را بازی می‌کند و به دادهٔ رمزگشایی‌شدهٔ تماس دسترسی دارد.** یعنی:
 
+- بله می‌تواند ببیند **چه کسی برای چه کسی رله می‌کند** — هر جلسهٔ تونل یک تماس صوتی بله بین دو حساب است، پس سوابق تماس بله گرافِ اجتماعی را افشا می‌کند (چه حسابی از چه رله‌ای، چه زمانی، چقدر استفاده کرده).
 - بله می‌تواند ببیند **شما به چه مقصدی وصل می‌شوید** (IP و پورت، یا نام میزبان اگر کلاینت شما نام بفرستد — برای جلوگیری از نشت DNS به [راهنمای SOCKS5 در نسخهٔ Node](docs/node-fa.md#تنظیم-مرورگر-بهعنوان-کلاینت) مراجعه کنید).
 - بله می‌تواند **محتوای هر ترافیکی را که خودش رمزنگاری انتها به انتها نشده** بخواند. اگر فقط روی `https://` بگردید، محتوا برایشان مبهم است؛ اما اگر از پروتکل‌های متنی (HTTP/DNS/FTP/…) استفاده کنید، قابل خواندن خواهد بود.
 
 این تونل را مثل VPN شرکتی‌ای ببینید که گرداننده‌اش را کاملاً نمی‌شناسید — برای دسترسی IP (دور زدن مسدودی) خوب است، **اما برای ناشناسی یا حریم خصوصی انتها به انتها کافی نیست**. در سطح برنامه از TLS (HTTPS، DNS رمزنگاری‌شده و…) استفاده کنید.
+
+**توصیهٔ نویسنده:** برای حساب بله‌ای که با این ابزار استفاده می‌کنید، از یک *شمارهٔ تلفن مجازی* استفاده کنید نه شمارهٔ اصلی‌تان، تا متادیتای تماس بالا به هویت واقعی شما گره نخورد. بله شماره‌های غیرایرانی را هم می‌پذیرد — مسیر معمول این است: یک شمارهٔ مجازی که SMS دریافت می‌کند تهیه کنید، اول با همان شماره روی تلگرام ثبت‌نام کنید (OTP تلگرام با SMS می‌آید)، سپس با همان شماره روی بله ثبت‌نام کنید — OTP بله از طریق حساب تلگرام شما می‌رسد.
 
 </div>
 
