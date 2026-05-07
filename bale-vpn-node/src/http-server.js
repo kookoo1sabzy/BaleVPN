@@ -44,7 +44,10 @@ function create(client, connection) {
         if (req.method === 'GET' && url.pathname === '/config') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({
-                token:       client.accessToken || '',
+                // tokenSet (boolean) instead of the actual token — the UI only
+                // needs "are we logged in?", and exposing the JWT here would
+                // let any XSS exfiltrate it via fetch('/config').
+                tokenSet:    !!client.accessToken,
                 ready:       client.ready,
                 connecting:  client.connecting,
                 tunnelMode:  TUNNEL_MODE,
@@ -130,7 +133,7 @@ function create(client, connection) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({
                 mode:            TUNNEL_MODE,
-                token:           client.accessToken || '',
+                tokenSet:        !!client.accessToken,   // never leak the JWT itself
                 self:            client.self,
                 wsReady:         client.ready,
                 wsConnecting:    client.connecting,
@@ -285,8 +288,13 @@ function create(client, connection) {
                     if (!resp.jwt) throw new Error('No JWT in ValidateCode response');
                     const token = await fetchAccessToken(resp.jwt) || resp.jwt;
                     console.log('[Auth] ValidateCode success, token obtained');
+                    // Set the token server-side and let reconcile bring up the WS.
+                    // We don't return it to the UI — the JWT never enters the browser.
+                    client.accessToken = token;
+                    connection.userInitiatedDisconnect = false;
+                    connection.reconcile();
                     res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true, token }));
+                    res.end(JSON.stringify({ ok: true }));
                 } catch (e) {
                     console.error('[Auth] ValidateCode:', e.message);
                     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -308,8 +316,11 @@ function create(client, connection) {
                     if (!resp.jwt) throw new Error('No JWT in SignUp response');
                     const token = await fetchAccessToken(resp.jwt) || resp.jwt;
                     console.log('[Auth] SignUp success, token obtained');
+                    client.accessToken = token;
+                    connection.userInitiatedDisconnect = false;
+                    connection.reconcile();
                     res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true, token }));
+                    res.end(JSON.stringify({ ok: true }));
                 } catch (e) {
                     console.error('[Auth] SignUp:', e.message);
                     res.writeHead(400, { 'Content-Type': 'application/json' });

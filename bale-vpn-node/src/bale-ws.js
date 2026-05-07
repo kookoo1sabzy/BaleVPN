@@ -13,10 +13,25 @@
 //     authority — this class doesn't try to override that.
 
 const WebSocket = require('ws');
+const fs   = require('fs');
+const path = require('path');
 const {
     ACCESS_TOKEN, WS_URL, API_VERSION, PROTO_VERSION,
     PEERTYPE_PRIVATE, PEERTYPE_GROUP, EXPEERTYPE_PRIVATE, EXPEERTYPE_GROUP,
 } = require('./constants');
+
+// Persistent token storage. Lives alongside .allowed-callers.json in the
+// package root. Mode 0600 — readable only by the user running the process.
+// Keeping the token here (and out of the browser) means an XSS in the UI
+// can no longer exfiltrate it: /config and /state report only a boolean.
+const TOKEN_FILE = path.join(__dirname, '..', '.bale-token');
+function loadPersistedToken() {
+    try { return fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch { return ''; }
+}
+function persistToken(t) {
+    if (t) fs.writeFileSync(TOKEN_FILE, t, { mode: 0o600 });
+    else   try { fs.unlinkSync(TOKEN_FILE); } catch {}
+}
 const {
     encodeHandshake, encodePing, encodeRpcRequest,
     decodeServerFrame, decodeSubscribeResponse, decodeCallResponse,
@@ -52,7 +67,15 @@ class BaleWsClient {
             onTunnelReady:         () => connection.reconcile(),
             onPermanentDisconnect: () => connection.onTunnelPermanentDisconnect(),
         });
-        this.accessToken   = ACCESS_TOKEN;
+        // accessToken is a getter/setter — every assignment auto-persists to
+        // disk (or unlinks the file when cleared). Initial value: file > env
+        // constant > empty.
+        let _token = loadPersistedToken() || ACCESS_TOKEN;
+        Object.defineProperty(this, 'accessToken', {
+            get: () => _token,
+            set: (v) => { _token = v || ''; persistToken(_token); },
+            enumerable: true,
+        });
         this.autoReconnect = false;
         this.connecting    = false;
         this.self          = null;       // { id, name, nick } — account owner
