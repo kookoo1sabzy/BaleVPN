@@ -16,6 +16,7 @@
 const fs    = require('fs');
 const net   = require('net');
 const dgram = require('dgram');
+const dns   = require('dns');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
 
@@ -95,6 +96,55 @@ function adjustCsum(pkt, off, oldHi, oldLo, newHi, newLo) {
 // applicable. ICMP doesn't include addresses in its checksum, so no fixup
 // there. Non-first fragments (frag-offset != 0) don't carry the L4 header,
 // so the L4 checksum lives only in the first fragment.
+// Egress filter — reject traffic to private / loopback / link-local /
+// multicast destinations. Without this, a tunnelled client can reach the
+// *server's* local services (sshd on 127.0.0.1, admin UIs on 192.168.x.x,
+// databases bound to localhost) and — most dangerously — cloud metadata
+// endpoints (169.254.169.254 on AWS/GCP/Azure exposes IAM credentials).
+// Used by both the TUN packet path (raw IP header bytes) and the SOCKS5
+// path (host strings, possibly resolved via DNS).
+function isBlockedOctets(a, b) {
+    return (
+        a === 0                          ||  // 0.0.0.0/8         "this network"
+        a === 10                         ||  // 10.0.0.0/8        private (incl. tunnel subnet)
+        (a === 100 && (b & 0xC0) === 64) ||  // 100.64.0.0/10     CGNAT
+        a === 127                        ||  // 127.0.0.0/8       loopback
+        (a === 169 && b === 254)         ||  // 169.254.0.0/16    link-local + cloud metadata
+        (a === 172 && (b & 0xF0) === 16) ||  // 172.16.0.0/12     private
+        (a === 192 && b === 168)         ||  // 192.168.0.0/16    private
+        a >= 224                             // 224.0.0.0/4       multicast + reserved
+    );
+}
+function isBlockedDst(pkt) {
+    if (pkt.length < 20 || (pkt[0] >> 4) !== 4) return true;
+    return isBlockedOctets(pkt[16], pkt[17]);
+}
+function isBlockedIp4(ip) {
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(n => isNaN(n) || n < 0 || n > 255)) return true;
+    return isBlockedOctets(parts[0], parts[1]);
+}
+
+// Resolve a SOCKS5 destination host to an IPv4 address and gate it through
+// the egress filter. Always passes a resolved literal back so the caller
+// hands `net.connect` / `dgram.send` an IP — eliminates a TOCTOU where the
+// downstream socket could re-resolve the hostname to a different (or
+// IPv6) address we hadn't checked. cb(err, addr) — err on DNS failure,
+// IPv6 literal, or blocked address.
+function resolveAndCheck(host, cb) {
+    const v = net.isIP(host);
+    if (v === 4) {
+        if (isBlockedIp4(host)) return cb(new Error(`destination ${host} blocked by egress filter`));
+        return cb(null, host);
+    }
+    if (v === 6) return cb(new Error(`IPv6 destinations not supported: ${host}`));
+    dns.lookup(host, { family: 4 }, (err, addr) => {
+        if (err) return cb(err);
+        if (isBlockedIp4(addr)) return cb(new Error(`destination ${host} (${addr}) blocked by egress filter`));
+        cb(null, addr);
+    });
+}
+
 function rewriteIp(pkt, fieldOffset, newIp) {
     if (pkt.length < 20 || (pkt[0] >> 4) !== 4) return;
     const parts = newIp.split('.').map(Number);
@@ -639,10 +689,11 @@ class TunnelManager {
 
     _handleTunPacket(data, lk) {
         if (!this._tunFd) this._setupTun();
-        // Drop packets destined for the TUN subnet (10.8.0.0/24) — clients
-        // must not reach each other or the gateway via the tunnel.
-        if (data.length >= 20 && (data[0] >> 4) === 4 &&
-            data[16] === 10 && data[17] === 8 && data[18] === 0) return;
+        // Egress filter — drop traffic to private / loopback / link-local /
+        // multicast destinations so a tunnelled client can't reach the
+        // server's localhost, LAN, or cloud-metadata endpoints. Public
+        // destinations (the actual point of the VPN) pass through.
+        if (isBlockedDst(data)) return;
         // Upload rate limit (client → internet). Drop on empty bucket; TCP-in-
         // tunnel will retransmit.
         if (lk._upBucket && !lk._upBucket.take(data.length)) return;
@@ -735,13 +786,26 @@ class TunnelManager {
         if (t === 'C') {
             const { h: host, p: port } = msg;
             console.log(`[Tunnel/S] ${key} TCP → ${host}:${port}`);
-            const socket = net.connect({ host, port });
             const fromUid = lk ? null : Number(fromKey);
-            const sess = { key, host, port, socket, fromUid, lk: lk || null, txSeq: 0, rxBuf: new Map(), rxNext: 0, dead: false, txBytes: 0, rxBytes: 0 };
+            // Insert the session before DNS so a 'D'/'X' frame arriving in the
+            // tiny window before the lookup callback finds it. socket stays
+            // null until the resolved address passes the egress filter; the
+            // 'D' handler null-guards on sess.socket below.
+            const sess = { key, host, port, socket: null, fromUid, lk: lk || null, txSeq: 0, rxBuf: new Map(), rxNext: 0, dead: false, txBytes: 0, rxBytes: 0 };
             this.sessions.set(key, sess);
 
-            socket.setNoDelay(true);
-            socket.once('connect', () => {
+            resolveAndCheck(host, (err, addr) => {
+                if (sess.dead) return;                       // 'X' raced ahead
+                if (err) {
+                    console.error(`[Tunnel/S] ${key} TCP ✗ ${host}:${port} — ${err.message}`);
+                    this._srvSend(sess, { t: 'A', s: sid, ok: false });
+                    this.sessions.delete(key);
+                    return;
+                }
+                const socket = net.connect({ host: addr, port });
+                sess.socket = socket;
+                socket.setNoDelay(true);
+                socket.once('connect', () => {
                 console.log(`[Tunnel/S] ${key} TCP ✓ ${host}:${port}`);
                 this._srvSend(sess, { t: 'A', s: sid, ok: true });
 
@@ -786,39 +850,50 @@ class TunnelManager {
                 this._srvSend(sess, { t: 'A', s: sid, ok: false });
                 this.sessions.delete(key);
             });
+            });   // resolveAndCheck callback
 
         } else if (t === 'D') {
             const sess = this.sessions.get(key);
             if (!sess || sess.dead) return;
+            // sess.socket is null between session creation and DNS resolution.
+            // A well-behaved client waits for 'A' before sending 'D'; defensively
+            // we just drop here if the socket isn't ready.
+            const ready = sess.socket && !sess.socket.destroyed;
             if (msg.data) {
                 sess.txBytes += msg.data.length;
-                if (!sess.socket.destroyed) sess.socket.write(msg.data);
+                if (ready) sess.socket.write(msg.data);
             } else {
                 sess.rxBuf.set(msg.q, Buffer.from(msg.d, 'base64'));
                 while (sess.rxBuf.has(sess.rxNext)) {
                     const buf = sess.rxBuf.get(sess.rxNext);
                     sess.txBytes += buf.length;
                     sess.rxBuf.delete(sess.rxNext++);
-                    if (!sess.socket.destroyed) sess.socket.write(buf);
+                    if (ready) sess.socket.write(buf);
                 }
             }
 
         } else if (t === 'U') {
             console.log(`[Tunnel/S] ${key} UDP → ${msg.h}:${msg.p} ${msg.data?.length ?? 0}B`);
-            const sock = dgram.createSocket('udp4');
-            sock.send(msg.data, msg.p, msg.h, () => {});
-            sock.once('message', resp => {
-                this._srvSend({ lk: lk || null, fromUid: lk ? null : Number(fromKey) },
-                    { t: 'U', s: sid, h: msg.h, p: msg.p, data: resp });
-                sock.close();
+            resolveAndCheck(msg.h, (err, addr) => {
+                if (err) {
+                    console.warn(`[Tunnel/S] ${key} UDP ✗ ${msg.h}:${msg.p} — ${err.message}`);
+                    return;
+                }
+                const sock = dgram.createSocket('udp4');
+                sock.send(msg.data, msg.p, addr, () => {});
+                sock.once('message', resp => {
+                    this._srvSend({ lk: lk || null, fromUid: lk ? null : Number(fromKey) },
+                        { t: 'U', s: sid, h: msg.h, p: msg.p, data: resp });
+                    sock.close();
+                });
+                setTimeout(() => { try { sock.close(); } catch {} }, 5000);
             });
-            setTimeout(() => { try { sock.close(); } catch {} }, 5000);
 
         } else if (t === 'X') {
             const sess = this.sessions.get(key);
             if (sess) {
                 sess.dead = true;
-                sess.socket.destroy();
+                sess.socket?.destroy();   // null when DNS hasn't resolved yet
                 this.sessions.delete(key);
                 console.log(`[Tunnel/S] ${key} TCP ✕ ${sess.host}:${sess.port} (client)  ↑${sess.txBytes}B ↓${sess.rxBytes}B`);
             } else {
