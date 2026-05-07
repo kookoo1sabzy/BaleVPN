@@ -38,6 +38,66 @@ function tunnelDecode(text) {
 }
 function makeSid() { return crypto.randomBytes(6).toString('hex'); }
 
+// ── IPv4 SNAT helpers (server-side multi-client TUN) ─────────────────────────
+//
+// Every Android client locally configures its TUN interface as 10.8.0.2/24
+// (BaleVpnService.kt). On a single-client server that's fine — the kernel's
+// MASQUERADE conntrack maps <10.8.0.2:sport, dst:dport> to the public NIC's
+// addr/port and demuxes return flows by that 4-tuple. With multiple clients
+// all claiming 10.8.0.2 the conntrack tuples collide and return packets get
+// misrouted, so the server applies a userspace SNAT: rewrite each client's
+// source IP to a distinct address in 10.8.0.0/24 *before* handing the packet
+// to bale0, and reverse the rewrite on return packets so the client still
+// sees its own configured 10.8.0.2.
+
+// Adjust a 16-bit Internet checksum at pkt[off] for a single IP-address change.
+// RFC 1624: HC' = ~(~HC + ~m + m')   in 16-bit one's complement arithmetic.
+// Used for the IPv4 header checksum and the L4 (TCP/UDP) checksum, both of
+// which depend on the IP addresses via the pseudo-header.
+function adjustCsum(pkt, off, oldHi, oldLo, newHi, newLo) {
+    let s = (~pkt.readUInt16BE(off) & 0xFFFF)
+          + (~oldHi & 0xFFFF) + (~oldLo & 0xFFFF)
+          + newHi + newLo;
+    while (s > 0xFFFF) s = (s & 0xFFFF) + (s >>> 16);
+    pkt.writeUInt16BE(~s & 0xFFFF, off);
+}
+
+// In-place rewrite of an IPv4 src (fieldOffset=12) or dst (fieldOffset=16)
+// address. Updates the IP header checksum and the L4 (TCP/UDP) checksum where
+// applicable. ICMP doesn't include addresses in its checksum, so no fixup
+// there. Non-first fragments (frag-offset != 0) don't carry the L4 header,
+// so the L4 checksum lives only in the first fragment.
+function rewriteIp(pkt, fieldOffset, newIp) {
+    if (pkt.length < 20 || (pkt[0] >> 4) !== 4) return;
+    const parts = newIp.split('.').map(Number);
+    // No-op short-circuit: when the address is already what we'd write (e.g.
+    // the first client is leased 10.8.0.2, which matches the address it
+    // already configured locally), skip the writes and the checksum update.
+    if (pkt[fieldOffset]     === parts[0] && pkt[fieldOffset + 1] === parts[1] &&
+        pkt[fieldOffset + 2] === parts[2] && pkt[fieldOffset + 3] === parts[3]) return;
+    const oldHi = pkt.readUInt16BE(fieldOffset);
+    const oldLo = pkt.readUInt16BE(fieldOffset + 2);
+    pkt[fieldOffset]     = parts[0]; pkt[fieldOffset + 1] = parts[1];
+    pkt[fieldOffset + 2] = parts[2]; pkt[fieldOffset + 3] = parts[3];
+    const newHi = (parts[0] << 8) | parts[1];
+    const newLo = (parts[2] << 8) | parts[3];
+
+    adjustCsum(pkt, 10, oldHi, oldLo, newHi, newLo);   // IP header checksum
+
+    const proto    = pkt[9];
+    const ihl      = (pkt[0] & 0x0F) * 4;
+    const fragInfo = pkt.readUInt16BE(6);
+    if ((fragInfo & 0x1FFF) !== 0) return;             // non-first fragment
+
+    if (proto === 6 && pkt.length >= ihl + 18) {       // TCP
+        adjustCsum(pkt, ihl + 16, oldHi, oldLo, newHi, newLo);
+    } else if (proto === 17 && pkt.length >= ihl + 8) {// UDP
+        if (pkt.readUInt16BE(ihl + 6) !== 0) {         // 0 = no checksum
+            adjustCsum(pkt, ihl + 6, oldHi, oldLo, newHi, newLo);
+        }
+    }
+}
+
 class TunnelManager {
     /**
      * @param {{
@@ -63,12 +123,14 @@ class TunnelManager {
         this._pendingSweep    = null;       // setInterval handle
         // TUN packet forwarding (server mode)
         this._tunFd           = null;
-        this._tunLk           = null;
-        this._tunClientKey    = null;
         this._tunReadRunning  = false;
         this._tunStatsTimer   = null;
         this._tunRxPkts       = 0;  this._tunRxBytes = 0;
         this._tunTxPkts       = 0;  this._tunTxBytes = 0;
+        // SNAT pool — lazily initialized on first allocation.
+        this._snatPool        = null;       // queue of free IPs (strings)
+        this._snatByLk        = new Map();  // lk → assigned IP
+        this._lkBySnat        = new Map();  // assigned IP → lk
         // Client reconnect state
         this._reconnectTimer   = null;
         this._reconnectAttempt = 0;
@@ -135,7 +197,8 @@ class TunnelManager {
                 callKey,
                 callerId:     lk._callerId   || 0,
                 callerName:   lk._callerName || null,
-                isTunClient:  lk === this._tunLk,
+                snatIp:       this._snatByLk.get(lk) || null,
+                isTunClient:  this._snatByLk.has(lk),
                 connectedAt:  lk._connectedAt,
                 rxPkts:  lk._rxPkts,  rxBytes: lk._rxBytes,
                 txPkts:  lk._txPkts,  txBytes: lk._txBytes,
@@ -147,9 +210,9 @@ class TunnelManager {
     disconnectClient(callKey) {
         const lk = this.lkRooms.get(callKey);
         if (!lk) return false;
+        // lk.disconnect() fires onDisconnected synchronously, which removes
+        // the room from lkRooms and frees the SNAT lease.
         lk.disconnect();
-        this.lkRooms.delete(callKey);
-        if (this._tunLk === lk) { this._tunLk = null; this._tunClientKey = null; }
         return true;
     }
 
@@ -166,11 +229,9 @@ class TunnelManager {
         if (this._pendingSweep) { clearInterval(this._pendingSweep); this._pendingSweep = null; }
         for (const [callKey, lk] of this.lkRooms) {
             promises.push(sendDiscard(callKey));
-            lk.disconnect();
+            lk.disconnect();   // synchronous onDisconnected → frees SNAT lease
         }
         this.lkRooms.clear();
-        this._tunLk = null;
-        this._tunClientKey = null;
         if (this._tunStatsTimer) { clearInterval(this._tunStatsTimer); this._tunStatsTimer = null; }
         await Promise.all(promises);
     }
@@ -316,9 +377,7 @@ class TunnelManager {
             for (const [k, lk] of this.lkRooms) {
                 if (lk._callerId === callerId) {
                     console.log(`[Tunnel/S] replacing existing client ${k} from caller ${callerId} with ${callKey}`);
-                    lk.disconnect();
-                    this.lkRooms.delete(k);
-                    if (this._tunLk === lk) { this._tunLk = null; this._tunClientKey = null; }
+                    lk.disconnect();   // onDisconnected → frees SNAT lease + removes from lkRooms
                 }
             }
         }
@@ -335,6 +394,14 @@ class TunnelManager {
         lk._rxPkts = 0; lk._rxBytes = 0;
         lk._txPkts = 0; lk._txBytes = 0;
         this.lkRooms.set(callKey, lk);
+        const snat = this._allocSnat(lk);
+        if (!snat) {
+            console.error(`[Tunnel/S] SNAT pool exhausted — rejecting call ${callId}`);
+            this.lkRooms.delete(callKey);
+            ws.discardCall(callId).catch(() => {});
+            return;
+        }
+        console.log(`[Tunnel/S] SNAT lease ${snat} for callKey=${callKey} caller=${callerId}`);
         lk.onData = (data) => {
             lk._rxPkts++;
             lk._rxBytes += data.length;
@@ -344,6 +411,7 @@ class TunnelManager {
         };
         lk.onDisconnected = () => {
             this.lkRooms.delete(callKey);
+            this._freeSnat(lk);
             let closed = 0;
             for (const [key, sess] of this.sessions) {
                 if (sess.lk === lk) {
@@ -360,6 +428,7 @@ class TunnelManager {
         } catch (e) {
             console.error('[Tunnel/S] LiveKit connect failed:', e.message);
             this.lkRooms.delete(callKey);
+            this._freeSnat(lk);
         }
     }
 
@@ -485,18 +554,46 @@ class TunnelManager {
 
     // ── TUN packet forwarding (server mode) ────────────────────────────────────
 
+    _initSnatPool() {
+        if (this._snatPool) return;
+        this._snatPool = [];
+        // Server's bale0 holds 10.8.0.1 — skip it. Reserve 10.8.0.255 for
+        // broadcast. Each client gets a unique address from .2..254 so the
+        // kernel's MASQUERADE conntrack can disambiguate concurrent flows.
+        for (let i = 2; i < 255; i++) this._snatPool.push(`10.8.0.${i}`);
+    }
+
+    _allocSnat(lk) {
+        this._initSnatPool();
+        const ip = this._snatPool.shift();
+        if (!ip) return null;
+        this._snatByLk.set(lk, ip);
+        this._lkBySnat.set(ip, lk);
+        return ip;
+    }
+
+    _freeSnat(lk) {
+        const ip = this._snatByLk.get(lk);
+        if (!ip) return;
+        this._snatByLk.delete(lk);
+        this._lkBySnat.delete(ip);
+        // Push back to the END of the queue so a recently freed IP doesn't
+        // get re-leased immediately — gives kernel conntrack time to age out
+        // stale entries before the same IP is handed to a new client.
+        this._snatPool.push(ip);
+    }
+
     _handleTunPacket(data, lk) {
-        if (this._tunLk !== lk) {
-            this._tunLk = lk;
-            this._tunClientKey = lk._callKey || '?';
-            if (!this._tunFd) this._setupTun();
-            this._tunRxPkts = 0; this._tunRxBytes = 0;
-            this._tunTxPkts = 0; this._tunTxBytes = 0;
-        }
+        if (!this._tunFd) this._setupTun();
         // Drop packets destined for the TUN subnet (10.8.0.0/24) — clients
-        // must not reach each other or the server via the tunnel.
+        // must not reach each other or the gateway via the tunnel.
         if (data.length >= 20 && (data[0] >> 4) === 4 &&
             data[16] === 10 && data[17] === 8 && data[18] === 0) return;
+        // SNAT inbound: every client locally configures src=10.8.0.2, so
+        // rewrite to its allocated unique IP before handing off to the kernel.
+        const snat = this._snatByLk.get(lk);
+        if (!snat) return;   // no lease — should not normally happen
+        rewriteIp(data, 12, snat);
         if (this._tunFd !== null) {
             this._tunRxPkts++; this._tunRxBytes += data.length;
             fs.write(this._tunFd, data, (err) => {
@@ -551,10 +648,19 @@ class TunnelManager {
                     this._tunReadRunning = false;
                     return;
                 }
-                if (n > 0 && this._tunLk) {
-                    this._tunTxPkts++; this._tunTxBytes += n;
-                    this._tunLk._txPkts++; this._tunLk._txBytes += n;
-                    this._tunLk.sendLossy(lkEncode({ t: 'I', data: Buffer.from(buf.slice(0, n)) }));
+                if (n > 0 && (buf[0] >> 4) === 4) {
+                    // Route by destination IP — return packets for SNAT'd flows
+                    // arrive with dst = the client's leased IP. Rewrite back to
+                    // the address the client expects (10.8.0.2) before shipping.
+                    const dst = `${buf[16]}.${buf[17]}.${buf[18]}.${buf[19]}`;
+                    const lk  = this._lkBySnat.get(dst);
+                    if (lk) {
+                        rewriteIp(buf, 16, '10.8.0.2');
+                        this._tunTxPkts++; this._tunTxBytes += n;
+                        lk._txPkts++; lk._txBytes += n;
+                        lk.sendLossy(lkEncode({ t: 'I', data: Buffer.from(buf.slice(0, n)) }));
+                    }
+                    // Packets to addresses with no lease (or non-IPv4) are dropped silently.
                 }
                 read();
             });
@@ -829,14 +935,15 @@ class TunnelManager {
     }
 
     hangUpAll() {
-        this._tunLk = null;
-        this._tunClientKey = null;
         if (this._tunStatsTimer) { clearInterval(this._tunStatsTimer); this._tunStatsTimer = null; }
         if (this.lkRooms.size) {
             console.log(`[Tunnel/S] Hanging up ${this.lkRooms.size} LiveKit room(s)`);
-            for (const lk of this.lkRooms.values()) lk.disconnect();
+            for (const lk of this.lkRooms.values()) lk.disconnect();   // → frees SNAT
             this.lkRooms.clear();
         }
+        // Defensive: any leases that somehow survived (e.g. from a crashed
+        // teardown) are reclaimed here. _freeSnat is idempotent.
+        for (const lk of [...this._snatByLk.keys()]) this._freeSnat(lk);
         if (this.sessions.size) {
             console.log(`[Tunnel/S] Closing ${this.sessions.size} session(s)`);
             for (const sess of this.sessions.values()) {
@@ -858,7 +965,6 @@ class TunnelManager {
         this._callIds.clear();
         this._callEndedRemover?.(); this._callEndedRemover = null;
         this._callId = null;
-        this._tunLk = null;
         // Clear mode/serverPeer/lkTransport BEFORE the LK teardown — its
         // synchronous onDisconnected fires _scheduleReconnect, which gates on
         // these. Leaving them set would arm a phantom reconnect.

@@ -154,12 +154,11 @@ On startup the server:
 4. Verifies the MASQUERADE rule is in place.
 5. Subscribes to Bale incoming-call updates and starts auto-answering.
 
-When an Android client connects, it gets `10.8.0.2/24` and routes all of its traffic into the tunnel.
+When an Android client connects, it gets `10.8.0.2/24` and routes all of its traffic into the tunnel. Up to 253 clients can connect simultaneously — the server transparently rewrites each client's source address to a distinct IP in `10.8.0.0/24` so the kernel can disambiguate concurrent flows.
 
 ### Limitations
 
 - IPv4 only. IPv6 packets from the client are explicitly dropped (the Android client falls back to IPv4 fast via ICMPv6 Destination Unreachable).
-- One TUN device, so only one *active TUN client* at a time. Other peers can still connect via SOCKS5 framing on the LK channel for TCP-only forwarding (see CLAUDE.md for the wire details).
 
 ---
 
