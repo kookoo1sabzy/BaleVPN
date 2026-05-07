@@ -140,7 +140,10 @@ function openInBrowser(url) {
 }
 
 const server = httpServer.create(client, connection);
-server.listen(HTTP_PORT, () => {
+// Bind to loopback only — the UI has no auth or CSRF protection, and
+// listening on 0.0.0.0 (Node's default) would expose tunnel control to
+// anyone on the LAN.
+server.listen(HTTP_PORT, '127.0.0.1', () => {
     const url = `http://localhost:${HTTP_PORT}`;
     console.log(`[HTTP] ${url}`);
     // Auto-open the UI in client mode (typical interactive use). Suppressed
