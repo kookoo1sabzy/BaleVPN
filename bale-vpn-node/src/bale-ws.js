@@ -381,7 +381,6 @@ class BaleWsClient {
             'bale.users.v1.Users', 'GetContacts', buildGetContactsRequest()
         );
         const contacts = decodeGetContactsResponse(contactsBuf);
-        console.log(`[Contacts] GetContacts: ${contacts.users.length} users, ${contacts.userPeers.length} peers, notChanged=${contacts.isNotChanged}`);
 
         let peers = [];
         if (contacts.userPeers.length > 0) {
