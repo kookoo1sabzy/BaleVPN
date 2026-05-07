@@ -10,7 +10,7 @@
 const http = require('http');
 const {
     TUNNEL_MODE, PEERTYPE_PRIVATE, PEERTYPE_GROUP,
-    MAX_LIMIT_KBPS,
+    MAX_LIMIT_KBPS, HTTP_PORT,
 } = require('./constants');
 const {
     buildStartPhoneAuthRequest, decodeStartPhoneAuthResponse,
@@ -20,11 +20,21 @@ const {
 } = require('./wire-codecs');
 const { grpcCall, fetchAccessToken } = require('./grpc-web');
 const { AdmissionStore } = require('./admission');
-const { HTML }           = require('./ui-html');
+const { HTML, csrfToken } = require('./ui-html');
 
 function create(client, connection) {
     return http.createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
+
+        // CSRF gate — any state-changing request must carry the per-process
+        // token that's embedded in our HTML. A cross-origin attacker can fire
+        // a fetch at us but can't read our HTML to learn the token, so the
+        // header check shuts the door on browser-driven CSRF.
+        if (req.method !== 'GET' && req.method !== 'HEAD' &&
+            req.headers['x-csrf-token'] !== csrfToken) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok: false, error: 'CSRF token missing or invalid' }));
+        }
 
         if (req.method === 'GET' && url.pathname === '/') {
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
