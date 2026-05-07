@@ -8,8 +8,9 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { RUNTIME_DIR } = require('./constants');
 
-const ADMISSION_FILE = path.join(__dirname, '..', '.allowed-callers.json');
+const ADMISSION_FILE = path.join(RUNTIME_DIR, '.allowed-callers.json');
 
 const AdmissionStore = {
     _ids: null,  // Set<number> — lazy-loaded

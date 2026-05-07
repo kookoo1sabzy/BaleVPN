@@ -3,7 +3,16 @@
 // Constants and CLI-arg-derived config used across the modules. Imported by
 // almost every other file — keep this file tiny and side-effect free.
 
+const path  = require('path');
 const _args = process.argv.slice(2);
+
+// Where to store runtime state files (.bale-token, .allowed-callers.json).
+// When packaged via `pkg`, __dirname is a virtual read-only snapshot path,
+// so we put files next to the binary on disk. In dev, use the package root
+// to match the historical convention.
+const RUNTIME_DIR = process.pkg
+    ? path.dirname(process.execPath)
+    : path.join(__dirname, '..');
 
 const ACCESS_TOKEN = '';
 
@@ -57,6 +66,7 @@ module.exports = {
     TUNNEL_MAX_RECONNECT_ATTEMPTS,
     PENDING_TIMEOUT_MS, PENDING_SWEEP_MS, ESTABLISH_GRACE_MS,
     DEFAULT_LIMIT_KBPS, MAX_LIMIT_KBPS, THROTTLE_FLAG_MS,
+    RUNTIME_DIR,
     // Helpers
     toLong: v => Number(v.toString()),
 };
