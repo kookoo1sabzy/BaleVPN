@@ -607,6 +607,23 @@ function decodeUserEntity(buf) {
     return o;
 }
 
+// Decode the inner protobuf payload of an RPC error response into a
+// readable { code, message }. Bale uses { code: int32 = 1, message: string = 2 }.
+// Falls back to hex if either field is missing so we never throw away info.
+function decodeRpcError(buf) {
+    const r = new Reader(buf);
+    let code = 0, message = '';
+    while (r.pos < r.len) {
+        const tag = r.uint32();
+        switch (tag >>> 3) {
+            case 1: code    = r.int32();  break;
+            case 2: message = r.string(); break;
+            default: r.skipType(tag & 7);
+        }
+    }
+    return { code, message: message || ('0x' + Buffer.from(buf).toString('hex')) };
+}
+
 module.exports = {
     // Auth
     buildStartPhoneAuthRequest, decodeStartPhoneAuthResponse,
@@ -622,7 +639,7 @@ module.exports = {
     buildPeerBytes, buildSendMessageRequest,
     // Frame decoders
     decodeServerFrame, decodeHandshakeResponse, decodeUpdateContainer,
-    decodeRpcResponse, decodePong, decodeSubscribeResponse,
+    decodeRpcResponse, decodePong, decodeSubscribeResponse, decodeRpcError,
     // Sub-message decoders
     decodeXC, decodeCallReceived, decodeCallEnded, decodeCallEntity,
     decodeCallResponse, decodeTIF, decodeQBZ, decodeTextMessage,
