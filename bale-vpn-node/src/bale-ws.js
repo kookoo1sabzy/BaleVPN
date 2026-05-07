@@ -18,13 +18,15 @@ const path = require('path');
 const {
     ACCESS_TOKEN, WS_URL, API_VERSION, PROTO_VERSION,
     PEERTYPE_PRIVATE, PEERTYPE_GROUP, EXPEERTYPE_PRIVATE, EXPEERTYPE_GROUP,
+    RUNTIME_DIR,
 } = require('./constants');
 
-// Persistent token storage. Lives alongside .allowed-callers.json in the
-// package root. Mode 0600 — readable only by the user running the process.
+// Persistent token storage. Sits alongside .allowed-callers.json in the
+// runtime dir (next to the binary when packaged via pkg, or the package
+// root in dev). Mode 0600 — readable only by the user running the process.
 // Keeping the token here (and out of the browser) means an XSS in the UI
 // can no longer exfiltrate it: /config and /state report only a boolean.
-const TOKEN_FILE = path.join(__dirname, '..', '.bale-token');
+const TOKEN_FILE = path.join(RUNTIME_DIR, '.bale-token');
 function loadPersistedToken() {
     try { return fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch { return ''; }
 }
