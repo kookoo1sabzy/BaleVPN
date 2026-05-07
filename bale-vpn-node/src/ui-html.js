@@ -4,6 +4,12 @@
 // renders the login screen, VPN menu, server-mode admission panels, and
 // drives the 2-second pollState() loop that keeps the UI in sync with the
 // backend. Kept verbatim from the original monolithic source for parity.
+//
+// Constants from ./constants are baked into the template literal at module
+// load (unescaped ${…}); browser-side runtime substitutions use the escaped
+// \${…} form to survive the template eval.
+
+const { MAX_LIMIT_KBPS } = require('./constants');
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -110,25 +116,35 @@ const HTML = `<!DOCTYPE html>
   .tunnel-row input[type=number] { max-width: 90px; flex: none; }
   #tunnelStatus { margin-top: .1rem; }
   .client-row {
-    display: flex; align-items: center; gap: .6rem;
-    padding: .45rem .6rem; border-radius: 7px;
-    background: #f7f9fc; margin-bottom: .35rem;
-    font-size: .78rem; font-family: monospace;
+    display: flex; align-items: center; gap: .7rem;
+    padding: .65rem .8rem; border-radius: 8px;
+    background: #f7f9fc; margin-bottom: .45rem;
+    font-family: monospace;
   }
   .client-row .client-dot {
-    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+    width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
     background: #aaa;
   }
   .client-row .client-dot.active { background: #43a047; }
-  .client-row .client-info { flex: 1; display: flex; flex-direction: column; gap: .15rem; }
-  .client-row .client-id { font-weight: 600; font-size: .8rem; }
-  .client-row .client-stats { opacity: .65; }
-  .client-row .disc-btn {
-    border: 1px solid #e53935; background: none; color: #e53935;
+  .client-row .client-info { flex: 1; display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
+  .client-row .client-id   { font-weight: 600; font-size: .85rem; }
+  .client-row .client-rate { font-size: .85rem; display: flex; gap: 1.2rem; }
+  .client-row .client-rate .up   { color: #1976d2; }
+  .client-row .client-rate .down { color: #2e7d32; }
+  .client-row .client-meta { font-size: .72rem; opacity: .55; display: flex; gap: 1rem; flex-wrap: wrap; }
+  .client-row.throttled { background: #fdecea; }
+  .client-row.throttled .client-rate .up,
+  .client-row.throttled .client-rate .down { color: #c62828; }
+  .client-row .client-actions { display: flex; flex-direction: column; gap: .3rem; }
+  .client-row .disc-btn, .client-row .lim-btn {
+    border: 1px solid #888; background: none; color: #444;
     border-radius: 5px; padding: .2rem .55rem; cursor: pointer;
     font-size: .72rem; white-space: nowrap;
   }
+  .client-row .disc-btn { border-color: #e53935; color: #e53935; }
   .client-row .disc-btn:hover { background: #e53935; color: #fff; }
+  .client-row .lim-btn { border-color: #1976d2; color: #1976d2; }
+  .client-row .lim-btn:hover { background: #1976d2; color: #fff; }
   #clientsList .empty, #pendingList .empty, #admissionList .empty {
     font-size: .78rem; opacity: .45; padding: .3rem .1rem;
   }
@@ -768,6 +784,14 @@ function fmtKB(bytes) {
   if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
   return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
 }
+// Bytes/sec → "X kbps" / "X.X Mbps". Used for live throughput display.
+function fmtRate(bps) {
+  const bits = bps * 8;
+  if (bits < 1000)        return '0 kbps';
+  if (bits < 1_000_000)   return Math.round(bits / 1000) + ' kbps';
+  return (bits / 1_000_000).toFixed(2) + ' Mbps';
+}
+const _sampleCache = new Map();   // callKey → { ts, rxBytes, txBytes, rxRate, txRate }
 function fmtAge(ms) {
   const s = Math.floor((Date.now() - ms) / 1000);
   if (s < 60) return s + 's';
@@ -784,30 +808,70 @@ async function pollClients() {
     const r = await fetch('/tunnel/clients');
     const list = await r.json();
     const el = document.getElementById('clientsList');
-    if (!list.length) { el.innerHTML = '<div class="empty">No clients connected</div>'; return; }
+    if (!list.length) { _sampleCache.clear(); el.innerHTML = '<div class="empty">No clients connected</div>'; return; }
+    const now = Date.now();
+    const seen = new Set();
     el.innerHTML = list.map(c => {
+      seen.add(c.callKey);
+      // Throughput rate from successive samples (rxBytes/txBytes are cumulative).
+      let rxRate = 0, txRate = 0;
+      const prev = _sampleCache.get(c.callKey);
+      if (prev) {
+        const dt = (now - prev.ts) / 1000;
+        if (dt > 0) {
+          rxRate = Math.max(0, (c.rxBytes - prev.rxBytes) / dt);
+          txRate = Math.max(0, (c.txBytes - prev.txBytes) / dt);
+        }
+      }
+      _sampleCache.set(c.callKey, { ts: now, rxBytes: c.rxBytes, txBytes: c.txBytes });
       const who = c.callerName
         ? escapeHtml(c.callerName) + ' <span style="opacity:.5; font-weight:400">(' + c.callerId + ')</span>'
         : (c.callerId ? 'Caller ' + c.callerId : 'Call ' + c.callKey);
+      const upLim   = c.upBps   ? Math.round(c.upBps   * 8 / 1000) : 0;
+      const downLim = c.downBps ? Math.round(c.downBps * 8 / 1000) : 0;
       return \`
-      <div class="client-row">
+      <div class="client-row\${c.throttled ? ' throttled' : ''}">
         <div class="client-dot\${c.isTunClient ? ' active' : ''}"></div>
         <div class="client-info">
           <span class="client-id">\${who}\${c.isTunClient ? ' · TUN' : ''}</span>
-          <span class="client-stats">
-            up \${fmtAge(c.connectedAt)} &nbsp;·&nbsp;
-            ↑ \${fmtKB(c.rxBytes)} &nbsp;·&nbsp;
-            ↓ \${fmtKB(c.txBytes)}
+          <span class="client-rate">
+            <span class="up">↑ \${fmtRate(rxRate)}</span>
+            <span class="down">↓ \${fmtRate(txRate)}</span>
+          </span>
+          <span class="client-meta">
+            <span>up \${fmtAge(c.connectedAt)}</span>
+            <span>total ↑\${fmtKB(c.rxBytes)} ↓\${fmtKB(c.txBytes)}</span>
+            <span>cap ↑\${upLim} / ↓\${downLim} kbps</span>
           </span>
         </div>
-        <button class="disc-btn" onclick="disconnectClient('\${encodeURIComponent(c.callKey)}')">Disconnect</button>
+        <div class="client-actions">
+          <button class="lim-btn"  onclick="limitClient('\${encodeURIComponent(c.callKey)}', \${upLim}, \${downLim})">Limit</button>
+          <button class="disc-btn" onclick="disconnectClient('\${encodeURIComponent(c.callKey)}')">Disconnect</button>
+        </div>
       </div>\`;
     }).join('');
+    // Drop cache entries for clients that disappeared (disconnects).
+    for (const k of [..._sampleCache.keys()]) if (!seen.has(k)) _sampleCache.delete(k);
   } catch {}
 }
 
 async function disconnectClient(callKey) {
   await fetch('/tunnel/clients/' + callKey + '/disconnect', { method: 'POST' });
+  pollClients();
+}
+
+async function limitClient(callKey, curUp, curDown) {
+  const upStr = prompt('Upload limit (kbps, 1–${MAX_LIMIT_KBPS}):', String(curUp || 300));
+  if (upStr === null) return;
+  const downStr = prompt('Download limit (kbps, 1–${MAX_LIMIT_KBPS}):', String(curDown || 300));
+  if (downStr === null) return;
+  const upKbps   = Math.max(1, Math.min(${MAX_LIMIT_KBPS}, parseInt(upStr,   10) || 0));
+  const downKbps = Math.max(1, Math.min(${MAX_LIMIT_KBPS}, parseInt(downStr, 10) || 0));
+  await fetch('/tunnel/clients/' + callKey + '/limit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upKbps, downKbps }),
+  });
   pollClients();
 }
 

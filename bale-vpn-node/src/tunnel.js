@@ -24,6 +24,7 @@ const {
     TUNNEL_PREFIX, CHUNK_SIZE, LK_CHUNK,
     TUNNEL_MAX_RECONNECT_ATTEMPTS,
     PENDING_TIMEOUT_MS, PENDING_SWEEP_MS, ESTABLISH_GRACE_MS,
+    DEFAULT_LIMIT_KBPS, MAX_LIMIT_KBPS, THROTTLE_FLAG_MS,
 } = require('./constants');
 const { LiveKitTransport, lkEncode, lkDecode } = require('./livekit');
 const { AdmissionStore } = require('./admission');
@@ -37,6 +38,33 @@ function tunnelDecode(text) {
     try { return JSON.parse(text.slice(TUNNEL_PREFIX.length)); } catch { return null; }
 }
 function makeSid() { return crypto.randomBytes(6).toString('hex'); }
+
+// Simple bytes/sec token bucket with 1-second burst, mirroring the Android
+// PacketProcessor's per-direction limiter. Drop semantics — when the bucket
+// is empty, take() returns false and the caller is expected to drop the
+// packet (TCP-in-tunnel will retransmit; UDP loss is acceptable).
+class TokenBucket {
+    constructor(rateBps) {
+        this._rate    = rateBps;
+        this._cap     = rateBps;
+        this._tokens  = rateBps;
+        this._last    = Date.now();
+        this.lastDrop = 0;
+    }
+    setRate(rateBps) {
+        this._rate = rateBps;
+        this._cap  = rateBps;
+        if (this._tokens > this._cap) this._tokens = this._cap;
+    }
+    take(bytes) {
+        const now = Date.now();
+        this._tokens = Math.min(this._cap, this._tokens + (now - this._last) / 1000 * this._rate);
+        this._last   = now;
+        if (this._tokens < bytes) { this.lastDrop = now; return false; }
+        this._tokens -= bytes;
+        return true;
+    }
+}
 
 // ── IPv4 SNAT helpers (server-side multi-client TUN) ─────────────────────────
 //
@@ -131,6 +159,9 @@ class TunnelManager {
         this._snatPool        = null;       // queue of free IPs (strings)
         this._snatByLk        = new Map();  // lk → assigned IP
         this._lkBySnat        = new Map();  // assigned IP → lk
+        // Per-caller bandwidth overrides (in-memory, like Android). Re-applied
+        // when the same caller reconnects within the same process lifetime.
+        this._callerLimits    = new Map();  // callerId → { upBps, downBps }
         // Client reconnect state
         this._reconnectTimer   = null;
         this._reconnectAttempt = 0;
@@ -192,7 +223,12 @@ class TunnelManager {
 
     clients() {
         const list = [];
+        const now = Date.now();
         for (const [callKey, lk] of this.lkRooms) {
+            const upBps   = lk._upBucket   ? lk._upBucket._rate   : 0;
+            const downBps = lk._downBucket ? lk._downBucket._rate : 0;
+            const throttled = !!(lk._upBucket   && (now - lk._upBucket.lastDrop)   < THROTTLE_FLAG_MS) ||
+                              !!(lk._downBucket && (now - lk._downBucket.lastDrop) < THROTTLE_FLAG_MS);
             list.push({
                 callKey,
                 callerId:     lk._callerId   || 0,
@@ -202,9 +238,20 @@ class TunnelManager {
                 connectedAt:  lk._connectedAt,
                 rxPkts:  lk._rxPkts,  rxBytes: lk._rxBytes,
                 txPkts:  lk._txPkts,  txBytes: lk._txBytes,
+                upBps, downBps, throttled,
             });
         }
         return list;
+    }
+
+    setClientLimit(callKey, upBps, downBps) {
+        const lk = this.lkRooms.get(callKey);
+        if (!lk) return false;
+        if (lk._upBucket)   lk._upBucket.setRate(upBps);
+        if (lk._downBucket) lk._downBucket.setRate(downBps);
+        // Persist per-caller so a reconnect picks up the same cap.
+        if (lk._callerId) this._callerLimits.set(lk._callerId, { upBps, downBps });
+        return true;
     }
 
     disconnectClient(callKey) {
@@ -402,6 +449,13 @@ class TunnelManager {
             return;
         }
         console.log(`[Tunnel/S] SNAT lease ${snat} for callKey=${callKey} caller=${callerId}`);
+
+        // Per-direction token buckets. Default to DEFAULT_LIMIT_KBPS, override
+        // from any per-caller cap remembered from a previous session.
+        const defaultBps = DEFAULT_LIMIT_KBPS * 1000 / 8;
+        const override   = callerId ? this._callerLimits.get(callerId) : null;
+        lk._upBucket   = new TokenBucket(override?.upBps   ?? defaultBps);
+        lk._downBucket = new TokenBucket(override?.downBps ?? defaultBps);
         lk.onData = (data) => {
             lk._rxPkts++;
             lk._rxBytes += data.length;
@@ -589,6 +643,9 @@ class TunnelManager {
         // must not reach each other or the gateway via the tunnel.
         if (data.length >= 20 && (data[0] >> 4) === 4 &&
             data[16] === 10 && data[17] === 8 && data[18] === 0) return;
+        // Upload rate limit (client → internet). Drop on empty bucket; TCP-in-
+        // tunnel will retransmit.
+        if (lk._upBucket && !lk._upBucket.take(data.length)) return;
         // SNAT inbound: every client locally configures src=10.8.0.2, so
         // rewrite to its allocated unique IP before handing off to the kernel.
         const snat = this._snatByLk.get(lk);
@@ -654,7 +711,8 @@ class TunnelManager {
                     // the address the client expects (10.8.0.2) before shipping.
                     const dst = `${buf[16]}.${buf[17]}.${buf[18]}.${buf[19]}`;
                     const lk  = this._lkBySnat.get(dst);
-                    if (lk) {
+                    // Download rate limit (internet → client). Drop on empty bucket.
+                    if (lk && (!lk._downBucket || lk._downBucket.take(n))) {
                         rewriteIp(buf, 16, '10.8.0.2');
                         this._tunTxPkts++; this._tunTxBytes += n;
                         lk._txPkts++; lk._txBytes += n;
