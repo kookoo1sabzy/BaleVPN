@@ -91,6 +91,14 @@ Two-step flow on connect:
 
 If `userPeers` is empty but `users` are present in the `GetContacts` response, those inline user entities are used directly.
 
+### Name resolution (`loadUserName` / `lookupContactName`)
+
+Server-mode caller-name lookup uses `Users/LoadUsers` directly with `accessHash=0` — same RPC pattern as `loadSelf()`. The contact list is **not** consulted: a calling peer might not be in the user's contacts (they could be calling for the first time after admission), and the contact-list flow has its own latency / caching gotchas. Per-uid cache holds both hits and misses so a stranger we already queried doesn't re-trigger the RPC.
+
+UserEntity field 3 (`name`) is preferred; falls back to field 9 (`nick`, wrapped string). Returns null only when LoadUsers returns no entity or the RPC fails.
+
+The result is used to label notifications/logs (e.g. `Joe (12345) connected`, `Joe wants to connect`). The Android server caches the resolved name on the `Client` object as `resolvedName` so disconnect notifications can show the same name even if the WS is being torn down at that moment.
+
 ### Wire protocol (custom binary, not gRPC-web)
 Frames are hand-rolled protobuf over WebSocket. Field assignments:
 
@@ -170,8 +178,9 @@ Real-time updates flow via `bale.maviz.v1.MavizStream.SubscribeToUpdates` (empty
 **Server auto-answer flow** (implemented in `TunnelManager.onCallReceived`):
 1. `callReceived` update arrives → `BaleWsClient._processUpdate` calls `tunnel.onCallReceived(callId)`
 2. `BaleWsClient.acceptCall(callId)` sends `bale.meet.v1.Meet/AcceptCall` → decodes response
-3. If `call.isLivekit`, creates `LiveKitTransport`, attaches per-client stat fields (`_callKey`, `_connectedAt`, `_rxPkts/_rxBytes/_txPkts/_txBytes`), wires `onDisconnected` → `lkRooms.delete(callKey)`, connects
+3. If `call.isLivekit`, creates `LiveKitTransport`, attaches per-client stat fields (`_callKey`, `_connectedAt`, `_callerName`, `_rxPkts/_rxBytes/_txPkts/_txBytes`), wires `onDisconnected` → `lkRooms.delete(callKey)`, wires `onPeerJoined` → log "client connected", connects
 4. Each LiveKit data message is decoded with `lkDecode`: recognized SOCKS5 frames go to `_srvMsg()`; unrecognized binary (raw IP packets) goes to `_handleTunPacket()`
+5. **Peer-join watchdog**: `PEER_JOIN_TIMEOUT_MS` (5 s) after `lk.connect()`, if `lk.hasPeer` is still false, the call is torn down and `discardCall` is sent. The LK session token would otherwise keep us connected for hours with no peer. Identity-checked against `lkRooms[callKey]` so a fresh client that replaced this one isn't reaped.
 
 **TUN packet forwarding (server) — multi-client via userspace SNAT**:
 
@@ -185,12 +194,37 @@ The Android server (`BaleServerService`) doesn't need SNAT — its per-client `P
 
 **Server LiveKit teardown**: `TunnelManager.hangUpAll()` disconnects all `lkRooms`, clears the map, sweeps any orphan SNAT leases, and stops the stats timer. Called automatically when the WS closes. `_stopAll()` delegates to `hangUpAll()` internally.
 
-**Client WebRTC flow** (`TunnelManager.startWebRtcTunnel`):
+**Client WebRTC flow** (`TunnelManager.startWebRtcTunnel` — both Node and Android, single-attempt no-retry):
 1. Calls `BaleWsClient.startCall(serverPeerId, serverPeerType)` → `bale.meet.v1.Meet/StartCall`
-2. Connects `LiveKitTransport` with returned credentials; wires `transport.onData` → `onPacket` callback (raw IP packets)
-3. `sendPacket(data)` → `transport.sendUrgent(data)` → LiveKit LOSSY publish
+2. Subscribes to `callEnded` for the current callId — server reject → permanent stop with `rejected = true`
+3. Subscribes to `callAccepted` for the current callId — waits up to `CALL_ACCEPTED_TIMEOUT_MS` (90 s) for the server's push. The 90 s budget covers manual admission (server's user has to tap "allow" in a notification). Timeout → permanent stop with `rejected = false`
+4. Connects `LiveKitTransport` with returned credentials; wires `transport.onData` → `onPacket` callback (raw IP packets)
+5. Waits up to `PEER_TIMEOUT_MS` (5 s) for the server peer to appear in the LK room. Timeout → permanent stop
+6. `sendPacket(data)` → `transport.sendUrgent(data)` → LiveKit LOSSY publish
+
+**No retry policy**: a single attempt, no auto-reconnect. On any failure the tunnel fires `onPermanentDisconnect` and the user retries manually via the dropped-VPN notification. LK transport disconnect mid-session also fires permanent disconnect — the LiveKit data channel and the Bale WS are independent, so losing the data channel means the tunnel is dead.
 
 **`@livekit/rtc-node`** is required unconditionally at startup (`require('@livekit/rtc-node')` at top of `livekit.js`). Install: `cd bale-vpn-node && npm install @livekit/rtc-node`.
+
+### Single-instance lock (Node)
+
+`bale-proxy.js` claims a PID lock file at `${RUNTIME_DIR}/.bale-vpn.lock` **before any other startup** — running TUN setup or HTTP listen first would step on a live instance. On startup:
+1. If lock file exists → read PID → probe with `process.kill(pid, 0)` (`ESRCH` ⇒ dead, `EPERM` ⇒ alive on another user, no-throw ⇒ alive).
+2. Live PID → print error and `exit(1)` with the lock path so the user can manually clear it if needed.
+3. Dead PID → log "stale lock, taking over" and overwrite.
+4. Write our own PID into the lock file.
+
+`process.on('exit')` cleans up the file, but only if it still contains our PID (a successor that took over our stale lock would have written its own).
+
+### Shutdown (Node)
+
+`SIGINT` / `SIGTERM` shutdown chain:
+1. Set `_shuttingDown` (second Ctrl-C → instant force-exit `code 1`).
+2. Arm a 3 s `setTimeout(...).unref()` deadline → force-exit `code 1` if the cleanup hangs (e.g., `@livekit/rtc-node` native worker threads not draining in time).
+3. `client.tunnel._stopAll()` — disconnect LK rooms first so their threads stop pinning the event loop.
+4. `client.disconnect()` — close the WS so no updates land mid-cleanup.
+5. `client.tunnel._teardownTun()` — flush pf anchor (macOS) / delete `bale0` (Linux) / drop route, then close the fd.
+6. `process.exit(0)`.
 
 ### WebRTC binary framing (`lkEncode` / `lkDecode`)
 
@@ -368,10 +402,10 @@ Two paths bypass reconcile because they need WS up *while the rule says down*:
 **Traffic stats**: `BaleVpnService` companion holds `@Volatile` fields `rxPkts/rxBytes` (packets read from TUN → sent to server) and `txPkts/txBytes` (packets received from server → injected into TUN). Reset to zero on each VPN start. `MainActivity` polls these every 500 ms and displays them as `↑ Npkt / X.XKB  ↓ Npkt / X.XKB` below the VPN button when connected. The service also logs stats to Logcat every 5 seconds.
 
 **`TunnelManager`** (Android, `shared/commonMain`): thin forwarder.
-- Constructor takes `getBale: suspend () -> BaleWsClient?` (resolved fresh on every connect attempt — lets `BaleVpnService.resolveWs` lazily bring the WS back up when needed) and `onTunnelReady: () -> Unit` (fired on every successful (re)connect — wired to `BaleConnection.reconcile()` so the WS drops once signaling is done).
-- `startWebRtcTunnel()` → `getBale()` → `bale.startCall` → join LiveKit room → wait for `transport.hasPeer` (15 s deadline) → `onTunnelReady()` → return true.
+- Constructor takes `getBale: suspend () -> BaleWsClient?` (resolved fresh on every connect — lets `BaleVpnService.resolveWs` lazily bring the WS back up when needed) and `onTunnelReady: () -> Unit` (fired once after a successful connect — wired to `BaleConnection.reconcile()` so the WS drops once signaling is done).
+- `connect()` → `getBale()` → `bale.startCall` → wait for `callAccepted` push (`CALL_ACCEPTED_TIMEOUT_MS` = 90 s) → join LiveKit room → wait for `transport.hasPeer` (`PEER_TIMEOUT_MS` = 5 s) → `onTunnelReady()` → return true. Re-entrant guard via `connectMutex.tryLock()`.
 - `sendPacket(data)` → `transport.sendUrgent(data)`.
-- Reconnects with `3 s × attempt` back-off (max 30 s, 5 attempts) on LiveKit disconnect; gives up via `onPermanentDisconnect`.
+- **Single attempt, no retry**. Failure (callAccepted timeout, peer didn't join, server rejected, LK transport drop) → `onPermanentDisconnect(rejected: Boolean)`. `rejected = true` only when `callEnded` arrives for the current callId; everything else is `rejected = false` ("server unreachable").
 
 **`AndroidLiveKitTransport`**: `Channel<ByteArray>(256)` send queue with `LOSSY` reliability. `trySend` drops when full (appropriate for IP forwarding). Both `send` and `sendUrgent` are non-blocking with drop semantics.
 
@@ -386,11 +420,15 @@ Unlike the Node.js server mode (which requires Linux + `setcap cap_net_admin` + 
 
 **Service lifecycle**:
 - `scope` is a `var` and is rebuilt in `onStartCommand` whenever it's not active (a previous `stopServer` cancelled it). Without this, a re-entrant `onStartCommand` would `scope.launch` on a dead scope and silently no-op every coroutine.
-- `loopsStarted` flag prevents re-launching `idleSweepLoop` / `pendingSweepLoop` / `statsLoop` on top of existing ones when `onStartCommand` fires multiple times for the same instance.
+- `loopsStarted` flag prevents re-launching `pendingSweepLoop` / `statsLoop` on top of existing ones when `onStartCommand` fires multiple times for the same instance. (No longer an idle-sweep loop — clients are removed strictly via `transport.onDisconnected` / Bale `callEnded` / explicit UI disconnect. Silent tunnels are fine; only an actually-empty room teardown ends a session.)
 - `stopServer()` only nulls `BaleConnection.onCallReceived` / `onCallEnded` if `instance === this`. Without that guard, a concurrent `onStartCommand` for a successor service would have its lambdas overwritten by the outgoing service. The `MainActivity` calls `startService` unconditionally (doesn't trust the volatile `isRunning` flag, which can stay `true` after an OS-killed service) — Android safely re-fires `onStartCommand` for live services and creates fresh instances for killed ones.
 - `BaleConnection.onCallReceived/onCallEnded` lambdas resolve the live `instance` from the companion at invocation time, so even a stale lambda from a destroyed service routes correctly to whichever instance is current.
 
-**Notifications**: foreground notification while the service runs. Surfaces WS state explicitly: `WebSocket disconnected — no incoming calls` (manually disconnected), `Reconnecting WebSocket… (no incoming calls)` (transient drop), or normal `N connected • M pending`. Pending connection requests also fire a separate notification with the caller's display name (resolved async via `BaleWsClient.loadUserName`); tapping it opens `MainActivity` for the allow/reject decision.
+**Notifications** — split across two channels:
+- **`bale_server`** (LOW importance, silent): the ongoing foreground notification + transient connect/disconnect events. Foreground body shows `N connected • M pending` when there's something to report; in idle state the body is empty (no "Waiting for clients…" noise). WS-state callouts surface explicitly when needed: `WebSocket disconnected — no incoming calls` or `Reconnecting WebSocket…`. Connect/disconnect events use a per-`callerId`-derived id (`CLIENT_EVENT_NOTIF_BASE + callerId % 10_000`) so a "disconnected" alert replaces the older "connected" from the same caller.
+- **`bale_server_alerts`** (HIGH importance, audible heads-up): pending admission requests only. Caller display name is resolved synchronously before the notification posts (via `BaleWsClient.loadUserName` — see "Name resolution"); tap routes to `MainActivity` for the allow/reject decision.
+
+**Client-side VPN-dropped notification** (`BaleVpnService`) — separate `vpn_alerts` channel, HIGH importance. Posted on `onPermanentDisconnect`. Two copy variants: `Bale VPN — disconnected / Could not reach the server. Tap to reconnect.` (timeout / unreachable) and `Bale VPN — rejected / The server rejected the connection.` (callEnded for current callId). Tap routes back to `MainActivity` so the user can press Connect again.
 
 **Per-caller state in `BaleServerService`**:
 - `clients` — map from `callId` to active `Client(callId, callerId, transport, processor)`.
@@ -399,17 +437,16 @@ Unlike the Node.js server mode (which requires Linux + `setcap cap_net_admin` + 
 
 **WS event reactions** (`checkAndHandleCall`):
 - **callerId == 0 → defer**. Bale fans out two updates per incoming call: `callReceived` (52810, sometimes with empty participants list → callerId=0) and `callStarted` (52807, carries adminUid). Order isn't guaranteed; the callerId=0 variant is dropped silently and the followup carries the real id. Prevents a transient "unknown caller" pending entry.
-- **Allowed caller, throttle**: if the same callerId has an *existing* client whose LK transport hasn't seen its peer yet AND it's less than `ESTABLISH_GRACE_MS` (8 s) old, drop the new call. Reconnect-storm guard — a misbehaving client retrying every ~2 s would otherwise replace its previous call before any LK room could finish setting up, exhausting AudioFlinger and never establishing a tunnel.
-- **Allowed caller, otherwise**: clear any stray pending entry for this callId, then `handleCall` (`acceptCall` + create transport/processor + dedup against any existing client from the same callerId via `cleanupClientLocal` — local cleanup, no `discardCall` RPC; Bale's discardCall scopes at caller↔callee session level and would end the *new* call too).
+- **Allowed caller**: clear any stray pending entry for this callId, then `handleCall` (`acceptCall` + create transport/processor + dedup against any existing client from the same callerId via `cleanupClientLocal` — local cleanup, no `discardCall` RPC; Bale's discardCall scopes at caller↔callee session level and would end the *new* call too). New call from the same caller always wins — no throttle (the previous `ESTABLISH_GRACE_MS` 8 s guard was removed when the client switched to single-attempt + 5 s peer wait, eliminating the reconnect-storm risk).
 - **Not-allowed caller**: dedup pending by callerId, queue a `PendingCall`, post the allow/reject notification.
-- `onCallEnded` (`onCallEndedRemote`): if the `callId` matches an active `Client` → `doDisconnect`; if it matches a pending entry → drop it and clear the notification. Without this hook, peers that hung up would linger until the 5-min idle sweep or a LiveKit-side event finally fired.
-- `pendingSweepLoop` (every 15 s): auto-rejects pending calls older than `PENDING_TIMEOUT_MS` (60 s).
+- `onCallEnded` (`onCallEndedRemote`): if the `callId` matches an active `Client` → `doDisconnect`; if it matches a pending entry → drop it and clear the notification. Without this hook, peers that hung up would linger until a LiveKit-side event finally fired.
+- `pendingSweepLoop` (every `PENDING_CHECK_MS` = 15 s): auto-rejects pending calls older than `PENDING_TIMEOUT_MS` (60 s).
 
 **`callerId` source**: parsed from `CallEntity` field 8 (`adminUid` — the call initiator). Field 9 (`peer`) is the *other party in the call ref*, which from the callee's perspective decodes to **self** — using it would make the server display its own user-id and name for every incoming call.
 
 **Companion API (called from UI)**:
 - `disconnectClient(callId)` — sends `discardCall` to peer (so the peer's VPN sees the disconnect cleanly), tears down the local processor.
-- `disconnectAllClients()` — **suspending**. For every active client and pending request, in parallel: send `discardCall` and close the LiveKit room. Caller awaits completion before tearing down the WS, so peers receive `WS callEnded` and stop immediately instead of spending 15 s × 5 reconnect attempts. Wired into `MainActivity.btnWs` Disconnect path — manual press disconnects all clients; **a natural WS drop does NOT** — the runLoop's 5 s reconnect handles transient drops and per-client LiveKit data channels are independent of the Bale WS.
+- `disconnectAllClients()` — **suspending**. For every active client and pending request, in parallel: send `discardCall` and close the LiveKit room. Caller awaits completion before tearing down the WS, so peers receive `WS callEnded` and stop immediately instead of waiting out the 90 s `callAccepted` timeout. Wired into `MainActivity.btnWs` Disconnect path — manual press disconnects all clients; **a natural WS drop does NOT** — the runLoop's 5 s reconnect handles transient drops and per-client LiveKit data channels are independent of the Bale WS.
 - `setClientLimit(callId, upBps, downBps)` — adjusts a live processor's token buckets and persists the per-caller override.
 - `acceptPending(callId, addToList)` / `rejectPending(callId)` — admission decisions surfaced from notifications or `MainActivity`.
 - `debug` — propagates verbose-log toggle to every running processor and persists to prefs.
@@ -450,8 +487,8 @@ Each `PacketProcessor` runs two `TokenBucket`s — one per direction — with a 
 - **`isThrottled`** flag: true if either bucket dropped a packet in the last 2 s; surfaced via `ClientInfo` for the UI to highlight.
 
 Defaults / ceilings:
-- `BaleServerService.DEFAULT_LIMIT_BPS = 37_500` bytes/sec ≈ **300 kbps** — applied to every newly accepted client. Stored as bytes/sec because the token bucket charges packet sizes in bytes; surfaced to the user in kbps.
-- `ServerClientsActivity.MAX_LIMIT_KBPS = 500` kbps — UI ceiling (input clamped `[1, 500]`; no "unlimited" option).
+- **Android**: `BaleServerService.DEFAULT_LIMIT_BPS = 37_500` bytes/sec ≈ **300 kbps** per client. `ServerClientsActivity.MAX_LIMIT_KBPS = 500` kbps UI ceiling. Stored as bytes/sec because the token bucket charges packet sizes in bytes; surfaced to the user in kbps.
+- **Node**: `DEFAULT_LIMIT_KBPS = 500`, `MAX_LIMIT_KBPS = 1000` (`constants.js`). Higher defaults reflect the typical Linux-server-with-bandwidth use case. Every client is rate-limited; there is no "unlimited" option.
 - Conversion in the UI: `kbpsToBytesPerSec(k) = k * 1_000 / 8`, `bytesPerSecToKbps(b) = b * 8 / 1_000`.
 
 Per-caller overrides live in `BaleServerService.callerLimits` (in-memory) and are re-applied automatically when the same caller reconnects within the same service lifetime.
