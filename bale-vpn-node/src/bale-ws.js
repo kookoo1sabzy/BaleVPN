@@ -60,6 +60,9 @@ class BaleWsClient {
         this.pingTimer     = null;
         this.pingCounter   = 0;
         this.ready         = false;
+        // Set when Bale closes the WS with code 4401 (their custom "Unauthenticated"
+        // close code) — the token is dead. Cleared by connect() on next login.
+        this.sessionExpired = false;
         this.subscribeIdx  = null;
         this.pending       = new Map();
         this.messages      = [];
@@ -109,6 +112,8 @@ class BaleWsClient {
     connect(token) {
         if (token) this.accessToken = token;
         if (!this.accessToken) throw new Error('No access token set');
+        // Clear the expired-session flag — a fresh login starts a new session.
+        this.sessionExpired = false;
         this.autoReconnect = true;
         this.connecting    = true;
         console.log(`[WS] Connecting to ${WS_URL}`);
@@ -140,7 +145,13 @@ class BaleWsClient {
             // client-mode tunnel are independent of the Bale WS once established.
             if (code === 4401) {
                 console.error('[WS] 4401 Unauthenticated — token expired');
-                this.autoReconnect = false;
+                this.autoReconnect  = false;
+                // Clearing accessToken makes connection.reconcile()'s empty-token
+                // guard short-circuit, preventing immediate redial. The setter
+                // also unlinks .bale-token so a process restart doesn't reuse
+                // the dead credential.
+                this.accessToken    = '';
+                this.sessionExpired = true;
             } else if (this.autoReconnect) {
                 console.log(`[WS] Closed ${code} — reconnecting in 3 s`);
                 this._reconnectTimer = setTimeout(() => {

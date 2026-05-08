@@ -49,6 +49,9 @@ object BaleConnection {
     @Volatile var userInitiatedDisconnect: Boolean = false
     /** Driven by ProcessLifecycleOwner (BaleApp). Read by reconcile(). */
     @Volatile var isForeground: Boolean = false
+    /** Set when Bale signals our token is dead (4401 close or 401/403 upgrade).
+     *  MainActivity polls this in tick() and routes the user to relogin. */
+    @Volatile var sessionExpired: Boolean = false
 
     private var callEndedRemover: (() -> Unit)? = null
 
@@ -73,6 +76,7 @@ object BaleConnection {
 
     fun connect(token: String) {
         if (client != null) { Log.d(TAG, "BaleConnection.connect: already connected, skipping"); return }
+        if (token.isBlank())  { Log.w(TAG, "BaleConnection.connect: empty token, skipping"); return }
         Log.d(TAG, "BaleConnection.connect: creating WS client")
         http   = HttpClient(OkHttp) { install(WebSockets) }
         val ws = BaleWsClient(
@@ -84,7 +88,21 @@ object BaleConnection {
                 if (cb == null) Log.w(TAG, "BaleConnection: callReceived $callId but no subscriber registered")
                 cb?.invoke(callId, call)
             },
-        ).also { it.connect() }
+        )
+        // Token-expired path: wipe the saved token, drop the WS, raise the
+        // sessionExpired flag for MainActivity.tick() to act on. Clearing the
+        // token also makes reconcile() short-circuit (its empty-token guard
+        // prevents an immediate re-dial with the same dead credential).
+        ws.onTokenExpired = {
+            Log.w(TAG, "BaleConnection: session expired — clearing token")
+            appContext.getSharedPreferences("config", Context.MODE_PRIVATE)
+                .edit().remove("token").apply()
+            sessionExpired   = true
+            callEndedRemover?.invoke(); callEndedRemover = null
+            client = null
+            http?.close(); http = null
+        }
+        ws.connect()
         callEndedRemover = ws.addOnCallEnded { id -> BaleConnection.onCallEnded?.invoke(id) }
         client = ws
     }

@@ -4,6 +4,7 @@ import ai.bale.proxy.proto.ProtoReader
 import ai.bale.proxy.proto.ProtoWriter
 import io.ktor.client.*
 import io.ktor.client.call.*
+import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.websocket.*
 import io.ktor.client.request.*
 import io.ktor.http.*
@@ -39,6 +40,12 @@ class BaleWsClient(
     // unsubscribe happen at service lifecycle boundaries so the rare add/remove race is fine.
     @kotlin.concurrent.Volatile
     private var callEndedListeners: List<(Long) -> Unit> = emptyList()
+
+    /** Fired once when Bale closes the WS with code 4401 (or rejects the upgrade
+     *  with HTTP 401/403) — the token is dead and reconnecting won't help.
+     *  Caller should clear the saved token and route the user to relogin. */
+    @kotlin.concurrent.Volatile
+    var onTokenExpired: (() -> Unit)? = null
 
     fun addOnCallEnded(cb: (Long) -> Unit): () -> Unit {
         callEndedListeners = callEndedListeners + cb
@@ -78,6 +85,12 @@ class BaleWsClient(
     private suspend fun runLoop() {
         log("[BaleProxy] WS runLoop started")
         while (scope.isActive) {
+            // Set inside the WS body or the catch block when we detect a permanent
+            // auth failure (Bale's 4401 close code, or a 401/403 on upgrade). When
+            // true, we fire onTokenExpired and break out of the retry loop instead
+            // of falling through to the 5 s delay — reconnecting with a dead token
+            // would just spin forever.
+            var tokenExpired = false
             try {
                 log("[BaleProxy] WS connecting to $WS_HOST...")
                 httpClient.webSocket(
@@ -101,12 +114,32 @@ class BaleWsClient(
                         if (frame is Frame.Binary) handleFrame(frame.data)
                     }
                     sender.cancel()
+                    // Channel exited because the server closed it. Inspect the close
+                    // reason so we can distinguish "expired token" from a network drop.
+                    val cr = closeReason.await()
+                    if (cr?.code == 4401.toShort()) {
+                        log("[BaleProxy] WS close 4401 — token expired")
+                        tokenExpired = true
+                    } else {
+                        log("[BaleProxy] WS session closed (code=${cr?.code} reason=${cr?.message})")
+                    }
                 }
-                log("[BaleProxy] WS session closed normally")
+            } catch (e: ResponseException) {
+                val status = e.response.status.value
+                if (status == 401 || status == 403) {
+                    log("[BaleProxy] WS upgrade rejected $status — token expired")
+                    tokenExpired = true
+                } else {
+                    log("[BaleProxy] WS upgrade failed: $status")
+                }
             } catch (e: Exception) {
                 log("[BaleProxy] WS exception: ${e::class.simpleName}: ${e.message}")
             }
             ready = false
+            if (tokenExpired) {
+                onTokenExpired?.invoke()
+                break
+            }
             if (scope.isActive) { log("[BaleProxy] WS reconnecting in 5s..."); delay(5_000) }
         }
         log("[BaleProxy] WS runLoop exiting")

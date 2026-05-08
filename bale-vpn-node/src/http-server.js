@@ -134,6 +134,7 @@ function create(client, connection) {
             return res.end(JSON.stringify({
                 mode:            TUNNEL_MODE,
                 tokenSet:        !!client.accessToken,   // never leak the JWT itself
+                sessionExpired:  !!client.sessionExpired,
                 self:            client.self,
                 wsReady:         client.ready,
                 wsConnecting:    client.connecting,

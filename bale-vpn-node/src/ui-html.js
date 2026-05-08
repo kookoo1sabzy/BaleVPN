@@ -486,6 +486,18 @@ function applyState() {
   // Mode (set once at boot; setTunnelMode is idempotent so re-calls are fine).
   if (s.mode && s.mode !== _tunnelMode) setTunnelMode(s.mode);
 
+  // Bale closed our WS with code 4401 — token was rejected. Show a clear
+  // banner so the user knows why they're back at the login screen. Token
+  // already cleared server-side, so tokenSet=false and the section visibility
+  // logic below flips us into the login form automatically. Show only once
+  // per occurrence — _shownExpiredBanner avoids re-toasting on every poll.
+  if (s.sessionExpired && !window._shownExpiredBanner) {
+    window._shownExpiredBanner = true;
+    showAuthStatus('Session expired — please log in again.', 'err');
+  } else if (!s.sessionExpired) {
+    window._shownExpiredBanner = false;
+  }
+
   // Section visibility — login vs VPN menu, driven by token presence alone.
   const tok = hasToken();
   document.getElementById('loginSection').style.display  = tok ? 'none' : '';
