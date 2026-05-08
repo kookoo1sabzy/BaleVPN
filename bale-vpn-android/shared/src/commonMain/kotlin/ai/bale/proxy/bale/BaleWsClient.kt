@@ -43,6 +43,13 @@ class BaleWsClient(
     @kotlin.concurrent.Volatile
     private var callEndedListeners: List<(Long) -> Unit> = emptyList()
 
+    /** Multi-subscriber listener for callAccepted — Bale's notification to the
+     *  caller that the callee ran AcceptCall and is on its way to the LK room.
+     *  Used by TunnelManager to gate "join LK room" on the actual server
+     *  acceptance instead of joining an empty room speculatively. */
+    @kotlin.concurrent.Volatile
+    private var callAcceptedListeners: List<(Long) -> Unit> = emptyList()
+
     /** Fired once when Bale closes the WS with code 4401 (or rejects the upgrade
      *  with HTTP 401/403) — the token is dead and reconnecting won't help.
      *  Caller should clear the saved token and route the user to relogin. */
@@ -62,6 +69,15 @@ class BaleWsClient(
 
     private fun fireCallEnded(callId: Long) {
         callEndedListeners.forEach { runCatching { it(callId) } }
+    }
+
+    fun addOnCallAccepted(cb: (Long) -> Unit): () -> Unit {
+        callAcceptedListeners = callAcceptedListeners + cb
+        return { callAcceptedListeners = callAcceptedListeners - cb }
+    }
+
+    private fun fireCallAccepted(callId: Long) {
+        callAcceptedListeners.forEach { runCatching { it(callId) } }
     }
 
     var ready = false
@@ -227,25 +243,25 @@ class BaleWsClient(
         log("[BaleProxy] WS runLoop exiting")
     }
 
-    /** Friendly name for the top-level inbound WS frame field tag. */
+    /** Friendly name for the top-level inbound WS frame field tag. Pong (4) is
+     *  not listed because handleFrame suppresses its log line. */
     private fun frameKindName(f: Int): String = when (f) {
         1 -> "RPC response / push"
         2 -> "Push update"
         3 -> "Terminate session"
-        4 -> "Pong"
         5 -> "Handshake response"
         else -> "field=$f (unknown)"
     }
 
-    /** Friendly name for inner xC update field tags. The numbers come from the
-     *  reverse-engineered Bale protobuf — see CLAUDE.md for the table. */
+    /** Friendly name for xC update tags handled via the `else` branch of
+     *  parseXC. The call* tags (52807–52810) have their own cases and are
+     *  intentionally absent here. See CLAUDE.md for the full table. */
     private fun xcUpdateName(f: Int): String = when (f) {
-        55     -> "newMessage"
-        52807  -> "callStarted"
-        52808  -> "callAccepted"
-        52809  -> "callEnded"
-        52810  -> "callReceived"
-        else   -> "field=$f"
+        19   -> "messageRead"        // someone read a message in one of our chats
+        50   -> "messageReadByMe"    // we read a message (sync to our other clients)
+        55   -> "newMessage"
+        85   -> "emptyUpdate"        // Bale's stream heartbeat / sync marker
+        else -> "field=$f"
     }
 
     private suspend fun handleFrame(buf: ByteArray) {
@@ -333,20 +349,26 @@ class BaleWsClient(
         }
     }
 
-    // SubscribeResponse bytes:
-    //   field 1 = xC union (the actual event)
-    //   field 3 = server-assigned sequence number (varint)
-    //   field 4 = update timestamp, ms since epoch (varint)
-    // Decode 3/4 to actual values rather than just dropping them, so the log
-    // gives context for the surrounding xC event.
+    // SubscribeResponse schema (verified against Bale's web bundle):
+    //   1 = update (xC union — call/message events)
+    //   2 = routeId      (int32, internal routing — silent)
+    //   3 = sequence     (int32, monotonic per-stream — log as "seq")
+    //   4 = timestamp    (int64 ms since epoch)
+    //   5 = weakEvent    (sub-message)
+    //   6 = mtupdate     (sub-message)
+    //   7 = updates      (sub-message)
     private suspend fun handleUpdate(buf: ByteArray) {
         val r = ProtoReader(buf)
         while (r.hasMore()) {
             val (f, w) = r.tag()
             when (f) {
                 1    -> parseXC(r.bytes())
+                2    -> r.skip(w)                                              // routeId — silent
                 3    -> log("[BaleProxy] WS update seq=${r.varint()}")
                 4    -> log("[BaleProxy] WS update timestamp=${r.varint()}")
+                5    -> { r.bytes(); log("[BaleProxy] WS update weakEvent") }
+                6    -> { r.bytes(); log("[BaleProxy] WS update mtupdate") }
+                7    -> { r.bytes(); log("[BaleProxy] WS update updates batch") }
                 else -> {
                     log("[BaleProxy] WS SubscribeResponse: unknown field=$f wire=$w")
                     r.skip(w)
@@ -367,6 +389,17 @@ class BaleWsClient(
                         log("[BaleProxy] WS callStarted callId=${it.callId} isLivekit=${it.isLivekit} callerId=${it.callerId}")
                         onCallReceived(it.callId, it)
                     }
+                }
+                52808 -> {
+                    // Caller-side notification that the callee ran AcceptCall.
+                    // Fired to subscribers (TunnelManager) so they can gate
+                    // joining the LK room on this signal rather than joining
+                    // an empty room and waiting hopefully.
+                    val raw = r.bytes()
+                    parseCallResponse(raw)?.let {
+                        log("[BaleProxy] WS callAccepted callId=${it.callId} isLivekit=${it.isLivekit} callerId=${it.callerId}")
+                        fireCallAccepted(it.callId)
+                    } ?: log("[BaleProxy] WS callAccepted (couldn't parse body)")
                 }
                 52809 -> {
                     val raw = r.bytes()
@@ -554,28 +587,58 @@ class BaleWsClient(
         }
     }
 
-    // Cache of uid → displayName backed by Users/GetContacts. Populated lazily on
-    // first lookup; reset when the WS reconnects (a new BaleWsClient is constructed).
-    @kotlin.concurrent.Volatile
-    private var contactNamesByUid: Map<Int, String>? = null
-    private val contactRepo: ContactRepository by lazy { ContactRepository(httpClient, accessToken) }
+    // Per-uid name cache, populated lazily by loadUserName. Reset when the WS
+    // reconnects (a new BaleWsClient is constructed).
+    private val userNameCache = mutableMapOf<Int, String?>()
+    private val userNameCacheMutex = Mutex()
 
     /** Returns the display name for a Bale user ID, or null if unknown.
      *
-     *  Sourced from the user's contact list — Bale's privacy gating means peers who
-     *  can call us are necessarily contacts, so this is reliable for our use case
-     *  (server-mode caller-name resolution). The previous implementation used
-     *  Users/LoadUsers with `uid` only and no accessHash, which Bale's server
-     *  responded to inconsistently — sometimes returning the requesting user (self)
-     *  instead of the queried target. */
+     *  Uses Users/LoadUsers with accessHash=0 — same RPC and parsing as
+     *  loadSelf(). The caller might not be in our contacts list (server-mode
+     *  use case), so we don't depend on GetContacts. UserEntity field 3 is the
+     *  full name, field 9 is the @-handle nick (wrapped string); we prefer
+     *  name and fall back to nick. */
     suspend fun loadUserName(userId: Int): String? {
         if (userId <= 0) return null
-        contactNamesByUid?.get(userId)?.let { return it }
-        val map = try {
-            contactRepo.getContacts().associate { it.id to it.displayName }
-        } catch (_: Exception) { emptyMap() }
-        contactNamesByUid = map
-        return map[userId]
+        userNameCacheMutex.withLock { if (userNameCache.containsKey(userId)) return userNameCache[userId] }
+
+        val peer    = ProtoWriter().int32(1, userId).int64(2, 0L).build()
+        val payload = ProtoWriter().bytes(1, peer).build()
+        val name = try {
+            val resp = rpcCall("bale.users.v1.Users", "LoadUsers", payload)
+            val r = ProtoReader(resp)
+            var entity: ByteArray? = null
+            while (r.hasMore()) {
+                val (f, w) = r.tag()
+                if (f == 1) { entity = r.bytes(); break } else r.skip(w)
+            }
+            if (entity == null) null else {
+                val ur = ProtoReader(entity)
+                var en = ""; var enick = ""
+                while (ur.hasMore()) {
+                    val (f, w) = ur.tag()
+                    when (f) {
+                        3 -> en = ur.string()
+                        9 -> {
+                            val nb = ur.bytes()
+                            val nr = ProtoReader(nb)
+                            while (nr.hasMore()) {
+                                val (nf, nw) = nr.tag()
+                                if (nf == 1) enick = nr.string() else nr.skip(nw)
+                            }
+                        }
+                        else -> ur.skip(w)
+                    }
+                }
+                en.takeIf { it.isNotBlank() } ?: enick.takeIf { it.isNotBlank() }
+            }
+        } catch (e: Exception) {
+            log("[BaleProxy] loadUserName($userId): RPC failed: ${e::class.simpleName}: ${e.message}")
+            null
+        }
+        userNameCacheMutex.withLock { userNameCache[userId] = name }
+        return name
     }
 
     /** Logged-in account info — populated by loadSelf() once the WS is up. */

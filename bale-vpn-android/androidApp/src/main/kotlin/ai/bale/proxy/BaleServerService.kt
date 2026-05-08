@@ -14,16 +14,14 @@ import kotlinx.coroutines.*
 import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG                = "BaleProxy"
-private const val IDLE_TIMEOUT_MS    = 5 * 60 * 1000L
-private const val IDLE_CHECK_MS      = 60 * 1000L
-// Auto-reject pending calls older than this. The caller has likely given up by now and
-// may already have hung up on their side; we don't want a stale notification to linger.
+// Auto-reject a pending caller after this — caller has likely given up and the notification is stale.
 private const val PENDING_TIMEOUT_MS = 60 * 1000L
-// How long a freshly-accepted client gets to complete LiveKit peer-join before we'll
-// consider replacing it with a new call from the same caller. Prevents reconnect-storm
-// thrashing where a misbehaving client keeps starting new calls before its previous
-// LiveKit room can finish setting up.
-private const val ESTABLISH_GRACE_MS = 8 * 1000L
+// How often the pending sweep loop runs.
+private const val PENDING_CHECK_MS   = 15_000L
+// Max wait for the caller to actually join our LK room after we acceptCall — covers Bale push + caller LK handshake + SDK propagation.
+private const val PEER_JOIN_TIMEOUT_MS = 5_000L
+// How often the UI snapshot loop refreshes per-client stats.
+private const val STATS_REFRESH_MS   = 500L
 
 class BaleServerService : Service() {
 
@@ -31,7 +29,6 @@ class BaleServerService : Service() {
         val callId:       Long,
         val callerId:     Long,
         val connectedAt:  Long,
-        val lastActivity: Long,
         val rxPkts: Long, val rxBytes: Long,
         val txPkts: Long, val txBytes: Long,
         val limitUpBps:   Long    = 0,
@@ -64,7 +61,10 @@ class BaleServerService : Service() {
         val transport:   DataTransport,
         val processor:   PacketProcessor,
         val connectedAt: Long = System.currentTimeMillis(),
-        @Volatile var lastActivity: Long = System.currentTimeMillis(),
+        // Display name resolved at connect time; reused on disconnect so the
+        // notification reads the same name even if the WS is being torn down
+        // by the time disconnect fires.
+        @Volatile var resolvedName: String? = null,
     )
 
     private val clients     = ConcurrentHashMap<Long, Client>()
@@ -75,7 +75,18 @@ class BaleServerService : Service() {
         const val ACTION_STOP = "ai.bale.proxy.SERVER_STOP"
         private const val NOTIF_ID         = 2
         private const val PENDING_NOTIF_ID = 3
+        // LOW-importance channel for the silent informational notifications:
+        // foreground service status + per-client connect/disconnect events.
         private const val CHANNEL          = "bale_server"
+        // HIGH-importance channel — only the pending-admission notification
+        // posts here, since it requires the user to allow/reject before the
+        // call can proceed. Heads-up + sound is appropriate.
+        private const val ALERT_CHANNEL    = "bale_server_alerts"
+        // Per-callerId connect/disconnect events sit on a separate id range so they
+        // don't collide with the foreground / pending notifications. Each caller
+        // gets a stable id derived from their callerId, so a "disconnected" alert
+        // replaces an older "connected" alert from the same caller.
+        private const val CLIENT_EVENT_NOTIF_BASE = 1_000
         // Default per-client cap. Stored as bytes/sec (the token-bucket charges packet sizes
         // in bytes), but expressed to the user in kilobits/sec. 37_500 B/s = 300 kbps.
         // Every client is rate-limited; there is no "unlimited".
@@ -193,7 +204,6 @@ class BaleServerService : Service() {
 
         if (!loopsStarted) {
             loopsStarted = true
-            scope.launch { idleSweepLoop() }
             scope.launch { pendingSweepLoop() }
             scope.launch { statsLoop() }
         }
@@ -220,23 +230,10 @@ class BaleServerService : Service() {
         }
 
         if (AdmissionStore.isAllowed(callerId)) {
-            // Throttle reconnect storms: if the same caller already has an active
-            // client whose LiveKit room hasn't yet completed peer-join, ignore this
-            // new call instead of accepting and immediately replacing it. Replacing
-            // before the previous LK can establish creates an endless cycle where the
-            // peer never gets a chance to actually join any of the rooms we accepted.
-            val existing = clients.values.firstOrNull { it.callerId == callerId }
-            if (existing != null && !existing.transport.hasPeer) {
-                val ageMs = System.currentTimeMillis() - existing.connectedAt
-                if (ageMs < ESTABLISH_GRACE_MS) {
-                    Log.d(TAG, "Server: dropping call $callId — existing client ${existing.callId} from callerId=$callerId still establishing (age=${ageMs}ms, no peer yet). Letting it finish first.")
-                    return
-                }
-            }
-            // If a previous variant of the same call somehow created a pending entry
-            // (e.g., admission-list state changed mid-flight), clear it before handing
-            // off to handleCall so the UI doesn't show a leftover "pending" row for an
-            // already-accepted client.
+            // New call from the same caller always wins — handleCall replaces any
+            // existing client locally. Clear any leftover pending entry first so
+            // the UI doesn't show a stale "pending" row for an already-accepted
+            // client (can happen if admission state changed mid-flight).
             if (pendingMap.remove(callId) != null) {
                 pendingSnapshot = pendingMap.values.toList()
                 cancelPendingNotificationIfEmpty()
@@ -251,20 +248,20 @@ class BaleServerService : Service() {
                 pendingMap.remove(dup.callId)
                 BaleConnection.client?.discardCall(dup.callId)
             }
-            val pending = PendingCall(callId, callerId, call)
+            // Resolve the caller name synchronously before posting so the
+            // notification reads "Joe wants to connect" on first appearance.
+            // Cached after first hit; only the first new caller per service
+            // lifetime pays the contact-list HTTP fetch.
+            val resolvedName = if (callerId != 0L) {
+                try { BaleConnection.client?.loadUserName(callerId.toInt()) } catch (_: Exception) { null }
+            } else null
+            Log.d(TAG, "Server: pending callerId=$callerId resolved='${resolvedName ?: "<null>"}'")
+            val pending = PendingCall(callId, callerId, call, callerName = resolvedName)
             pendingMap[callId] = pending
             pendingSnapshot = pendingMap.values.toList()
             updateNotification()
-            showPendingNotification(callerId, callerName = null)
-            scope.launch { fetchAndApplyName(callId, callerId) }
+            showPendingNotification(callerId, callerName = resolvedName)
         }
-    }
-
-    private suspend fun fetchAndApplyName(callId: Long, callerId: Long) {
-        val name = BaleConnection.client?.loadUserName(callerId.toInt()) ?: return
-        pendingMap.computeIfPresent(callId) { _, v -> v.copy(callerName = name) }
-        pendingSnapshot = pendingMap.values.toList()
-        showPendingNotification(callerId, callerName = name)
     }
 
     private suspend fun doAcceptPending(callId: Long, addToList: Boolean) {
@@ -310,10 +307,7 @@ class BaleServerService : Service() {
         }
         val transport = AndroidLiveKitTransport(applicationContext)
         val processor = PacketProcessor(
-            onSend = { pkt ->
-                clients[callId]?.also { it.lastActivity = System.currentTimeMillis() }
-                transport.send(lkEncode(TFrame.Ip(pkt)))
-            },
+            onSend = { pkt -> transport.send(lkEncode(TFrame.Ip(pkt))) },
             log = { msg -> Log.d(TAG, msg) },
         )
         processor.debug = debug
@@ -326,39 +320,50 @@ class BaleServerService : Service() {
             if (down > 0L) processor.limitDownBps = down
         }
 
-        val client = Client(callId, callerId, transport, processor)
+        // Resolve the caller's display name now (sync) so we have it for both
+        // the connect event AND the future disconnect event. loadUserName is
+        // cached after first hit, so this is effectively free on subsequent
+        // calls; the first call pays a single contact-list HTTP fetch.
+        val callerName: String? = if (callerId != 0L) {
+            try { ws.loadUserName(callerId.toInt()) } catch (_: Exception) { null }
+        } else null
+
+        val client = Client(callId, callerId, transport, processor, resolvedName = callerName)
 
         transport.onData = { data ->
-            client.lastActivity = System.currentTimeMillis()
             (lkDecode(data) as? TFrame.Ip)?.let { client.processor.process(it.data) }
         }
         transport.onDisconnected = {
             Log.d(TAG, "Server: client $callId disconnected")
-            clients.remove(callId)?.also { it.processor.close() }
+            val removed = clients.remove(callId)?.also { it.processor.close() }
             clientCount = clients.size
             rebuildSnapshot()
             updateNotification()
+            postClientEvent(callerId, "disconnected", removed?.resolvedName ?: callerName)
         }
 
         clients[callId] = client
         clientCount = clients.size
         rebuildSnapshot()
         updateNotification()
+        postClientEvent(callerId, "connected", callerName)
 
         Log.d(TAG, "Server: joining LK room for call $callId")
         transport.connect(accepted.url, accepted.token)
-    }
 
-    private suspend fun idleSweepLoop() {
-        while (true) {
-            delay(IDLE_CHECK_MS)
-            val now = System.currentTimeMillis()
-            clients.values
-                .filter { now - it.lastActivity > IDLE_TIMEOUT_MS }
-                .forEach { c ->
-                    Log.d(TAG, "Server: idle timeout for call ${c.callId}")
-                    doDisconnect(c.callId)
-                }
+        // Watchdog: the LK session token can keep us connected for hours even
+        // with nobody on the other side, so if the caller never actually joins
+        // (e.g., their VPN was cancelled before the room handshake completed)
+        // we tear the call down ourselves to free resources. The identity
+        // check on `transport` ensures we don't kill a fresh client that
+        // replaced this one in the meantime.
+        scope.launch {
+            delay(PEER_JOIN_TIMEOUT_MS)
+            val current = clients[callId]
+            if (current?.transport === transport && !transport.hasPeer) {
+                Log.d(TAG, "Server: peer never joined call $callId — disconnecting")
+                doDisconnect(callId)
+            }
         }
     }
 
@@ -366,7 +371,7 @@ class BaleServerService : Service() {
     // hung up by now and the notification is just clutter.
     private suspend fun pendingSweepLoop() {
         while (true) {
-            delay(15_000L)
+            delay(PENDING_CHECK_MS)
             val now    = System.currentTimeMillis()
             val expired = pendingMap.values.filter { now - it.receivedAt > PENDING_TIMEOUT_MS }
             for (p in expired) {
@@ -395,7 +400,7 @@ class BaleServerService : Service() {
 
     private suspend fun statsLoop() {
         while (true) {
-            delay(500)
+            delay(STATS_REFRESH_MS)
             if (clients.isNotEmpty()) rebuildSnapshot()
         }
     }
@@ -406,7 +411,6 @@ class BaleServerService : Service() {
                 callId       = c.callId,
                 callerId     = c.callerId,
                 connectedAt  = c.connectedAt,
-                lastActivity = c.lastActivity,
                 rxPkts       = c.processor.rxPkts,
                 rxBytes      = c.processor.rxBytes,
                 txPkts       = c.processor.txPkts,
@@ -427,6 +431,7 @@ class BaleServerService : Service() {
             clientCount = clients.size
             rebuildSnapshot()
             updateNotification()
+            postClientEvent(it.callerId, "disconnected", it.resolvedName)
         }
     }
 
@@ -491,30 +496,34 @@ class BaleServerService : Service() {
                 ch.setShowBadge(false)
                 mgr.createNotificationChannel(ch)
             }
+            if (mgr.getNotificationChannel(ALERT_CHANNEL) == null) {
+                val ch = NotificationChannel(ALERT_CHANNEL, "Connection Requests", NotificationManager.IMPORTANCE_HIGH)
+                mgr.createNotificationChannel(ch)
+            }
         }
     }
 
     private fun buildNotification(): Notification {
         ensureChannel()
-        // The WS is the only way incoming-call updates reach the server. If it's down
-        // the service can't accept anyone, so surface that prominently — otherwise the
-        // notification reads "Waiting for clients…" while we're actually deaf.
+        // The WS is the only way incoming-call updates reach the server. If it's
+        // down, surface that — otherwise the body just shows the live state when
+        // there's something interesting to report (clients connected or pending).
         val wsAttached = BaleConnection.client != null
         val wsReady    = BaleConnection.isReady
         val text = when {
-            !wsAttached                   -> "WebSocket disconnected — no incoming calls"
-            !wsReady                      -> "Reconnecting WebSocket… (no incoming calls)"
-            clientCount == 0 && pendingMap.isEmpty() -> "Waiting for clients…"
-            else -> buildList {
-                if (clientCount > 0)        add("$clientCount connected")
+            !wsAttached -> "WebSocket disconnected — no incoming calls"
+            !wsReady    -> "Reconnecting WebSocket… (no incoming calls)"
+            clientCount > 0 || pendingMap.isNotEmpty() -> buildList {
+                if (clientCount > 0)         add("$clientCount connected")
                 if (pendingMap.isNotEmpty()) add("${pendingMap.size} pending")
             }.joinToString(" • ")
+            else -> ""  // idle — no body text, just the title
         }
         val b = Notification.Builder(this, CHANNEL)
             .setContentTitle("Bale VPN — Server")
-            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
+        if (text.isNotEmpty()) b.setContentText(text)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
             b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
         return b.build()
@@ -536,7 +545,7 @@ class BaleServerService : Service() {
         }
         val pi = PendingIntent.getActivity(this, PENDING_NOTIF_ID, intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val n = Notification.Builder(this, CHANNEL)
+        val n = Notification.Builder(this, ALERT_CHANNEL)
             .setContentTitle("Bale VPN — Connection Request")
             .setContentText("$callerLabel wants to connect")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
@@ -552,5 +561,35 @@ class BaleServerService : Service() {
 
     private fun cancelPendingNotification() {
         getSystemService(NotificationManager::class.java).cancel(PENDING_NOTIF_ID)
+    }
+
+    // Transient connect/disconnect alert. Caller passes the pre-resolved name
+    // when available (handleCall does the lookup once at connect time, then
+    // disconnect callbacks use the cached value on Client.resolvedName). Falls
+    // back to a fresh lookup, then to "ID $callerId" if everything fails.
+    private fun postClientEvent(callerId: Long, event: String, knownName: String? = null) {
+        scope.launch {
+            val name = knownName ?: if (callerId != 0L) {
+                try { BaleConnection.client?.loadUserName(callerId.toInt()) } catch (_: Exception) { null }
+            } else null
+            val label = name?.takeIf { it.isNotBlank() }
+                ?: if (callerId != 0L) "ID $callerId" else "unknown caller"
+            Log.d(TAG, "Server: postClientEvent callerId=$callerId resolved='$label' event=$event")
+            showClientEventNotification(callerId, label, event)
+        }
+    }
+
+    private fun showClientEventNotification(callerId: Long, label: String, event: String) {
+        val n = Notification.Builder(this, CHANNEL)
+            .setContentTitle("Bale VPN — Server")
+            .setContentText("$label $event")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setAutoCancel(true)
+            .build()
+        // Stable per-caller id so a "disconnected" alert replaces an earlier
+        // "connected" alert from the same caller — the user sees the latest
+        // state, not a stack of stale events.
+        val id = CLIENT_EVENT_NOTIF_BASE + (callerId.rem(10_000).toInt().let { if (it < 0) it + 10_000 else it })
+        getSystemService(NotificationManager::class.java).notify(id, n)
     }
 }
