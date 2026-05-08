@@ -27,8 +27,8 @@ const tun   = require('./tun');
 const {
     PEERTYPE_PRIVATE,
     TUNNEL_PREFIX, CHUNK_SIZE, LK_CHUNK,
-    TUNNEL_MAX_RECONNECT_ATTEMPTS,
-    PENDING_TIMEOUT_MS, PENDING_SWEEP_MS, ESTABLISH_GRACE_MS,
+    CALL_ACCEPTED_TIMEOUT_MS, PEER_TIMEOUT_MS, PEER_JOIN_TIMEOUT_MS,
+    PENDING_TIMEOUT_MS, PENDING_SWEEP_MS,
     DEFAULT_LIMIT_KBPS, MAX_LIMIT_KBPS, THROTTLE_FLAG_MS,
 } = require('./constants');
 const { LiveKitTransport, lkEncode, lkDecode } = require('./livekit');
@@ -217,15 +217,9 @@ class TunnelManager {
         // Per-caller bandwidth overrides (in-memory, like Android). Re-applied
         // when the same caller reconnects within the same process lifetime.
         this._callerLimits    = new Map();  // callerId → { upBps, downBps }
-        // Client reconnect state
-        this._reconnectTimer   = null;
-        this._reconnectAttempt = 0;
-        // When true, the client tunnel will NOT auto-reconnect after an LK
-        // drop. Reserved for legacy code paths — current /disconnect calls
-        // _stopAll directly.
-        this._noReconnect      = false;
+        // Client tunnel state — single attempt, no auto-retry.
         this._callId           = null;     // most recent callId of our outgoing client-mode call
-        this._callIds          = new Set();// all callIds we've initiated this Activate session
+        this._callIds          = new Set();// callIds whose callEnded should still trip a permanent stop
         this._callEndedRemover = null;     // deregister our addOnCallEnded subscription
         this._rejected         = false;    // peer (server) ended one of our calls — surfaced to UI
         // Generation counter — bumped on every new startWebRtcTunnel run and on
@@ -338,12 +332,6 @@ class TunnelManager {
         await Promise.all(promises);
     }
 
-    /** Client-mode soft-disconnect — kept around for the "leave unused code" preference. */
-    stopReconnect() {
-        if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
-        this._noReconnect = true;
-    }
-
     handleIncoming(text, fromUid) {
         const msg = tunnelDecode(text);
         if (!msg) return false;
@@ -371,15 +359,11 @@ class TunnelManager {
         }
 
         if (AdmissionStore.isAllowed(callerId)) {
-            for (const [, lk] of this.lkRooms) {
-                if (lk._callerId === callerId && !lk.hasPeer) {
-                    const ageMs = Date.now() - lk._connectedAt;
-                    if (ageMs < ESTABLISH_GRACE_MS) {
-                        console.log(`[Tunnel/S] dropping call ${callId} — caller ${callerId} still establishing (age=${ageMs}ms)`);
-                        return;
-                    }
-                }
-            }
+            // New call from the same caller always wins — _handleCall will
+            // tear down any existing room from the same caller (local cleanup
+            // only, see _handleCall's dedup loop). The previous "establish
+            // grace" guard is gone — the client only retries once and waits
+            // 2s for peer-join, so the worst case is a single extra ~2s hop.
             this.pendingMap.delete(callKey);
             await this._handleCall(callId, callerId, callEntity);
         } else {
@@ -391,19 +375,25 @@ class TunnelManager {
                     break;
                 }
             }
+            // Resolve the caller name synchronously before logging so the log
+            // line names them ("Joe (12345) → PENDING") rather than just the
+            // bare uid. Cached after first hit; only the first new caller per
+            // session pays the LoadUsers RPC cost.
+            let callerName = null;
+            try {
+                const ws = await this.getBale();
+                callerName = await ws?.lookupContactName(callerId);
+            } catch (_) {}
             this.pendingMap.set(callKey, {
                 callId:     callKey,
                 callerId,
-                callerName: null,
+                callerName,
                 receivedAt: Date.now(),
                 _entity:    callEntity || null,
             });
             this._startPendingSweep();
-            console.log(`[Tunnel/S] call ${callId} from caller ${callerId} → PENDING (awaiting admission)`);
-            this.getBale().then(ws => ws?.lookupContactName(callerId)).then(name => {
-                const cur = this.pendingMap.get(callKey);
-                if (cur && name) { cur.callerName = name; }
-            }).catch(() => {});
+            const label = callerName ? `${callerName} (${callerId})` : `caller ${callerId}`;
+            console.log(`[Tunnel/S] call ${callId} from ${label} → PENDING (awaiting admission)`);
         }
     }
 
@@ -460,10 +450,17 @@ class TunnelManager {
 
     async _handleCall(callId, callerId, callEntity) {
         const callKey = String(callId);
-        console.log(`[Tunnel/S] Auto-answering call ${callId} caller=${callerId}`);
 
         const ws = await this.getBale();
         if (!ws) { console.error('[Tunnel/S] AcceptCall: no WS available'); return; }
+
+        // Resolve the caller name up front so connect/disconnect logs read
+        // "Joe (12345)" instead of just "12345". Cached after first hit.
+        let callerName = null;
+        try { callerName = await ws.lookupContactName(callerId); } catch (_) {}
+        const callerLabel = callerName ? `${callerName} (${callerId})` : `caller ${callerId}`;
+        console.log(`[Tunnel/S] Auto-answering call ${callId} from ${callerLabel}`);
+
         let resp;
         try { resp = await ws.acceptCall(callId); }
         catch (e) { console.error('[Tunnel/S] AcceptCall failed:', e.message); return; }
@@ -483,9 +480,6 @@ class TunnelManager {
                 }
             }
         }
-
-        let callerName = null;
-        try { callerName = await ws.lookupContactName(callerId); } catch (_) {}
 
         console.log(`[Tunnel/S] LiveKit url=${call.url} room=${call.room} token=${call.token.slice(0, 40)}…`);
         const lk = new LiveKitTransport();
@@ -530,7 +524,8 @@ class TunnelManager {
                     closed++;
                 }
             }
-            console.log(`[Tunnel/S] LiveKit room disconnected callKey=${callKey} closed=${closed} session(s)`);
+            const who = lk._callerName ? `${lk._callerName} (${lk._callerId})` : `caller ${lk._callerId}`;
+            console.log(`[Tunnel/S] ${who} disconnected callKey=${callKey} closed=${closed} session(s)`);
         };
         try {
             await lk.connect(call.url, call.token);
@@ -538,42 +533,59 @@ class TunnelManager {
             console.error('[Tunnel/S] LiveKit connect failed:', e.message);
             this.lkRooms.delete(callKey);
             this._freeSnat(lk);
+            return;
         }
+
+        // Watchdog: PEER_JOIN_TIMEOUT_MS after our LK connects, if the caller
+        // hasn't joined the room, tear the call down. The LK session token
+        // would otherwise keep us connected for hours with no peer. Identity
+        // check on the entry guards against reaping a fresh client that
+        // replaced this one in the meantime.
+        setTimeout(() => {
+            const cur = this.lkRooms.get(callKey);
+            if (cur === lk && !lk.hasPeer) {
+                console.log(`[Tunnel/S] peer never joined call ${callId} — disconnecting`);
+                lk.disconnect();
+                this.getBale().then(w => w?.discardCall(callId)).catch(() => {});
+            }
+        }, PEER_JOIN_TIMEOUT_MS);
     }
 
+    // Single connect attempt — no auto-retry. On any failure (callAccepted
+     // timeout, peer didn't join, server rejected, LK transport drops mid-
+     // session) we fire onPermanentDisconnect and let the user retry manually.
     async startWebRtcTunnel() {
         if (this.mode !== 'client' || !this.serverPeer) return;
+        const fail = (reason) => {
+            console.warn(`[Tunnel/C] connect failed — ${reason}`);
+            this._stopAll();
+            try { this.onPermanentDisconnect(); } catch (_) {}
+        };
 
         const gen = ++this._gen;
         const cancelled = () => gen !== this._gen;
-        const fail = () => { if (!cancelled()) this._scheduleReconnect(); };
 
         if (this.lkTransport) { const prev = this.lkTransport; this.lkTransport = null; prev.disconnect(); }
 
         const ws = await this.getBale();
         if (cancelled()) return;
-        if (!ws) { console.error('[Tunnel/C] WS unavailable'); fail(); return; }
+        if (!ws) { fail('WS unavailable'); return; }
 
         console.log('[Tunnel/C] Starting call for WebRTC tunnel…');
         let resp;
         try { resp = await ws.startCall(this.serverPeer.id, this.serverPeer.type); }
-        catch (e) {
-            console.error('[Tunnel/C] StartCall failed:', e.message);
-            fail(); return;
-        }
+        catch (e) { fail(`StartCall: ${e.message}`); return; }
         if (cancelled()) return;
 
         const call = resp.call;
         if (!call?.isLivekit || !call?.token) {
-            console.warn('[Tunnel/C] StartCall: no LiveKit info in response');
-            fail(); return;
+            fail('StartCall: no LiveKit info in response');
+            return;
         }
 
-        // Track every callId we've initiated so a late server-rejection
-        // (callEnded for an earlier attempt's id) still trips permanent
-        // disconnect — peer-join timeout + reconnect back-off can move us to
-        // the next attempt before the rejection signal arrives.
+        // callEnded for the current call → permanent stop with rejected=true.
         this._callId = call.id;
+        this._callIds.clear();
         this._callIds.add(String(call.id));
         this._callEndedRemover?.(); this._callEndedRemover = null;
         this._callEndedRemover = ws.addOnCallEnded((endedId) => {
@@ -585,7 +597,27 @@ class TunnelManager {
             }
         });
 
-        console.log(`[Tunnel/C] Joining LiveKit room ${call.room}`);
+        // Wait for callAccepted before joining the LK room. Joining
+        // speculatively when the server's offline burns us into an empty
+        // room until the peer-join timeout. The CALL_ACCEPTED_TIMEOUT_MS
+        // budget covers manual admission ("allow" notification on server).
+        console.log('[Tunnel/C] Waiting for callAccepted…');
+        let acceptedResolve;
+        const acceptedP = new Promise((res) => { acceptedResolve = res; });
+        const acceptedRemover = ws.addOnCallAccepted((acceptedId) => {
+            if (String(acceptedId) === String(call.id)) acceptedResolve(true);
+        });
+        let accepted = false;
+        try {
+            accepted = await Promise.race([
+                acceptedP,
+                new Promise(r => setTimeout(() => r(false), CALL_ACCEPTED_TIMEOUT_MS)),
+            ]);
+        } finally { acceptedRemover(); }
+        if (cancelled()) return;
+        if (!accepted) { fail(`callAccepted timeout after ${CALL_ACCEPTED_TIMEOUT_MS / 1000}s`); return; }
+
+        console.log(`[Tunnel/C] callAccepted — joining LiveKit room ${call.room}`);
         const lk = new LiveKitTransport();
         lk._rxPkts = 0; lk._rxBytes = 0;
         lk._txPkts = 0; lk._txBytes = 0;
@@ -595,59 +627,39 @@ class TunnelManager {
             const msg = lkDecode(data);
             if (msg && msg.t !== 'I') this._cliMsg(msg);
         };
+        // No auto-reconnect on disconnect — fire permanent disconnect and let
+        // the user retry. The LiveKit data channel and the Bale WS are
+        // independent; losing the data channel means the tunnel is dead.
         lk.onDisconnected = () => {
             if (this.lkTransport === lk) {
                 this.lkTransport = null;
-                console.log('[Tunnel/C] LiveKit disconnected — reconnecting…');
+                console.log('[Tunnel/C] LiveKit disconnected — permanent disconnect');
                 this._closeCliSessions();
-                try { this.onTunnelReady(); } catch (_) {}
-                this._scheduleReconnect();
+                this._stopAll();
+                try { this.onPermanentDisconnect(); } catch (_) {}
             }
         };
         try { await lk.connect(call.url, call.token); }
-        catch (e) {
-            console.error('[Tunnel/C] LiveKit connect failed:', e.message);
-            fail(); return;
-        }
+        catch (e) { fail(`LiveKit connect: ${e.message}`); return; }
         if (cancelled()) { lk.disconnect(); return; }
 
-        // Wait up to 15s for the server peer to actually join. Without this
-        // gate, lk.connect succeeds the moment WE join; if the server is
-        // offline / rejected, we'd sit forever with a dead room.
-        const peerDeadline = Date.now() + 15000;
+        // Wait up to PEER_TIMEOUT_MS for the server to appear in the room.
+        // callAccepted just confirmed the server is racing in — sub-second
+        // on a healthy network.
+        const peerDeadline = Date.now() + PEER_TIMEOUT_MS;
         while (!lk.hasPeer && lk.room && Date.now() < peerDeadline) {
             await new Promise(r => setTimeout(r, 200));
             if (cancelled()) { lk.disconnect(); return; }
         }
         if (!lk.hasPeer) {
-            console.warn('[Tunnel/C] Server peer did not join in 15 s — retrying');
             if (lk.room) lk.disconnect();
-            fail(); return;
+            fail(`peer never joined after ${PEER_TIMEOUT_MS / 1000}s`);
+            return;
         }
 
-        this._reconnectAttempt = 0;
         this.lkTransport = lk;
         console.log('[Tunnel/C] WebRTC tunnel ready');
         try { this.onTunnelReady(); } catch (e) { console.error('[Tunnel/C] onTunnelReady threw:', e.message); }
-    }
-
-    _scheduleReconnect() {
-        if (this.mode !== 'client' || !this.serverPeer) return;
-        if (this._noReconnect) return;
-        if (this._reconnectTimer) return;
-        this._reconnectAttempt++;
-        if (this._reconnectAttempt > TUNNEL_MAX_RECONNECT_ATTEMPTS) {
-            console.log(`[Tunnel/C] Reconnect: giving up after ${TUNNEL_MAX_RECONNECT_ATTEMPTS} attempts`);
-            this._stopAll();
-            try { this.onPermanentDisconnect(); } catch (_) {}
-            return;
-        }
-        const delaySec = Math.min(this._reconnectAttempt * 3, 30);
-        console.log(`[Tunnel/C] Reconnect attempt ${this._reconnectAttempt} in ${delaySec}s…`);
-        this._reconnectTimer = setTimeout(async () => {
-            this._reconnectTimer = null;
-            await this.startWebRtcTunnel();
-        }, delaySec * 1000);
     }
 
     _closeCliSessions() {
@@ -1188,15 +1200,12 @@ class TunnelManager {
         // Bump _gen so any in-flight startWebRtcTunnel sees cancelled() === true
         // on its next await and bails before mutating state.
         this._gen++;
-        if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
-        this._reconnectAttempt = 0;
-        this._noReconnect      = false;
         this._callIds.clear();
         this._callEndedRemover?.(); this._callEndedRemover = null;
         this._callId = null;
-        // Clear mode/serverPeer/lkTransport BEFORE the LK teardown — its
-        // synchronous onDisconnected fires _scheduleReconnect, which gates on
-        // these. Leaving them set would arm a phantom reconnect.
+        // Clear mode/serverPeer/lkTransport BEFORE the LK teardown — the LK's
+        // synchronous onDisconnected reads them when deciding whether to fire
+        // a permanent disconnect; leaving them set would surface a stale event.
         this.mode       = null;
         this.serverPeer = null;
         if (this.socks5Srv) { this.socks5Srv.close(); this.socks5Srv = null; }
