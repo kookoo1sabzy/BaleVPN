@@ -77,7 +77,14 @@ class BaleWsClient(
     // bearing sequence number on the ping frame).
     @kotlin.concurrent.Volatile
     private var rpcIdx  = 1
-    private val pending = mutableMapOf<Int, CompletableDeferred<ByteArray>>()
+    /** Tracked per outgoing RPC so handleRpc can log which service/method's
+     *  response just landed instead of just an opaque idx number. */
+    private data class PendingRpc(
+        val service:  String,
+        val method:   String,
+        val deferred: CompletableDeferred<ByteArray>,
+    )
+    private val pending = mutableMapOf<Int, PendingRpc>()
     // Serializes access to `pending` and `rpcIdx`. Both are touched from rpcCall
     // (caller's coroutine), handleRpc (runLoop's coroutine), and disconnect
     // (any thread); the mutex makes those three orderable without a shared
@@ -113,7 +120,7 @@ class BaleWsClient(
                 pending.clear()
                 list
             }
-            drained.forEach { it.completeExceptionally(CancellationException("WS disconnected")) }
+            drained.forEach { it.deferred.completeExceptionally(CancellationException("WS disconnected")) }
         }
         scope.cancel()
     }
@@ -189,6 +196,12 @@ class BaleWsClient(
                         log("[BaleProxy] WS session closed (code=${cr?.code} reason=${cr?.message})")
                     }
                 }
+            } catch (e: CancellationException) {
+                // Normal teardown — disconnect() called scope.cancel(). Don't
+                // log it as an error and don't swallow it: rethrow so structured
+                // concurrency can propagate the cancellation cleanly. The
+                // outer while-loop's `scope.isActive` check will then exit.
+                throw e
             } catch (e: ResponseException) {
                 val status = e.response.status.value
                 if (status == 401 || status == 403) {
@@ -214,15 +227,43 @@ class BaleWsClient(
         log("[BaleProxy] WS runLoop exiting")
     }
 
+    /** Friendly name for the top-level inbound WS frame field tag. */
+    private fun frameKindName(f: Int): String = when (f) {
+        1 -> "RPC response / push"
+        2 -> "Push update"
+        3 -> "Terminate session"
+        4 -> "Pong"
+        5 -> "Handshake response"
+        else -> "field=$f (unknown)"
+    }
+
+    /** Friendly name for inner xC update field tags. The numbers come from the
+     *  reverse-engineered Bale protobuf — see CLAUDE.md for the table. */
+    private fun xcUpdateName(f: Int): String = when (f) {
+        55     -> "newMessage"
+        52807  -> "callStarted"
+        52808  -> "callAccepted"
+        52809  -> "callEnded"
+        52810  -> "callReceived"
+        else   -> "field=$f"
+    }
+
     private suspend fun handleFrame(buf: ByteArray) {
         val r = ProtoReader(buf)
         while (r.hasMore()) {
             val (f, w) = r.tag()
-            log("[BaleProxy] WS frame field=$f")
+            // Suppress the pong log line — it fires every heartbeat (~10 s) and
+            // adds nothing diagnostic. Heartbeat issues are caught by the
+            // liveness coroutine and the zombie-connection log instead.
+            if (f != 4) log("[BaleProxy] WS frame: ${frameKindName(f)}")
             when (f) {
                 1 -> handleRpc(r.bytes())
                 2 -> handlePushContainer(r.bytes())
-                4 -> { r.bytes(); rawSend(encodePing()) } // pong
+                // Pong — just acknowledge it (the liveness coroutine refreshes
+                // lastInboundTs from the read loop). Don't send a ping back here:
+                // the liveness coroutine is the sole heartbeat source. Replying
+                // with a ping would create a tight pong→ping→pong feedback loop.
+                4 -> r.bytes()
                 5 -> {
                     // Handshake response — parse proto+api version inline. The body
                     // is a wrapped int32 + int64 inside a bytes field; we walk
@@ -266,13 +307,14 @@ class BaleWsClient(
                 else -> r.skip(w)
             }
         }
-        val (d, sizeAfter) = stateMutex.withLock {
-            val deferred = pending.remove(idx)
-            deferred to pending.size
+        val (entry, sizeAfter) = stateMutex.withLock {
+            val e = pending.remove(idx)
+            e to pending.size
         }
-        log("[BaleProxy] WS RPC idx=$idx err=$err payloadSize=${payload?.size ?: 0} pendingSize=$sizeAfter")
-        if (d != null) {
-            if (err) d.completeExceptionally(Exception("RPC error")) else d.complete(payload ?: ByteArray(0))
+        if (entry != null) {
+            log("[BaleProxy] WS RPC ← ${entry.service}/${entry.method} idx=$idx ${if (err) "ERR" else "ok"} ${payload?.size ?: 0}B (pending=$sizeAfter)")
+            if (err) entry.deferred.completeExceptionally(Exception("RPC error"))
+            else     entry.deferred.complete(payload ?: ByteArray(0))
         } else if (payload != null && !err) {
             log("[BaleProxy] WS RPC idx=$idx not in pending — routing to handleUpdate")
             handleUpdate(payload)
@@ -291,14 +333,25 @@ class BaleWsClient(
         }
     }
 
-    // SubscribeResponse bytes: field 1 = xC union
+    // SubscribeResponse bytes:
+    //   field 1 = xC union (the actual event)
+    //   field 3 = server-assigned sequence number (varint)
+    //   field 4 = update timestamp, ms since epoch (varint)
+    // Decode 3/4 to actual values rather than just dropping them, so the log
+    // gives context for the surrounding xC event.
     private suspend fun handleUpdate(buf: ByteArray) {
-        log("[BaleProxy] WS handleUpdate len=${buf.size}")
         val r = ProtoReader(buf)
         while (r.hasMore()) {
             val (f, w) = r.tag()
-            log("[BaleProxy] WS update field=$f")
-            if (f == 1) parseXC(r.bytes()) else r.skip(w)
+            when (f) {
+                1    -> parseXC(r.bytes())
+                3    -> log("[BaleProxy] WS update seq=${r.varint()}")
+                4    -> log("[BaleProxy] WS update timestamp=${r.varint()}")
+                else -> {
+                    log("[BaleProxy] WS SubscribeResponse: unknown field=$f wire=$w")
+                    r.skip(w)
+                }
+            }
         }
     }
 
@@ -329,7 +382,14 @@ class BaleWsClient(
                     if (callId != 0L) onCallReceived(callId,
                         if (callerId != 0L) CallEntity(callId, "", "", "", false, callerId) else null)
                 }
-                else  -> r.skip(w)
+                else  -> {
+                    // Surface every xC event type we don't explicitly handle —
+                    // xcUpdateName names the documented ones (newMessage,
+                    // callAccepted) and falls back to "field=N" for genuinely
+                    // unknown tags so they're never silent in the log.
+                    log("[BaleProxy] WS xC event: ${xcUpdateName(f)}")
+                    r.skip(w)
+                }
             }
         }
     }
@@ -444,7 +504,7 @@ class BaleWsClient(
         val (idx, d) = stateMutex.withLock {
             val i = rpcIdx++
             val deferred = CompletableDeferred<ByteArray>()
-            pending[i] = deferred
+            pending[i] = PendingRpc(service, method, deferred)
             i to deferred
         }
         rawSend(encodeRpc(service, method, payload, idx))
