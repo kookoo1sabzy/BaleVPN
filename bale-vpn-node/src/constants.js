@@ -54,8 +54,8 @@ const PENDING_TIMEOUT_MS = 60 * 1000;
 const PENDING_SWEEP_MS   = 15 * 1000;
 
 // Per-client TUN bandwidth caps (server mode) — match Android.
-// 300 kbps / 37500 bytes/sec, 1-second burst.
-const DEFAULT_LIMIT_KBPS = 300;
+// 500 kbps default, 1-second burst.
+const DEFAULT_LIMIT_KBPS = 500;
 const MAX_LIMIT_KBPS     = 1000;
 const THROTTLE_FLAG_MS   = 2000;   // row stays "throttled" 2s after last drop
 
