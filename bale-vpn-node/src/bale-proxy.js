@@ -26,9 +26,52 @@
 process.on('uncaughtException',  e => console.error('[Process] uncaughtException:',  e.message, e.stack));
 process.on('unhandledRejection', e => console.error('[Process] unhandledRejection:', e?.message ?? e));
 
-const { TUNNEL_MODE, HTTP_PORT } = require('./constants');
+const { TUNNEL_MODE, HTTP_PORT, RUNTIME_DIR } = require('./constants');
 const { BaleWsClient }           = require('./bale-ws');
 const httpServer                 = require('./http-server');
+
+// ── Single-instance guard ─────────────────────────────────────────────────────
+//
+// Two instances would compete for the same TUN device and trash each other's
+// routing. We claim a PID lock file at startup; if another live instance
+// already holds it, refuse to start. Stale locks (process died without
+// cleaning up) are taken over after a `process.kill(pid, 0)` liveness probe.
+(function acquireSingleInstanceLock() {
+    const fs   = require('fs');
+    const path = require('path');
+    const lockPath = path.join(RUNTIME_DIR, '.bale-vpn.lock');
+
+    if (fs.existsSync(lockPath)) {
+        const txt = (() => { try { return fs.readFileSync(lockPath, 'utf8').trim(); } catch (_) { return ''; } })();
+        const pid = parseInt(txt, 10);
+        if (pid > 0 && pid !== process.pid) {
+            // process.kill(pid, 0) throws ESRCH if the pid is gone; on Windows
+            // it throws EPERM if owned by another user (still alive).
+            let alive = false;
+            try { process.kill(pid, 0); alive = true; }
+            catch (e) { alive = (e.code === 'EPERM'); }
+            if (alive) {
+                console.error(`[Lock] Another instance is already running (pid=${pid}). Refusing to start.`);
+                console.error(`[Lock] If you're sure no other instance is alive, delete ${lockPath} and retry.`);
+                process.exit(1);
+            }
+            console.warn(`[Lock] Stale lock from dead pid=${pid} — taking over.`);
+        }
+    }
+    try { fs.writeFileSync(lockPath, String(process.pid)); }
+    catch (e) { console.error(`[Lock] Could not write ${lockPath}: ${e.message}`); process.exit(1); }
+
+    // Best-effort cleanup. Removed by the SIGINT/SIGTERM handler below; this
+    // catches `process.exit()` calls and normal termination paths.
+    process.on('exit', () => {
+        try {
+            // Only remove if it's still ours — a successor instance that took
+            // over our stale lock would have written its own PID.
+            const txt = fs.readFileSync(lockPath, 'utf8').trim();
+            if (parseInt(txt, 10) === process.pid) fs.unlinkSync(lockPath);
+        } catch (_) {}
+    });
+})();
 
 // ── BaleConnection ────────────────────────────────────────────────────────────
 //
