@@ -154,6 +154,9 @@ class BaleWsClient {
             clearInterval(this.pingTimer);
             this.ready      = false;
             this.connecting = false;
+            // Fail any in-flight RPCs immediately — they can never succeed once
+            // the socket is closed, no point making callers wait the 15 s timeout.
+            this._drainPending(`WS closed (code ${code})`);
             // Don't tear down LK state on WS drop — server-mode rooms and the
             // client-mode tunnel are independent of the Bale WS once established.
             if (code === 4401) {
@@ -194,7 +197,22 @@ class BaleWsClient {
         if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
         if (this.ws) { this.ws.close(); this.ws = null; }
         clearInterval(this.pingTimer);
+        this._drainPending('WS disconnected by user');
         console.log('[WS] Disconnected by user');
+    }
+
+    // Reject every in-flight RPC promise so awaiting callers fail fast instead
+    // of stalling for the full 15 s _rpcCall timeout. Idempotent — the empty-
+    // map short-circuit + clearTimeout/reject being no-ops on already-completed
+    // entries make repeat calls safe.
+    _drainPending(reason) {
+        if (this.pending.size === 0) return;
+        const drained = [...this.pending.values()];
+        this.pending.clear();
+        drained.forEach(cb => {
+            clearTimeout(cb.timer);
+            cb.reject(new Error(reason));
+        });
     }
 
     _onFrame(frame) {
