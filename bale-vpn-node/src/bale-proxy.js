@@ -204,16 +204,38 @@ if (TUNNEL_MODE === 'server') client.tunnel.configure('server');
 // internally; reconcile is the single source of truth for lifecycle.
 connection.reconcile();
 
-// Idempotent shutdown — runs the platform-specific TUN teardown (close fd,
-// flush pf anchor on macOS / delete bale0 on Linux, drop route) before exit.
-// SIGTERM gets the same path as SIGINT so systemd / launchd / Docker stop
-// signals don't leave state behind.
+// Idempotent shutdown — disconnects LK rooms, runs the platform-specific TUN
+// teardown (close fd, flush pf anchor on macOS / delete bale0 on Linux, drop
+// route), then exits. SIGTERM gets the same path as SIGINT so systemd /
+// launchd / Docker stop signals don't leave state behind.
+//
+// Two safeguards against hangs:
+//   - A second Ctrl-C while shutdown is in progress force-exits immediately.
+//   - A 3-second deadline force-exits even if the first signal's cleanup is
+//     still running (e.g., LiveKit native threads not releasing in time).
 let _shuttingDown = false;
 const shutdown = (signal) => {
-    if (_shuttingDown) return;
+    if (_shuttingDown) {
+        console.log(`[WS] Force-exit on second ${signal}`);
+        process.exit(1);
+    }
     _shuttingDown = true;
     console.log(`\n[WS] Exiting (${signal})`);
-    try { client.tunnel._teardownTun(); } catch (e) { console.error('[TUN] Teardown error:', e.message); }
+
+    // Backstop: if any of the cleanup steps below hangs, give up after 3s
+    // and exit anyway. unref() so the timer itself doesn't keep the loop
+    // alive in the happy path.
+    setTimeout(() => {
+        console.warn('[WS] Cleanup timeout — force-exiting');
+        process.exit(1);
+    }, 3000).unref();
+
+    // Tear down LK rooms first so their native threads stop pinning the
+    // event loop, then close the WS so we stop receiving updates, then the
+    // TUN device. Each step swallows its own errors — best-effort.
+    try { client.tunnel._stopAll(); }       catch (e) { console.error('[Tunnel] stopAll error:', e.message); }
+    try { client.disconnect(); }            catch (e) { console.error('[WS] disconnect error:', e.message); }
+    try { client.tunnel._teardownTun(); }   catch (e) { console.error('[TUN] Teardown error:', e.message); }
     process.exit(0);
 };
 process.on('SIGINT',  () => shutdown('SIGINT'));
