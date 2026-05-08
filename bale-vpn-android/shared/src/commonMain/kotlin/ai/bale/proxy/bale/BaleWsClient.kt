@@ -11,6 +11,8 @@ import io.ktor.http.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.CoroutineContext
 
 private const val WS_HOST       = "next-ws.bale.ai"
@@ -66,8 +68,21 @@ class BaleWsClient(
         private set
 
     private val scope   = CoroutineScope(dispatcher + SupervisorJob())
+    // Long-lived scope for cleanup tasks that need to outlive `scope` (which is
+    // cancelled by disconnect()). Never cancelled by us — survives until the
+    // BaleWsClient instance itself is GC'd.
+    private val cleanupScope = CoroutineScope(SupervisorJob())
+    // Mutated only inside stateMutex.withLock; @Volatile gives visibility for
+    // the unlocked reads in encodePing (where the value is just a non-load-
+    // bearing sequence number on the ping frame).
+    @kotlin.concurrent.Volatile
     private var rpcIdx  = 1
     private val pending = mutableMapOf<Int, CompletableDeferred<ByteArray>>()
+    // Serializes access to `pending` and `rpcIdx`. Both are touched from rpcCall
+    // (caller's coroutine), handleRpc (runLoop's coroutine), and disconnect
+    // (any thread); the mutex makes those three orderable without a shared
+    // dispatcher.
+    private val stateMutex = Mutex()
     private val sendCh  = Channel<ByteArray>(Channel.UNLIMITED)
     // Last inbound-frame timestamp (epoch ms). Updated on every received frame
     // and read by the liveness coroutine to detect a zombie WS — TCP socket
@@ -89,13 +104,17 @@ class BaleWsClient(
     fun disconnect() {
         log("[BaleProxy] BaleWsClient.disconnect() called")
         ready = false
-        // Fail any in-flight RPCs immediately rather than letting them stall
-        // for the full 30 s timeout. Snapshot first to avoid mutating the map
-        // while we iterate; completeExceptionally on an already-completed
-        // deferred is a no-op so a racing response is harmless.
-        val drained = pending.values.toList()
-        pending.clear()
-        drained.forEach { it.completeExceptionally(CancellationException("WS disconnected")) }
+        // Drain pending under the same mutex other accessors use, on a scope
+        // that survives the upcoming scope.cancel(). Awaiting callers see
+        // their CancellationException within a millisecond as this dispatches.
+        cleanupScope.launch {
+            val drained = stateMutex.withLock {
+                val list = pending.values.toList()
+                pending.clear()
+                list
+            }
+            drained.forEach { it.completeExceptionally(CancellationException("WS disconnected")) }
+        }
         scope.cancel()
     }
 
@@ -247,8 +266,11 @@ class BaleWsClient(
                 else -> r.skip(w)
             }
         }
-        log("[BaleProxy] WS RPC idx=$idx err=$err payloadSize=${payload?.size ?: 0} pendingSize=${pending.size}")
-        val d = pending.remove(idx)
+        val (d, sizeAfter) = stateMutex.withLock {
+            val deferred = pending.remove(idx)
+            deferred to pending.size
+        }
+        log("[BaleProxy] WS RPC idx=$idx err=$err payloadSize=${payload?.size ?: 0} pendingSize=$sizeAfter")
         if (d != null) {
             if (err) d.completeExceptionally(Exception("RPC error")) else d.complete(payload ?: ByteArray(0))
         } else if (payload != null && !err) {
@@ -416,9 +438,15 @@ class BaleWsClient(
     // ── RPC helpers ────────────────────────────────────────────────────────────
 
     suspend fun rpcCall(service: String, method: String, payload: ByteArray): ByteArray {
-        val idx = rpcIdx++
-        val d   = CompletableDeferred<ByteArray>()
-        pending[idx] = d
+        // Lock around the rpcIdx++ / pending-add pair so handleRpc and
+        // disconnect can't observe a half-built state. The send itself goes
+        // through the channel and doesn't need the lock.
+        val (idx, d) = stateMutex.withLock {
+            val i = rpcIdx++
+            val deferred = CompletableDeferred<ByteArray>()
+            pending[i] = deferred
+            i to deferred
+        }
         rawSend(encodeRpc(service, method, payload, idx))
         // try/finally ensures the pending entry is removed regardless of how
         // the await ends — success, timeout, or scope cancellation. Without
@@ -426,12 +454,12 @@ class BaleWsClient(
         return try {
             withTimeout(30_000) { d.await() }
         } finally {
-            pending.remove(idx)
+            stateMutex.withLock { pending.remove(idx) }
         }
     }
 
-    private fun subscribeUpdates() {
-        val idx = rpcIdx++
+    private suspend fun subscribeUpdates() {
+        val idx = stateMutex.withLock { rpcIdx++ }
         sendCh.trySend(encodeRpc("bale.maviz.v1.MavizStream", "SubscribeToUpdates", ByteArray(0), idx))
     }
 
