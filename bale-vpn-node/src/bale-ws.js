@@ -60,6 +60,10 @@ class BaleWsClient {
         this.pingTimer     = null;
         this.pingCounter   = 0;
         this.ready         = false;
+        // Wall-clock timestamp of the last inbound WS frame. Used by _startPing
+        // to detect zombie connections (TCP "open" but no application traffic).
+        // 0 = no inbound seen yet.
+        this._lastInboundTs = 0;
         // Set when Bale closes the WS with code 4401 (their custom "Unauthenticated"
         // close code) — the token is dead. Cleared by connect() on next login.
         this.sessionExpired = false;
@@ -133,6 +137,10 @@ class BaleWsClient {
         });
 
         ws.on('message', (data) => {
+            // Any inbound frame proves the socket is live; refresh the
+            // liveness timestamp before decoding so even a malformed-but-
+            // received frame counts.
+            this._lastInboundTs = Date.now();
             try { this._onFrame(decodeServerFrame(new Uint8Array(data))); }
             catch (err) { console.error('[WS] Decode error:', err.message); }
         });
@@ -241,9 +249,21 @@ class BaleWsClient {
     }
 
     _startPing() {
+        this._lastInboundTs = Date.now();
         this.pingTimer = setInterval(() => {
-            if (this.ws.readyState === WebSocket.OPEN)
-                this.ws.send(encodePing(++this.pingCounter));
+            if (this.ws.readyState !== WebSocket.OPEN) return;
+            // Zombie-connection check — if no inbound frame for 30 s (3× ping
+            // interval), assume the socket is blackholed and force-close it.
+            // ws.terminate() destroys the underlying TCP socket immediately
+            // and fires 'close' (code 1006), which kicks off the existing
+            // reconnect path.
+            const idle = Date.now() - this._lastInboundTs;
+            if (idle > 30_000) {
+                console.warn(`[WS] No inbound for ${idle}ms — closing zombie connection`);
+                try { this.ws.terminate(); } catch (_) {}
+                return;
+            }
+            this.ws.send(encodePing(++this.pingCounter));
         }, 10_000);
     }
 

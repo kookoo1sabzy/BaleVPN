@@ -63,6 +63,12 @@ class BaleWsClient(
     private var rpcIdx  = 1
     private val pending = mutableMapOf<Int, CompletableDeferred<ByteArray>>()
     private val sendCh  = Channel<ByteArray>(Channel.UNLIMITED)
+    // Last inbound-frame timestamp (epoch ms). Updated on every received frame
+    // and read by the liveness coroutine to detect a zombie WS — TCP socket
+    // appears open but no application traffic flows. @Volatile so the read on
+    // the timer coroutine sees writes from the read coroutine without locking.
+    @kotlin.concurrent.Volatile
+    private var lastInboundTs = 0L
 
     fun connect() {
         log("[BaleProxy] BaleWsClient.connect() called")
@@ -107,12 +113,33 @@ class BaleWsClient(
                 ) {
                     log("[BaleProxy] WS socket open, sending handshake")
                     send(Frame.Binary(true, encodeHandshake()))
+                    lastInboundTs = System.currentTimeMillis()
                     val sender = launch {
                         for (data in sendCh) send(Frame.Binary(true, data))
                     }
+                    // Liveness check — runs every 10 s. Sends a ping unless the
+                    // socket has been silent for 30 s, in which case we close it
+                    // ourselves so the runLoop's outer reconnect kicks in. The
+                    // existing reactive ping in handleFrame's case 4 still fires
+                    // on incoming pongs; the slight redundancy is harmless and
+                    // avoids breaking the existing handshake cycle.
+                    val liveness = launch {
+                        while (isActive) {
+                            delay(10_000)
+                            val idle = System.currentTimeMillis() - lastInboundTs
+                            if (idle > 30_000) {
+                                log("[BaleProxy] WS idle ${idle}ms — closing zombie connection")
+                                close(CloseReason(CloseReason.Codes.GOING_AWAY, "ping timeout"))
+                                break
+                            }
+                            send(Frame.Binary(true, encodePing()))
+                        }
+                    }
                     for (frame in incoming) {
+                        lastInboundTs = System.currentTimeMillis()
                         if (frame is Frame.Binary) handleFrame(frame.data)
                     }
+                    liveness.cancel()
                     sender.cancel()
                     // Channel exited because the server closed it. Inspect the close
                     // reason so we can distinguish "expired token" from a network drop.
