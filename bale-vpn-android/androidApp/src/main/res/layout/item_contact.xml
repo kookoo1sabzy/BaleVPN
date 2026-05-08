@@ -23,6 +23,11 @@
             android:layout_width="wrap_content" android:layout_height="wrap_content"
             android:textSize="13sp" android:alpha="0.6"
             android:layout_marginTop="2dp"/>
+
+        <TextView android:id="@+id/tvId"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:textSize="13sp" android:alpha="0.6"
+            android:layout_marginTop="2dp"/>
     </LinearLayout>
 
     <com.google.android.material.button.MaterialButton

@@ -15,6 +15,7 @@ class BaleApp : Application() {
     override fun onCreate() {
         super.onCreate()
         BaleConnection.init(this)
+        UserCache.init(this)
         installMainLoopCrashRecovery()
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {

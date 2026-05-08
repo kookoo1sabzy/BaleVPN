@@ -5,6 +5,7 @@ import ai.bale.proxy.bale.UserEntity
 import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.Menu
 import android.view.MenuItem
@@ -36,11 +37,19 @@ class ContactsActivity : BaseActivity() {
         const val EXTRA_MODE   = "mode"
         const val MODE_PICK    = "pick"
         const val MODE_MANAGE  = "manage"
+        /** LoadUsers batch size — small enough to feel responsive (each batch
+         *  is one HTTPS round trip), large enough to amortise overhead. */
+        private const val BATCH_SIZE     = 30
+        /** Distance (in rows) before the next placeholder at which we trigger
+         *  the next batch. Higher = more pre-fetch, fewer scroll stalls. */
+        private const val PREFETCH_AHEAD = 10
     }
 
     private lateinit var recycler:    RecyclerView
     private lateinit var searchView:  SearchView
     private lateinit var fabAdd:      FloatingActionButton
+    private lateinit var loadingBox:  View
+    private lateinit var loadingMore: View
     private lateinit var adapter:     ContactAdapter
 
     private val prefs  by lazy { getSharedPreferences("config", MODE_PRIVATE) }
@@ -52,6 +61,12 @@ class ContactsActivity : BaseActivity() {
     private var searchMode   = false
     private var manageMode   = false
 
+    /** Peer refs not yet resolved to a full UserEntity (lazy-load queue).
+     *  Drained as the user scrolls. */
+    private var pendingPeers = mutableListOf<ai.bale.proxy.bale.UserPeerRef>()
+    /** Guards loadMoreBatch() against overlapping fires from the scroll listener. */
+    private var loadingBatch = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_contacts)
@@ -61,9 +76,11 @@ class ContactsActivity : BaseActivity() {
         manageMode = intent.getStringExtra(EXTRA_MODE) == MODE_MANAGE
         if (manageMode) supportActionBar?.title = "Contacts"
 
-        recycler   = findViewById(R.id.recycler)
-        searchView = findViewById(R.id.searchView)
-        fabAdd     = findViewById(R.id.fabAdd)
+        recycler    = findViewById(R.id.recycler)
+        searchView  = findViewById(R.id.searchView)
+        fabAdd      = findViewById(R.id.fabAdd)
+        loadingBox  = findViewById(R.id.loadingBox)
+        loadingMore = findViewById(R.id.loadingMore)
 
         adapter = ContactAdapter(
             showRemove = manageMode,
@@ -72,6 +89,20 @@ class ContactsActivity : BaseActivity() {
         )
         recycler.layoutManager = LinearLayoutManager(this)
         recycler.adapter       = adapter
+        // Lazy-load: when the user scrolls within PREFETCH_AHEAD of the next
+        // unresolved placeholder, kick off a LoadUsers batch. Cheap to evaluate
+        // — only fires on actual scroll events.
+        recycler.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
+                if (dy <= 0 || loadingBatch || pendingPeers.isEmpty()) return
+                val lm = rv.layoutManager as LinearLayoutManager
+                val last = lm.findLastVisibleItemPosition()
+                val firstUnloaded = allContacts.indexOfFirst { !it.loaded }
+                if (firstUnloaded >= 0 && last >= firstUnloaded - PREFETCH_AHEAD) {
+                    loadMoreBatch()
+                }
+            }
+        })
 
         // FAB behavior diverges per mode:
         //  - client mode: opens the search bar to find any user (by phone) and tap
@@ -99,12 +130,88 @@ class ContactsActivity : BaseActivity() {
     // ── Contacts mode ─────────────────────────────────────────────────────────
 
     private fun loadContacts() {
+        // Show centered spinner only if there are no cache hits yet — otherwise
+        // we have rows to render immediately and a centered overlay would just
+        // hide them.
+        loadingBox.visibility = View.VISIBLE
         scope.launch {
             try {
-                allContacts = repo.getContacts()
+                val res = repo.getContactPeers()
+                // Inline-users path (rare): full entities came back in one shot.
+                if (res.inlineUsers.isNotEmpty()) {
+                    UserCache.putAll(res.inlineUsers)
+                    allContacts = res.inlineUsers
+                    pendingPeers = mutableListOf()
+                    adapter.submit(allContacts)
+                    return@launch
+                }
+                // Lazy-load path. For each peer ref:
+                //   - cache hit AND accessHash matches → render cached entity (loaded=true)
+                //   - cache miss OR accessHash mismatch → placeholder + queue for fetch
+                val initial = ArrayList<UserEntity>(res.peers.size)
+                val toFetch = ArrayList<ai.bale.proxy.bale.UserPeerRef>()
+                for (p in res.peers) {
+                    val cached = UserCache[p.uid]
+                    if (cached != null && cached.accessHash == p.accessHash) {
+                        initial += cached
+                    } else {
+                        initial += UserEntity(id = p.uid, name = "", accessHash = p.accessHash, loaded = false)
+                        toFetch += p
+                    }
+                }
+                allContacts  = initial
+                pendingPeers = toFetch
                 adapter.submit(allContacts)
+                // Centered spinner hides in the finally block; the footer
+                // takes over for the per-batch fetches kicked off below.
+                if (pendingPeers.isNotEmpty()) loadMoreBatch()
             } catch (e: Exception) {
                 Toast.makeText(this@ContactsActivity, "Load failed: ${e.message}", Toast.LENGTH_SHORT).show()
+            } finally {
+                loadingBox.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun loadMoreBatch() {
+        if (loadingBatch || pendingPeers.isEmpty()) return
+        loadingBatch = true
+        loadingMore.visibility = View.VISIBLE
+        scope.launch {
+            try {
+                val batch = pendingPeers.take(BATCH_SIZE).toList()
+                val users = repo.loadUsersBatch(batch)
+                pendingPeers = pendingPeers.drop(batch.size).toMutableList()
+                UserCache.putAll(users)
+                val byId = users.associateBy { it.id }
+                // For uids in `batch` that LoadUsers didn't return (deleted
+                // account, blocked, server-side miss), synthesise a "loaded but
+                // empty" entity so the row renders the uid number instead of
+                // spinning forever. Cache them too — Bale won't return more
+                // info on a future call either.
+                val unresolved = batch.filter { !byId.containsKey(it.uid) }
+                val unresolvedFillers = unresolved.map {
+                    UserEntity(id = it.uid, name = "", accessHash = it.accessHash, loaded = true)
+                }
+                if (unresolvedFillers.isNotEmpty()) {
+                    Log.w("ContactsActivity", "LoadUsers didn't return ${unresolvedFillers.size}/${batch.size} uids: ${unresolved.map { it.uid }}")
+                    UserCache.putAll(unresolvedFillers)
+                }
+                val byIdFiller = unresolvedFillers.associateBy { it.id }
+                allContacts = allContacts.map { c ->
+                    when {
+                        c.loaded                       -> c
+                        byId.containsKey(c.id)         -> byId.getValue(c.id)
+                        byIdFiller.containsKey(c.id)   -> byIdFiller.getValue(c.id)
+                        else                           -> c
+                    }
+                }
+                adapter.submit(allContacts)
+            } catch (e: Exception) {
+                Toast.makeText(this@ContactsActivity, "Load more failed: ${e.message}", Toast.LENGTH_SHORT).show()
+            } finally {
+                loadingBatch = false
+                loadingMore.visibility = View.GONE
             }
         }
     }
@@ -139,7 +246,9 @@ class ContactsActivity : BaseActivity() {
         }
         scope.launch {
             try {
-                adapter.submit(repo.searchByPhone(query))
+                val results = repo.searchByPhone(query)
+                UserCache.putAll(results)
+                adapter.submit(results)
             } catch (e: Exception) {
                 Toast.makeText(this@ContactsActivity, "Search failed: ${e.message}", Toast.LENGTH_SHORT).show()
             }
@@ -267,17 +376,40 @@ class ContactAdapter(
         private val tvName    = v.findViewById<TextView>(R.id.tvName)
         private val tvNick    = v.findViewById<TextView>(R.id.tvNick)
         private val tvPhone   = v.findViewById<TextView>(R.id.tvPhone)
+        private val tvId      = v.findViewById<TextView>(R.id.tvId)
         private val btnRemove = v.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnRemove)
         fun bind(u: UserEntity) {
-            // Primary: real name; if absent fall back to @nick so the row is never blank
+            if (!u.loaded) {
+                // Placeholder row — full entity hasn't been LoadUsers-fetched
+                // yet. Dim the row, show "Loading…", swallow taps so the user
+                // doesn't pick a peer with no name yet.
+                tvName.text        = "Loading…"
+                tvNick.visibility  = View.GONE
+                tvPhone.visibility = View.GONE
+                tvId.text          = "ID: ${u.id}"
+                itemView.alpha     = 0.5f
+                itemView.setOnClickListener(null)
+                btnRemove.visibility = View.GONE
+                return
+            }
+            itemView.alpha = 1f
+            // Each piece of info on its own light-gray line below the name:
+            //   tvName  : name (or @nick / id fallback) — bold, full opacity
+            //   tvNick  : @nickname (when present, and primary isn't already it)
+            //   tvPhone : +989121234567 (when known)
+            //   tvId    : ID: 12345 (always — for log/notification correlation)
             tvName.text = if (u.name.isNotBlank()) u.name
                           else if (u.nick.isNotBlank()) "@${u.nick}"
                           else u.id.toString()
-            // Secondary: @nick — only when there is also a name, to avoid showing it twice
+
             val showNick = u.nick.isNotBlank() && u.name.isNotBlank()
             tvNick.text       = "@${u.nick}"
             tvNick.visibility = if (showNick) View.VISIBLE else View.GONE
-            tvPhone.text = if (u.phone.isNotEmpty()) u.phone else "ID: ${u.id}"
+
+            tvPhone.text       = formatPhone(u.phone)
+            tvPhone.visibility = if (u.phone.isNotEmpty()) View.VISIBLE else View.GONE
+
+            tvId.text = "ID: ${u.id}"
             itemView.setOnClickListener { onSelect(u) }
             // Per-row Remove button visible only in manage mode. Tapping it goes
             // straight to the confirm dialog without first selecting the row.
@@ -285,4 +417,11 @@ class ContactAdapter(
             btnRemove.setOnClickListener { onRemove(u) }
         }
     }
+
+    // Bale sometimes returns the phone as bare digits ("989121234567") instead
+    // of E.164 ("+989121234567"). Prepend '+' if it looks like an international
+    // number that's missing it. Anything starting with '+' or non-digit is
+    // returned as-is.
+    private fun formatPhone(p: String): String =
+        if (p.isNotEmpty() && p.all { it.isDigit() }) "+$p" else p
 }
