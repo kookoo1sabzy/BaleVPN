@@ -417,7 +417,6 @@ function decodeCallEnded(buf) {
             default: r.skipType(tag & 7);
         }
     }
-    console.log('[CallEnded] raw fields:', JSON.stringify(o), 'hex:', Buffer.from(buf).toString('hex'));
     return o;
 }
 
