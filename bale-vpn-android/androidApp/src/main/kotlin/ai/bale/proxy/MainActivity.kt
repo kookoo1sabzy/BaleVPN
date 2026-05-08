@@ -24,7 +24,7 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
 import kotlinx.coroutines.*
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : BaseActivity() {
 
     private lateinit var toggleMode:    MaterialButtonToggleGroup
     private lateinit var btnModeClient: MaterialButton
@@ -60,9 +60,6 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val VPN_REQUEST = 1
-        const val MENU_ABOUT  = 1
-        const val ABOUT_EMAIL = "kookoo.sabzy@proton.me"
-        const val ABOUT_REPO  = "https://github.com/kookoo1sabzy/BaleVPN"
     }
 
     private val notifPermLauncher = registerForActivityResult(
@@ -477,116 +474,5 @@ class MainActivity : AppCompatActivity() {
         finishAffinity()
     }
 
-    // ── About menu ────────────────────────────────────────────────────────────
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        menu.add(0, MENU_ABOUT, 0, "About")
-            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
-        return true
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (item.itemId == MENU_ABOUT) { showAboutDialog(); return true }
-        return super.onOptionsItemSelected(item)
-    }
-
-    private fun showAboutDialog() {
-        val dp = resources.displayMetrics.density
-        val pad = (24 * dp).toInt()
-
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, (8 * dp).toInt())
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-
-        val tvMotto = TextView(this).apply {
-            text     = "“Voices that can’t be silenced.”"
-            textSize = 16f
-            typeface = Typeface.create(Typeface.SERIF, Typeface.ITALIC)
-            gravity  = Gravity.CENTER_HORIZONTAL
-            setPadding(0, 0, 0, (24 * dp).toInt())
-        }
-
-        val tvBody = TextView(this).apply {
-            text     = "For bug reports and ideas, contact:"
-            textSize = 14f
-            gravity  = Gravity.CENTER_HORIZONTAL
-            setPadding(0, 0, 0, (4 * dp).toInt())
-        }
-
-        val tvEmail = TextView(this).apply {
-            text     = ABOUT_EMAIL
-            textSize = 15f
-            typeface = Typeface.MONOSPACE
-            gravity  = Gravity.CENTER_HORIZONTAL
-            paintFlags = paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
-            setTextColor(ContextCompat.getColor(context, android.R.color.holo_blue_dark))
-            setOnClickListener { sendEmail(ABOUT_EMAIL) }
-        }
-
-        val tvRepoLabel = TextView(this).apply {
-            text     = "Source code:"
-            textSize = 14f
-            gravity  = Gravity.CENTER_HORIZONTAL
-            setPadding(0, (16 * dp).toInt(), 0, (4 * dp).toInt())
-        }
-
-        val tvRepo = TextView(this).apply {
-            text     = ABOUT_REPO
-            textSize = 13f
-            typeface = Typeface.MONOSPACE
-            gravity  = Gravity.CENTER_HORIZONTAL
-            paintFlags = paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
-            setTextColor(ContextCompat.getColor(context, android.R.color.holo_blue_dark))
-            setOnClickListener { openUrl(ABOUT_REPO) }
-        }
-
-        val tvVersion = TextView(this).apply {
-            text     = "Version ${appVersion()}"
-            textSize = 12f
-            alpha    = 0.6f
-            gravity  = Gravity.CENTER_HORIZONTAL
-            setPadding(0, (20 * dp).toInt(), 0, 0)
-        }
-
-        layout.addView(tvMotto)
-        layout.addView(tvBody)
-        layout.addView(tvEmail)
-        layout.addView(tvRepoLabel)
-        layout.addView(tvRepo)
-        layout.addView(tvVersion)
-
-        AlertDialog.Builder(this)
-            .setTitle("About ${getString(R.string.app_name)}")
-            .setView(layout)
-            .setPositiveButton("Close", null)
-            .show()
-    }
-
-    private fun appVersion(): String =
-        try {
-            val info = packageManager.getPackageInfo(packageName, 0)
-            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
-            "${info.versionName} ($code)"
-        } catch (_: Exception) { "unknown" }
-
-    private fun sendEmail(address: String) {
-        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:$address")).apply {
-            putExtra(Intent.EXTRA_SUBJECT, "${getString(R.string.app_name)} feedback")
-        }
-        try {
-            startActivity(intent)
-        } catch (_: ActivityNotFoundException) {
-            Toast.makeText(this, "No email app installed; address: $address", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private fun openUrl(url: String) {
-        try {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-        } catch (_: ActivityNotFoundException) {
-            Toast.makeText(this, "No browser installed; URL: $url", Toast.LENGTH_LONG).show()
-        }
-    }
+    // About / TCP debug / View app logs menu lives in BaseActivity.
 }

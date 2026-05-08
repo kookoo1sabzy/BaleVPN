@@ -14,7 +14,7 @@ import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.button.MaterialButton
 import kotlinx.coroutines.*
 
-class ServerClientsActivity : AppCompatActivity() {
+class ServerClientsActivity : BaseActivity() {
 
     private lateinit var llClients: LinearLayout
     private lateinit var tvEmpty:   TextView
@@ -56,34 +56,9 @@ class ServerClientsActivity : AppCompatActivity() {
     override fun onSupportNavigateUp(): Boolean { finish(); return true }
     override fun onDestroy() { uiScope.cancel(); super.onDestroy() }
 
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        menu.add(0, MENU_DEBUG, 0, debugMenuTitle()).setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
-        return true
-    }
-
-    override fun onPrepareOptionsMenu(menu: Menu): Boolean {
-        menu.findItem(MENU_DEBUG)?.title = debugMenuTitle()
-        return super.onPrepareOptionsMenu(menu)
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (item.itemId == MENU_DEBUG) {
-            val newState = !BaleServerService.debug
-            BaleServerService.debug = newState
-            Toast.makeText(this,
-                if (newState) "Packet debug logs ON (Logcat: BaleProxy)" else "Packet debug logs OFF",
-                Toast.LENGTH_SHORT).show()
-            invalidateOptionsMenu()
-            return true
-        }
-        return super.onOptionsItemSelected(item)
-    }
-
-    private fun debugMenuTitle(): String =
-        if (BaleServerService.debug) "Debug logs: ON" else "Debug logs: OFF"
+    // Overflow menu (About / TCP debug toggle / View app logs) lives in BaseActivity.
 
     companion object {
-        private const val MENU_DEBUG       = 1
         private const val MAX_LIMIT_KBPS   = 500L   // hard ceiling for per-client bandwidth caps (500 kbps)
     }
 

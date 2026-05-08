@@ -10,7 +10,7 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.textfield.TextInputEditText
 import kotlinx.coroutines.*
 
-class ServerAdmissionActivity : AppCompatActivity() {
+class ServerAdmissionActivity : BaseActivity() {
 
     private lateinit var etAddId:       TextInputEditText
     private lateinit var btnAdd:        MaterialButton

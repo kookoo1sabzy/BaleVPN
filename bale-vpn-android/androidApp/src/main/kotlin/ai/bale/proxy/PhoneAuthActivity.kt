@@ -16,7 +16,7 @@ import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.websocket.*
 import kotlinx.coroutines.*
 
-class PhoneAuthActivity : AppCompatActivity() {
+class PhoneAuthActivity : BaseActivity() {
 
     private lateinit var etPhone:          TextInputEditText
     private lateinit var btnSend:          MaterialButton
