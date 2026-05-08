@@ -65,6 +65,13 @@ class BaleWsClient(
     fun disconnect() {
         log("[BaleProxy] BaleWsClient.disconnect() called")
         ready = false
+        // Fail any in-flight RPCs immediately rather than letting them stall
+        // for the full 30 s timeout. Snapshot first to avoid mutating the map
+        // while we iterate; completeExceptionally on an already-completed
+        // deferred is a no-op so a racing response is harmless.
+        val drained = pending.values.toList()
+        pending.clear()
+        drained.forEach { it.completeExceptionally(CancellationException("WS disconnected")) }
         scope.cancel()
     }
 
@@ -310,8 +317,14 @@ class BaleWsClient(
         val d   = CompletableDeferred<ByteArray>()
         pending[idx] = d
         rawSend(encodeRpc(service, method, payload, idx))
-        val result = withTimeout(30_000) { d.await() }
-        return result
+        // try/finally ensures the pending entry is removed regardless of how
+        // the await ends — success, timeout, or scope cancellation. Without
+        // this, dead entries accumulate forever across reconnect storms.
+        return try {
+            withTimeout(30_000) { d.await() }
+        } finally {
+            pending.remove(idx)
+        }
     }
 
     private fun subscribeUpdates() {
