@@ -27,7 +27,7 @@ import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.websocket.*
 import kotlinx.coroutines.*
 
-class ContactsActivity : AppCompatActivity() {
+class ContactsActivity : BaseActivity() {
 
     companion object {
         /** Intent extra: "pick" (default — tap selects a peer for client mode and
@@ -227,6 +227,7 @@ class ContactsActivity : AppCompatActivity() {
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.menu_contacts, menu)
+        super.onCreateOptionsMenu(menu)   // adds About / TCP debug / View app logs
         return true
     }
 

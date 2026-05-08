@@ -16,7 +16,7 @@ import io.ktor.client.engine.okhttp.*
 import io.ktor.client.plugins.websocket.*
 import kotlinx.coroutines.*
 
-class OtpActivity : AppCompatActivity() {
+class OtpActivity : BaseActivity() {
 
     companion object {
         const val EXTRA_PHONE         = "phone"
