@@ -7,6 +7,8 @@ import io.ktor.client.call.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 
 private const val GRPC_HOST = "next-ws.bale.ai"
 
@@ -14,22 +16,56 @@ class ContactRepository(
     private val http:        HttpClient,
     private val accessToken: String,
 ) {
-    // Load full contact list via GetContacts → LoadUsers
-    suspend fun getContacts(): List<UserEntity> {
+    /** GetContacts result split into refs (need LoadUsers) and entities
+     *  (already complete). The two are mutually exclusive in practice — Bale
+     *  picks one shape per response — but we surface both so callers can
+     *  handle either case without re-running the response shape check. */
+    data class ContactPeers(val peers: List<UserPeerRef>, val inlineUsers: List<UserEntity>)
+
+    /** Cheap one-RPC call. Returns the contact-list refs. Use loadUsersBatch
+     *  to fetch full entities in pages. */
+    suspend fun getContactPeers(): ContactPeers {
         val contactsBuf = grpcCall("bale.users.v1.Users", "GetContacts",
             ProtoWriter().string(1, "").build())
         val contacts = decodeGetContactsResponse(contactsBuf)
+        return ContactPeers(contacts.userPeers, contacts.inlineUsers)
+    }
 
-        // If peers returned, do a second call to load full user entities and
-        // backfill accessHash from the peer ref (LoadUsers responses don't
-        // carry it, but we need it to call RemoveContact later).
-        if (contacts.userPeers.isNotEmpty()) {
-            val loadBuf = grpcCall("bale.users.v1.Users", "LoadUsers",
-                buildLoadUsersRequest(contacts.userPeers))
-            return mergeAccessHash(decodeUsersResponse(loadBuf), contacts.userPeers)
+    /** Fetch full UserEntity objects for a batch of peer refs. Bale's
+     *  protocol splits user data across two RPCs:
+     *    - LoadUsers     → identity (id, name, nick, accessHash, …)
+     *    - LoadFullUsers → "fullUser" (contactInfo with phone, about, …)
+     *  We fan out both calls in parallel and merge phone into each entity.
+     *  Keep batches modest (≈30) to keep round-trips responsive. */
+    suspend fun loadUsersBatch(peers: List<UserPeerRef>): List<UserEntity> = coroutineScope {
+        if (peers.isEmpty()) return@coroutineScope emptyList<UserEntity>()
+        val usersJob = async {
+            val loadBuf = grpcCall("bale.users.v1.Users", "LoadUsers", buildLoadUsersRequest(peers))
+            mergeAccessHash(decodeUsersResponse(loadBuf), peers)
         }
-        // GetContacts may return inline user entities directly
-        return contacts.inlineUsers
+        val phonesJob = async { loadPhones(peers) }
+        val users  = usersJob.await()
+        val phones = phonesJob.await()
+        users.map { u -> phones[u.id]?.let { u.copy(phone = it) } ?: u }
+    }
+
+    /** LoadFullUsers — returns a map of uid → phone. Phone lives in
+     *  FullUser.contactInfo[*].longValue/stringValue when type == PHONE.
+     *  Failures are swallowed (returns empty map); the main LoadUsers data
+     *  is the more critical half of the merge. */
+    private suspend fun loadPhones(peers: List<UserPeerRef>): Map<Int, String> {
+        if (peers.isEmpty()) return emptyMap()
+        return try {
+            val loadBuf = grpcCall("bale.users.v1.Users", "LoadFullUsers",
+                buildLoadUsersRequest(peers))
+            decodeFullUsersResponseForPhones(loadBuf)
+        } catch (_: Exception) { emptyMap() }
+    }
+
+    /** Eager load — kept for callers that want everything in one shot. */
+    suspend fun getContacts(): List<UserEntity> {
+        val (peers, inlineUsers) = getContactPeers()
+        return if (peers.isNotEmpty()) loadUsersBatch(peers) else inlineUsers
     }
 
     // Remove a contact (Users/RemoveContact). Server needs both uid + accessHash;
@@ -140,7 +176,6 @@ class ContactRepository(
     // ── Response decoders ──────────────────────────────────────────────────────
 
     private data class GetContactsResult(val userPeers: List<UserPeerRef>, val inlineUsers: List<UserEntity>)
-    private data class UserPeerRef(val uid: Int, val accessHash: Long)
 
     private fun decodeGetContactsResponse(buf: ByteArray): GetContactsResult {
         val r = ProtoReader(buf)
@@ -181,19 +216,88 @@ class ContactRepository(
 
     private fun decodeUserEntity(buf: ByteArray): UserEntity {
         val r = ProtoReader(buf)
-        var id = 0; var name = ""; var nick = ""; var phone = ""; var accessHash = 0L
+        var id = 0; var name = ""; var nick = ""; var accessHash = 0L
+        // User entity (verified against Bale's web bundle):
+        //   1  id (int32)
+        //   2  accessHash (int64) — required by Add/RemoveContact
+        //   3  name (string)
+        //   9  nick (wrapped string)
+        // Phone is NOT carried here — it lives on FullUser (separate
+        // LoadFullUsers RPC). See loadPhones() / decodeFullUsersResponseForPhones.
         while (r.hasMore()) {
             val (f, w) = r.tag()
             when (f) {
                 1  -> id         = r.varint().toInt()
-                2  -> accessHash = r.varint()  // int64 — required by Add/RemoveContact
+                2  -> accessHash = r.varint()
                 3  -> name       = r.string()
-                5  -> phone      = r.string()
                 9  -> nick       = decodeWrapped(r.bytes())
                 else -> r.skip(w)
             }
         }
-        return UserEntity(id, name, nick, phone, accessHash)
+        return UserEntity(id, name, nick, "", accessHash)
+    }
+
+    // LoadFullUsersResponse: { fullUsers: repeated FullUser } at field 1.
+    // FullUser: { id @ field 1, contactInfo @ field 2 (repeated ContactInfo) }.
+    // ContactInfo entry: { type @ f1 (int32 enum, default 0=PHONE),
+    //                      stringValue @ f2 (wrapped string),
+    //                      longValue @ f3 (Int64Value sub-message) }.
+    // Returns uid → phone for every FullUser whose contactInfo includes a
+    // PHONE-typed entry. Prefers stringValue (Bale pre-formats it like
+    // "+989121234567") over longValue (raw int64).
+    private fun decodeFullUsersResponseForPhones(buf: ByteArray): Map<Int, String> {
+        val r = ProtoReader(buf)
+        val out = mutableMapOf<Int, String>()
+        while (r.hasMore()) {
+            val (f, w) = r.tag()
+            if (f != 1) { r.skip(w); continue }
+            val (uid, phone) = decodeFullUserPhone(r.bytes())
+            if (uid > 0 && phone.isNotEmpty()) out[uid] = phone
+        }
+        return out
+    }
+
+    private fun decodeFullUserPhone(buf: ByteArray): Pair<Int, String> {
+        val r = ProtoReader(buf)
+        var uid = 0
+        var phone = ""
+        while (r.hasMore()) {
+            val (f, w) = r.tag()
+            when (f) {
+                1 -> uid = r.varint().toInt()
+                2 -> {
+                    if (phone.isEmpty()) phone = extractPhoneFromContactInfo(r.bytes())
+                    else r.bytes()
+                }
+                else -> r.skip(w)
+            }
+        }
+        return uid to phone
+    }
+
+    private fun extractPhoneFromContactInfo(buf: ByteArray): String {
+        val r = ProtoReader(buf)
+        var type = 0
+        var stringValue = ""
+        var longValue   = 0L
+        while (r.hasMore()) {
+            val (f, w) = r.tag()
+            when (f) {
+                1 -> type        = r.varint().toInt()
+                2 -> stringValue = decodeWrapped(r.bytes())
+                3 -> {
+                    val sub = r.bytes()
+                    val sr  = ProtoReader(sub)
+                    while (sr.hasMore()) {
+                        val (sf, sw) = sr.tag()
+                        if (sf == 1) longValue = sr.varint() else sr.skip(sw)
+                    }
+                }
+                else -> r.skip(w)
+            }
+        }
+        if (type != 0) return ""  // CONTACTTYPE_PHONE = 0; skip email/web/social
+        return stringValue.ifEmpty { if (longValue != 0L) longValue.toString() else "" }
     }
 
     private fun decodeUserPeerRef(buf: ByteArray): UserPeerRef {
