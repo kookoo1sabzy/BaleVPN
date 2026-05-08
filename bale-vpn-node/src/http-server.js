@@ -135,6 +135,7 @@ function create(client, connection) {
                 mode:            TUNNEL_MODE,
                 tokenSet:        !!client.accessToken,   // never leak the JWT itself
                 sessionExpired:  !!client.sessionExpired,
+                versionMismatch: !!client.versionMismatch,
                 self:            client.self,
                 wsReady:         client.ready,
                 wsConnecting:    client.connecting,

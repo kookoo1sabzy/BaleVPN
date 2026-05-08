@@ -237,6 +237,12 @@ class MainActivity : AppCompatActivity() {
             finishAffinity()
             return
         }
+        // Server's protocol version differs from what this build knows. Relogin
+        // won't help — the app needs an update. Surface once per occurrence.
+        if (BaleConnection.versionMismatch) {
+            BaleConnection.versionMismatch = false
+            Toast.makeText(this, "App is out of date — please update", Toast.LENGTH_LONG).show()
+        }
 
         val mode           = prefs.getString("mode", "client") ?: "client"
         val wsReady        = BaleConnection.isReady

@@ -497,6 +497,14 @@ function applyState() {
   } else if (!s.sessionExpired) {
     window._shownExpiredBanner = false;
   }
+  // Server's protocol version doesn't match what this build knows. The user
+  // needs to update the app — relogin won't help. Sticky banner.
+  if (s.versionMismatch && !window._shownVersionBanner) {
+    window._shownVersionBanner = true;
+    showAuthStatus('App version is incompatible with Bale. Please update.', 'err');
+  } else if (!s.versionMismatch) {
+    window._shownVersionBanner = false;
+  }
 
   // Section visibility — login vs VPN menu, driven by token presence alone.
   const tok = hasToken();

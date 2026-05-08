@@ -52,6 +52,9 @@ object BaleConnection {
     /** Set when Bale signals our token is dead (4401 close or 401/403 upgrade).
      *  MainActivity polls this in tick() and routes the user to relogin. */
     @Volatile var sessionExpired: Boolean = false
+    /** Set when the server's handshake reports an incompatible proto/api version.
+     *  MainActivity surfaces a "please update the app" Toast — relogin won't help. */
+    @Volatile var versionMismatch: Boolean = false
 
     private var callEndedRemover: (() -> Unit)? = null
 
@@ -98,6 +101,13 @@ object BaleConnection {
             appContext.getSharedPreferences("config", Context.MODE_PRIVATE)
                 .edit().remove("token").apply()
             sessionExpired   = true
+            callEndedRemover?.invoke(); callEndedRemover = null
+            client = null
+            http?.close(); http = null
+        }
+        ws.onVersionMismatch = {
+            Log.w(TAG, "BaleConnection: version mismatch — app needs update")
+            versionMismatch = true
             callEndedRemover?.invoke(); callEndedRemover = null
             client = null
             http?.close(); http = null
