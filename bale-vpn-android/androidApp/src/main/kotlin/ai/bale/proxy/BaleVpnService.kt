@@ -11,8 +11,6 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import android.os.Handler
-import android.os.Looper
 import android.os.PowerManager
 import android.system.ErrnoException
 import android.system.Os
@@ -38,6 +36,8 @@ class BaleVpnService : VpnService() {
         const val ACTION_STOP     = "ai.bale.proxy.STOP"
         private const val NOTIF_ID = 1
         private const val CHANNEL  = "vpn"
+        private const val ALERT_CHANNEL  = "vpn_alerts"
+        private const val ALERT_NOTIF_ID = 2
         var isRunning   = false
         var isConnected = false
         @Volatile var rxPkts: Long = 0; @Volatile var rxBytes: Long = 0
@@ -90,7 +90,7 @@ class BaleVpnService : VpnService() {
     private suspend fun resolveWs(): BaleWsClient? {
         // Bypass reconcile here — its rule says "client mode + VPN running → WS down",
         // which is exactly the state we're in. We need WS *briefly* for signaling.
-        // After startWebRtcTunnel returns, onTunnelReady → reconcile() drops it again.
+        // After connect() returns, onTunnelReady → reconcile() drops it again.
         if (BaleConnection.client == null) {
             val token = getSharedPreferences("config", MODE_PRIVATE).getString("token", "").orEmpty()
             if (token.isEmpty()) { Log.e(TAG, "VPN: no saved token"); return null }
@@ -153,16 +153,20 @@ class BaleVpnService : VpnService() {
             // 5. Call the peer → get LiveKit credentials → join room
             mgr.onPermanentDisconnect = { rejected ->
                 Log.d(TAG, "VPN: permanent disconnect — stopping service (rejected=$rejected)")
-                // Toast the user from the main thread so they understand why
-                // the VPN just dropped — server reject vs. connectivity giveup.
-                val msg = if (rejected) "Server rejected the connection."
-                          else          "Server unreachable — gave up after retries."
-                Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show()
-                }
+                // High-importance notification (audible) — the user may have
+                // backgrounded the app. Tap routes back to MainActivity so they
+                // can reconnect.
+                val title = if (rejected) "Bale VPN — rejected"
+                            else          "Bale VPN — disconnected"
+                val text  = if (rejected) "The server rejected the connection."
+                            else          "Could not reach the server. Tap to reconnect."
+                showAlert(title, text)
                 scope.launch { stopVpn() }
             }
-            if (!mgr.startWebRtcTunnel()) { Log.e(TAG, "VPN: WebRTC tunnel failed"); return }
+            // Single attempt — no auto-retry. On failure, TunnelManager has
+            // already fired onPermanentDisconnect (which posts the alert
+            // notification and stops the VPN); the user retries by tapping it.
+            if (!mgr.connect()) { Log.e(TAG, "VPN: WebRTC tunnel failed"); return }
             isConnected = true
             Log.d(TAG, "VPN: connected ✓")
 
@@ -350,4 +354,30 @@ class BaleVpnService : VpnService() {
         }
         return builder.build()
     }
+
+    // Separate channel + notification id for "VPN dropped" alerts. The ongoing
+    // foreground notification uses CHANNEL/NOTIF_ID; alerts must be a different
+    // id so they don't replace each other, and a different channel so the user
+    // gets sound/vibration despite the foreground channel being LOW importance.
+    private fun showAlert(title: String, text: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val mgr = getSystemService(NotificationManager::class.java)
+            val ch  = NotificationChannel(ALERT_CHANNEL, "VPN alerts", NotificationManager.IMPORTANCE_HIGH)
+            mgr.createNotificationChannel(ch)
+        }
+        val tap = android.app.PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+        )
+        val n = Notification.Builder(this, ALERT_CHANNEL)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setAutoCancel(true)
+            .setContentIntent(tap)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(ALERT_NOTIF_ID, n)
+    }
+
 }

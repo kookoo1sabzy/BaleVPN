@@ -35,6 +35,13 @@ class AndroidLiveKitTransport(
     private val scope           = CoroutineScope(dispatcher + SupervisorJob())
     private val sendQueue       = Channel<ByteArray>(QUEUE_CAPACITY)
     @Volatile private var everHadRemote = false
+    // Time we returned from connect(). Used to distinguish a phantom
+    // ParticipantDisconnected (LK SDK occasionally fires one in the first
+    // ~1-2 s before any peer has joined) from a real disconnect later. After
+    // this window, an empty-room disconnect is honored even if we never saw
+    // the peer join — covers the case where the server is removed before its
+    // ParticipantConnected propagated to us.
+    @Volatile private var connectedAt = 0L
 
     override suspend fun connect(url: String, token: String) {
         Log.d(TAG, "LiveKit: connect url=$url")
@@ -76,16 +83,31 @@ class AndroidLiveKitTransport(
                         Log.d(TAG, "LiveKit: peer joined (${r.remoteParticipants.size} remote)")
                     }
                     is RoomEvent.ParticipantDisconnected -> {
-                        // Only treat an empty room as "peer left" if we'd actually had a peer.
-                        // LiveKit sometimes fires this for stale signaling state during the
-                        // initial connect window, before the real peer has joined.
+                        // Empty room means the peer left — leave the room ourselves
+                        // and hand control to the reconnect path. The only exception
+                        // is a brief phantom-event window right after connect() returns
+                        // (LK SDK occasionally fires a stale ParticipantDisconnected
+                        // before any peer has joined). Past that window we honor it
+                        // regardless of whether we saw a ParticipantConnected — covers
+                        // the case where the peer was here and left so fast we missed
+                        // the join, or the server kicked us mid-handshake.
                         if (r.remoteParticipants.isEmpty()) {
-                            if (everHadRemote) {
-                                Log.d(TAG, "LiveKit: peer left room — disconnecting")
+                            val elapsed = System.currentTimeMillis() - connectedAt
+                            if (everHadRemote || elapsed > 2_000) {
+                                Log.d(TAG, "LiveKit: peer gone — leaving room (everHadRemote=$everHadRemote elapsed=${elapsed}ms)")
                                 isConnected = false
+                                // Tell the SFU we're leaving too — without this we
+                                // keep our signal channel open with no peer for the
+                                // session-token's full lifetime. RoomEvent.Disconnected
+                                // may follow but our isConnected=false guard makes
+                                // the duplicate onDisconnected a harmless no-op for
+                                // downstream consumers.
+                                scope.launch {
+                                    withContext(Dispatchers.Main) { runCatching { r.disconnect() } }
+                                }
                                 onDisconnected?.invoke()
                             } else {
-                                Log.d(TAG, "LiveKit: stale ParticipantDisconnected before any peer joined — ignoring")
+                                Log.d(TAG, "LiveKit: phantom ParticipantDisconnected at ${elapsed}ms — ignoring")
                             }
                         }
                     }
@@ -104,6 +126,7 @@ class AndroidLiveKitTransport(
         val connectOpts = ConnectOptions(autoSubscribe = false)
         withContext(Dispatchers.Main) { r.connect(url, token, connectOpts) }
         isConnected = true
+        connectedAt = System.currentTimeMillis()
         Log.d(TAG, "LiveKit: connected")
 
         scope.launch {

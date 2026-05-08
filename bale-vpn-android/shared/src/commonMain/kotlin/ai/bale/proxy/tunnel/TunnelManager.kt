@@ -2,6 +2,7 @@ package ai.bale.proxy.tunnel
 
 import ai.bale.proxy.bale.BaleWsClient
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
 import kotlin.coroutines.CoroutineContext
 
 data class TunnelConfig(
@@ -9,8 +10,10 @@ data class TunnelConfig(
     val serverPeerType: Int = 1,
 )
 
-private const val MAX_RECONNECT_ATTEMPTS = 5
-private const val PEER_TIMEOUT_MS        = 15_000L
+// Max wait for the server's callAccepted push after StartCall — covers manual admission (server user has to tap "allow" in a notification).
+private const val CALL_ACCEPTED_TIMEOUT_MS = 90_000L
+// Max wait for the peer to show up in the LK room after callAccepted.
+private const val PEER_TIMEOUT_MS         = 5_000L
 
 class TunnelManager(
     /** Resolved at every (re)connect attempt — lets the caller bring up a torn-down
@@ -35,14 +38,21 @@ class TunnelManager(
 
     private val scope            = CoroutineScope(dispatcher + SupervisorJob())
     private var transport        = newTransport()
-    private var reconnecting     = false
     private var stopped          = false
-    private val seenCallIds      = mutableSetOf<Long>()
-    private var callEndedRemover: (() -> Unit)? = null
+    /** The callId of the in-flight call. */
+    @Volatile
+    private var currentCallId: Long = 0L
+    /** Held while a connect cycle is in flight; tryLock() guards against
+     *  concurrent invocations (e.g., two onDisconnected events from different
+     *  threads racing into the same handler). */
+    private val connectMutex    = Mutex()
+    private var callEndedRemover:    (() -> Unit)? = null
+    private var callAcceptedRemover: (() -> Unit)? = null
 
     fun stop() {
         stopped = true
-        callEndedRemover?.invoke(); callEndedRemover = null
+        callEndedRemover?.invoke();    callEndedRemover    = null
+        callAcceptedRemover?.invoke(); callAcceptedRemover = null
         transport.disconnect()
         scope.coroutineContext.cancelChildren()
     }
@@ -51,11 +61,39 @@ class TunnelManager(
         transport.send(lkEncode(TFrame.Ip(data)))
     }
 
-    suspend fun startWebRtcTunnel(): Boolean {
+    /** Single connect attempt — no auto-retry. On any failure (callAccepted
+     *  timeout, peer didn't join, server rejected) we fire onPermanentDisconnect
+     *  and let the user decide whether to try again. Re-entrant guard: a second
+     *  call while one is in flight returns false immediately. */
+    suspend fun connect(): Boolean {
+        if (stopped) return false
+        if (!connectMutex.tryLock()) {
+            log("[BaleProxy] connect: already in progress, skipping")
+            return false
+        }
+        try {
+            transport.disconnect()
+            transport = newTransport()
+            val ok = try {
+                startWebRtcTunnel()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log("[BaleProxy] connect: failed — ${e::class.simpleName}: ${e.message}")
+                false
+            }
+            if (!ok && !stopped) onPermanentDisconnect?.invoke(/* rejected = */ false)
+            return ok
+        } finally {
+            connectMutex.unlock()
+        }
+    }
+
+    /** StartCall → wait for callAccepted → join LK → wait for peer → tunnel ready.
+     *  Returns false on failure. callEnded for the current call trips a permanent
+     *  stop with rejected=true. */
+    private suspend fun startWebRtcTunnel(): Boolean {
         val cfg = config ?: run { log("[BaleProxy] WebRTC: no config"); return false }
-        // Resolve the WS afresh on every (re)connect attempt — the previous one may
-        // have been torn down by the lifecycle observer while the app was backgrounded.
-        // getBale() is responsible for bringing it back up; we wait for it to be ready.
         val bale = getBale() ?: run { log("[BaleProxy] WebRTC: WS unavailable"); return false }
         if (!bale.ready) {
             var retries = 0
@@ -69,15 +107,14 @@ class TunnelManager(
             log("[BaleProxy] WebRTC: no LiveKit credentials in response")
             return false
         }
-        seenCallIds.add(call.callId)
-        // Stop the VPN if Bale signals that any call we initiated has ended.
-        // Multiple reconnect cycles re-register; drop the previous registration first.
-        // Re-subscribes against whatever WS instance is current right now — survives
-        // disconnect/reconnect cycles since we're hooking into the live one.
+        currentCallId = call.callId
+
+        // callEnded for the current call — server explicitly rejected/hung up.
+        // Trip permanent stop regardless of which phase we're in.
         callEndedRemover?.invoke()
         callEndedRemover = bale.addOnCallEnded { callId ->
-            if (callId in seenCallIds && !stopped) {
-                log("[BaleProxy] WebRTC: callEnded for tracked callId=$callId — server rejected, stopping")
+            if (callId == currentCallId && !stopped) {
+                log("[BaleProxy] WebRTC: callEnded for current callId=$callId — server rejected, stopping")
                 scope.launch {
                     stopped = true
                     transport.disconnect()
@@ -85,20 +122,50 @@ class TunnelManager(
                 }
             }
         }
-        log("[BaleProxy] WebRTC: joining ${call.url}")
+
+        // Wait for callAccepted from the server before joining the LK room.
+        // If callEnded arrives first, the listener above already triggered the
+        // permanent stop — we'll see stopped=true and bail out cleanly.
+        log("[BaleProxy] WebRTC: waiting for callAccepted…")
+        val accepted = CompletableDeferred<Boolean>()
+        callAcceptedRemover?.invoke()
+        callAcceptedRemover = bale.addOnCallAccepted { callId ->
+            if (callId == currentCallId) accepted.complete(true)
+        }
+        try {
+            withTimeout(CALL_ACCEPTED_TIMEOUT_MS) {
+                while (!accepted.isCompleted && !stopped) {
+                    delay(200)
+                }
+            }
+        } catch (e: TimeoutCancellationException) {
+            log("[BaleProxy] WebRTC: callAccepted timeout — server didn't accept in ${CALL_ACCEPTED_TIMEOUT_MS / 1000}s")
+            return false
+        }
+        if (stopped) return false
+        log("[BaleProxy] WebRTC: callAccepted — joining ${call.url}")
+
         transport.onData         = { data -> (lkDecode(data) as? TFrame.Ip)?.let { onPacket?.invoke(it.data) } }
-        transport.onDisconnected = { if (!stopped) scope.launch { reconnect() } }
+        transport.onDisconnected = {
+            // No auto-reconnect — fire permanent stop and let the user retry
+            // manually via the disconnect notification.
+            if (!stopped) {
+                stopped = true
+                scope.launch { onPermanentDisconnect?.invoke(/* rejected = */ false) }
+            }
+        }
         transport.connect(call.url, call.token)
 
-        // Wait for the server to join the room. If nobody appears within PEER_TIMEOUT_MS,
-        // the server rejected or is not running — treat as a connection failure.
+        // Wait for the peer to actually appear in the LK room. With
+        // callAccepted received, the server is racing in — sub-second on a
+        // healthy network. 2 s is enough margin.
         val deadline = System.currentTimeMillis() + PEER_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline && scope.isActive && !stopped) {
             if (transport.hasPeer) break
-            delay(500)
+            delay(200)
         }
         if (!transport.hasPeer || stopped) {
-            log("[BaleProxy] WebRTC: no peer joined after ${PEER_TIMEOUT_MS / 1000}s — aborting")
+            log("[BaleProxy] WebRTC: no peer joined after ${PEER_TIMEOUT_MS / 1000}s — aborting attempt")
             transport.disconnect()
             return false
         }
@@ -106,37 +173,5 @@ class TunnelManager(
         log("[BaleProxy] WebRTC: tunnel ready")
         onTunnelReady()
         return true
-    }
-
-    private suspend fun reconnect() {
-        if (reconnecting || stopped) return
-        reconnecting = true
-        log("[BaleProxy] Reconnect: disconnected")
-        try {
-            transport.disconnect()
-            var attempt = 0
-            while (scope.isActive && !stopped) {
-                attempt++
-                if (attempt > MAX_RECONNECT_ATTEMPTS) {
-                    log("[BaleProxy] Reconnect: giving up after $MAX_RECONNECT_ATTEMPTS attempts")
-                    onPermanentDisconnect?.invoke(/* rejected = */ false)
-                    break
-                }
-                val delaySec = minOf(attempt * 3, 30)
-                log("[BaleProxy] Reconnect: attempt $attempt in ${delaySec}s…")
-                delay(delaySec * 1_000L)
-                transport = newTransport()
-                try {
-                    if (startWebRtcTunnel()) {
-                        log("[BaleProxy] Reconnect: OK (attempt $attempt)")
-                        break
-                    }
-                } catch (e: Exception) {
-                    log("[BaleProxy] Reconnect: attempt $attempt failed — ${e::class.simpleName}: ${e.message}")
-                }
-            }
-        } finally {
-            reconnecting = false
-        }
     }
 }

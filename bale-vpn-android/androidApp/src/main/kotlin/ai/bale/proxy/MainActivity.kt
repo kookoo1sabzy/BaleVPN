@@ -111,7 +111,8 @@ class MainActivity : BaseActivity() {
             if (BaleConnection.client != null) {
                 // Disconnect path needs pre-cleanup: send discardCall to every
                 // connected/pending peer over the still-alive WS so they tear down
-                // immediately instead of spending 15s × 5 reconnect attempts.
+                // immediately instead of waiting out the callAccepted timeout on
+                // every retry.
                 btnWs.isEnabled = false
                 uiScope.launch {
                     try {
