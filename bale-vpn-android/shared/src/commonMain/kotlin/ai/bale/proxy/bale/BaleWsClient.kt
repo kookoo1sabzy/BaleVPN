@@ -47,6 +47,12 @@ class BaleWsClient(
     @kotlin.concurrent.Volatile
     var onTokenExpired: (() -> Unit)? = null
 
+    /** Fired when the handshake response carries a different proto/api version
+     *  than this build expects — the app needs to be updated. Caller should
+     *  surface a non-relogin "please update" banner and not retry. */
+    @kotlin.concurrent.Volatile
+    var onVersionMismatch: (() -> Unit)? = null
+
     fun addOnCallEnded(cb: (Long) -> Unit): () -> Unit {
         callEndedListeners = callEndedListeners + cb
         return { callEndedListeners = callEndedListeners - cb }
@@ -69,6 +75,11 @@ class BaleWsClient(
     // the timer coroutine sees writes from the read coroutine without locking.
     @kotlin.concurrent.Volatile
     private var lastInboundTs = 0L
+    // Set by handleFrame's case=5 when the server reports an incompatible
+    // proto/api version. Read by the WS body's read loop (close + break) and
+    // by runLoop (fire callback + break the outer retry loop).
+    @kotlin.concurrent.Volatile
+    private var versionMismatchSeen = false
 
     fun connect() {
         log("[BaleProxy] BaleWsClient.connect() called")
@@ -97,6 +108,10 @@ class BaleWsClient(
             // of falling through to the 5 s delay — reconnecting with a dead token
             // would just spin forever.
             var tokenExpired = false
+            // Reset the version-mismatch flag at the top of each attempt — if the
+            // previous session ended for a different reason (network drop, etc.)
+            // we want a clean slate on the next attempt.
+            versionMismatchSeen = false
             try {
                 log("[BaleProxy] WS connecting to $WS_HOST...")
                 httpClient.webSocket(
@@ -138,6 +153,10 @@ class BaleWsClient(
                     for (frame in incoming) {
                         lastInboundTs = System.currentTimeMillis()
                         if (frame is Frame.Binary) handleFrame(frame.data)
+                        if (versionMismatchSeen) {
+                            close(CloseReason(CloseReason.Codes.PROTOCOL_ERROR, "version mismatch"))
+                            break
+                        }
                     }
                     liveness.cancel()
                     sender.cancel()
@@ -167,6 +186,10 @@ class BaleWsClient(
                 onTokenExpired?.invoke()
                 break
             }
+            if (versionMismatchSeen) {
+                onVersionMismatch?.invoke()
+                break
+            }
             if (scope.isActive) { log("[BaleProxy] WS reconnecting in 5s..."); delay(5_000) }
         }
         log("[BaleProxy] WS runLoop exiting")
@@ -182,7 +205,27 @@ class BaleWsClient(
                 2 -> handlePushContainer(r.bytes())
                 4 -> { r.bytes(); rawSend(encodePing()) } // pong
                 5 -> {
-                    r.bytes(); ready = true
+                    // Handshake response — parse proto+api version inline. The body
+                    // is a wrapped int32 + int64 inside a bytes field; we walk
+                    // those manually rather than pulling in a generated decoder
+                    // for one tiny struct.
+                    val body = r.bytes()
+                    var proto = 0; var api = 0L
+                    val br = ProtoReader(body)
+                    while (br.hasMore()) {
+                        val (bf, bw) = br.tag()
+                        when (bf) {
+                            1 -> proto = br.varint().toInt()
+                            2 -> api   = br.varint()
+                            else -> br.skip(bw)
+                        }
+                    }
+                    if (proto != PROTO_VERSION || api != API_VERSION) {
+                        log("[BaleProxy] WS version mismatch: server proto=$proto api=$api, expected proto=$PROTO_VERSION api=$API_VERSION")
+                        versionMismatchSeen = true
+                        return
+                    }
+                    ready = true
                     log("[BaleProxy] WS handshake complete — ready=true")
                     subscribeUpdates()
                     scope.launch { loadSelf() }

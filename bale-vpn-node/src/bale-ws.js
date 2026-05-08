@@ -67,6 +67,10 @@ class BaleWsClient {
         // Set when Bale closes the WS with code 4401 (their custom "Unauthenticated"
         // close code) — the token is dead. Cleared by connect() on next login.
         this.sessionExpired = false;
+        // Set when the server's handshake reports a different proto/api version
+        // than we know how to speak. Means the app needs to be updated; further
+        // reconnects to the same server will hit the same wall.
+        this.versionMismatch = false;
         this.subscribeIdx  = null;
         this.pending       = new Map();
         this.messages      = [];
@@ -116,8 +120,9 @@ class BaleWsClient {
     connect(token) {
         if (token) this.accessToken = token;
         if (!this.accessToken) throw new Error('No access token set');
-        // Clear the expired-session flag — a fresh login starts a new session.
-        this.sessionExpired = false;
+        // Clear transient flags — a fresh connect starts from a clean slate.
+        this.sessionExpired  = false;
+        this.versionMismatch = false;
         this.autoReconnect = true;
         this.connecting    = true;
         console.log(`[WS] Connecting to ${WS_URL}`);
@@ -205,7 +210,10 @@ class BaleWsClient {
                 this.loadSelf().catch(e => console.error('[Self] loadSelf failed:', e.message));
                 this.loadContacts().catch(e => console.error('[Contacts] loadContacts failed:', e.message));
             } else {
-                console.error('[WS] Version mismatch');
+                console.error(`[WS] Version mismatch: server proto=${hs.mkprotoVersion} api=${hs.apiVersion}, expected proto=${PROTO_VERSION} api=${API_VERSION}`);
+                this.versionMismatch = true;
+                this.autoReconnect   = false;     // stop the inner timer
+                if (this.ws) this.ws.close();     // shut down the dead session
             }
         }
 
