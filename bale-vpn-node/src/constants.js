@@ -41,14 +41,17 @@ const TUNNEL_PREFIX = 'T:';
 const CHUNK_SIZE    = 3000;   // bytes of raw data per Bale text message
 const LK_CHUNK      = 65536;  // bytes per WebRTC DataChannel message
 
-// Tunnel-manager reconnect parameters — match Android (5 attempts, 3s × n
-// back-off, max 30s).
-const TUNNEL_MAX_RECONNECT_ATTEMPTS = 5;
+// Tunnel-manager state machine timeouts — match Android.
+// Initial attempt: wait long enough for manual admission (server user has to tap "allow" in a notification).
+const CALL_ACCEPTED_TIMEOUT_MS = 90 * 1000;
+// Max wait for the peer to show up in the LK room after callAccepted.
+const PEER_TIMEOUT_MS          =  5 * 1000;
+// Server: max wait for the caller to actually join our LK room after we acceptCall.
+const PEER_JOIN_TIMEOUT_MS     =  5 * 1000;
 
 // Server-mode admission control timeouts.
 const PENDING_TIMEOUT_MS = 60 * 1000;
 const PENDING_SWEEP_MS   = 15 * 1000;
-const ESTABLISH_GRACE_MS = 8  * 1000;
 
 // Per-client TUN bandwidth caps (server mode) — match Android.
 // 300 kbps / 37500 bytes/sec, 1-second burst.
@@ -63,8 +66,8 @@ module.exports = {
     AUTH_APP_ID, AUTH_API_KEY, SENDCODE_SMS,
     PEERTYPE_PRIVATE, PEERTYPE_GROUP, EXPEERTYPE_PRIVATE, EXPEERTYPE_GROUP,
     TUNNEL_PREFIX, CHUNK_SIZE, LK_CHUNK,
-    TUNNEL_MAX_RECONNECT_ATTEMPTS,
-    PENDING_TIMEOUT_MS, PENDING_SWEEP_MS, ESTABLISH_GRACE_MS,
+    CALL_ACCEPTED_TIMEOUT_MS, PEER_TIMEOUT_MS, PEER_JOIN_TIMEOUT_MS,
+    PENDING_TIMEOUT_MS, PENDING_SWEEP_MS,
     DEFAULT_LIMIT_KBPS, MAX_LIMIT_KBPS, THROTTLE_FLAG_MS,
     RUNTIME_DIR,
     // Helpers

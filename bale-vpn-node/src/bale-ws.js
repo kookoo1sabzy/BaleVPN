@@ -44,6 +44,17 @@ const {
 const { decodeJwtPayload } = require('./grpc-web');
 const { TunnelManager } = require('./tunnel');
 
+// Friendly names for xC update field tags we don't decode into a typed
+// property. Anything in _unknownFields is one of these (or genuinely new).
+function _xcUpdateName(f) {
+    switch (f) {
+        case 19: return 'messageRead';      // someone read a message in our chat
+        case 50: return 'messageReadByMe';  // we read a message (sync to other clients)
+        case 85: return 'emptyUpdate';      // Bale stream heartbeat / sync marker
+        default: return `field=${f}`;
+    }
+}
+
 class BaleWsClient {
     /**
      * @param {{
@@ -99,6 +110,7 @@ class BaleWsClient {
         // cycles because they live on this singleton, not on each WebSocket session.
         this._onCallReceivedListeners = [];
         this._onCallEndedListeners    = [];
+        this._onCallAcceptedListeners = [];
     }
 
     addOnCallReceived(cb) {
@@ -114,6 +126,14 @@ class BaleWsClient {
         return () => {
             const i = this._onCallEndedListeners.indexOf(cb);
             if (i >= 0) this._onCallEndedListeners.splice(i, 1);
+        };
+    }
+
+    addOnCallAccepted(cb) {
+        this._onCallAcceptedListeners.push(cb);
+        return () => {
+            const i = this._onCallAcceptedListeners.indexOf(cb);
+            if (i >= 0) this._onCallAcceptedListeners.splice(i, 1);
         };
     }
 
@@ -215,7 +235,21 @@ class BaleWsClient {
         });
     }
 
+    // Friendly name for the inbound WS frame kind. Pong is intentionally
+    // omitted — it fires every heartbeat (~10s) and adds nothing diagnostic;
+    // the zombie-connection check is the meaningful liveness signal.
+    _frameKindName(frame) {
+        if (frame.handshakeResponse) return 'Handshake response';
+        if (frame.response)          return 'RPC response / push';
+        if (frame.update)            return 'Push update';
+        if (frame.terminateSession)  return 'Terminate session';
+        return null;  // pong or unknown — don't log
+    }
+
     _onFrame(frame) {
+        const kind = this._frameKindName(frame);
+        if (kind) console.log(`[WS] frame: ${kind}`);
+
         if (frame.handshakeResponse) {
             const hs = frame.handshakeResponse;
             console.log(`[WS] Handshake: proto=${hs.mkprotoVersion} api=${hs.apiVersion}`);
@@ -241,6 +275,9 @@ class BaleWsClient {
             if (cb) {
                 this.pending.delete(rpc.index);
                 clearTimeout(cb.timer);
+                const status = rpc.error ? 'ERR' : 'ok';
+                const sz     = (rpc.response?.length || 0);
+                console.log(`[WS] RPC ← ${cb.service}/${cb.method} idx=${rpc.index} ${status} ${sz}B (pending=${this.pending.size})`);
                 if (rpc.error) {
                     const { code, message } = decodeRpcError(Buffer.from(rpc.error));
                     const err = new Error(`${message} (RPC code ${code})`);
@@ -297,6 +334,8 @@ class BaleWsClient {
         let sub;
         try { sub = decodeSubscribeResponse(buf); } catch (e) { console.log('[Update] decode error:', e.message); return; }
         const update = sub.update;
+        if (sub.sequence  != null) console.log(`[Update] seq=${sub.sequence}`);
+        if (sub.timestamp != null) console.log(`[Update] timestamp=${sub.timestamp}`);
         if (!update) { console.log('[Update] no xC payload, buf len=', buf.length); return; }
 
         const type = update.message      ? 'message'
@@ -304,7 +343,7 @@ class BaleWsClient {
                    : update.callReceived ? 'callReceived'
                    : update.callAccepted ? 'callAccepted'
                    : update.callEnded    ? 'callEnded'
-                   : update._unknownFields ? `unknown(fields=${update._unknownFields.join(',')})`
+                   : update._unknownFields ? `unknown(${update._unknownFields.map(_xcUpdateName).join(',')})`
                    : 'unknown';
 
         if (update.callStarted || update.callReceived) {
@@ -320,6 +359,10 @@ class BaleWsClient {
         } else if (update.callAccepted) {
             const callId = update.callAccepted?.call?.id;
             console.log(`[Update] callAccepted  callId=${callId}`);
+            for (const cb of this._onCallAcceptedListeners.slice()) {
+                try { cb(callId); }
+                catch (e) { console.error('[Update] onCallAccepted subscriber threw:', e.message); }
+            }
         } else if (update.callEnded) {
             const callId = update.callEnded.callId;
             console.log(`[Update] callEnded  callId=${callId}`);
@@ -369,7 +412,11 @@ class BaleWsClient {
             if (!this.ready) return reject(new Error('Not connected'));
             const idx   = ++this.rpcIndex;
             const timer = setTimeout(() => { this.pending.delete(idx); reject(new Error('Timeout')); }, 15_000);
+            // service/method recorded so the response handler can name what
+            // just landed in the log instead of just the opaque idx.
             this.pending.set(idx, {
+                service: serviceName,
+                method,
                 resolve: (buf) => { clearTimeout(timer); resolve(buf); },
                 reject:  (e)   => { clearTimeout(timer); reject(e); },
                 timer,
@@ -378,18 +425,17 @@ class BaleWsClient {
         });
     }
 
+    // Returns the display name for a Bale user ID, or null if unknown. Uses
+    // Users/LoadUsers with accessHash=0 — same RPC and parsing as loadSelf().
+    // The caller might not be in our contacts list (server-mode use case), so
+    // we don't depend on GetContacts. UserEntity name is preferred; falls back
+    // to nick. Cache holds both hits and misses so a stranger we already
+    // queried doesn't re-trigger the RPC.
     async lookupContactName(uid) {
         const n = Number(uid);
         if (!n || n <= 0) return null;
-        if (!this.peers.length) {
-            try { await this.loadContacts(); } catch (_) {}
-        }
-        const hit = this.peers.find(p => Number(p.id) === n);
-        if (hit) return hit.name;
-        // Strangers (callers not in our contact list) — resolve via LoadUsers
-        // and memoize. Same RPC loadSelf uses. Cached entries survive WS
-        // reconnect since uid→name doesn't change.
         if (this._userNameCache.has(n)) return this._userNameCache.get(n);
+        let name = null;
         try {
             const buf = await this._rpcCall(
                 'bale.users.v1.Users', 'LoadUsers',
@@ -398,13 +444,13 @@ class BaleWsClient {
             const loaded = decodeLoadUsersResponse(buf);
             if (loaded.users.length) {
                 const u = decodeUserEntity(loaded.users[0]);
-                const name = u.name || u.nick || null;
-                this._userNameCache.set(n, name);
-                return name;
+                name = u.name || u.nick || null;
             }
-        } catch (e) { console.warn('[Caller] LoadUsers failed for uid=' + n + ':', e.message); }
-        this._userNameCache.set(n, null);  // negative cache so we don't retry repeatedly
-        return null;
+        } catch (e) {
+            console.warn(`[lookupContactName] uid=${n} RPC failed: ${e.message}`);
+        }
+        this._userNameCache.set(n, name);
+        return name;
     }
 
     async loadSelf() {
