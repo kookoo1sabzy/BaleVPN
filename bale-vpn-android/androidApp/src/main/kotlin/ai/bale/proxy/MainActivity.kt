@@ -227,6 +227,17 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() { uiScope.cancel(); super.onDestroy() }
 
     private fun tick() {
+        // Bale rejected our token (4401 close or 401/403 on upgrade). Clearing
+        // the flag here so we don't re-route on the next tick if the user
+        // navigates back.
+        if (BaleConnection.sessionExpired) {
+            BaleConnection.sessionExpired = false
+            Toast.makeText(this, "Session expired — please log in again", Toast.LENGTH_LONG).show()
+            startActivity(Intent(this, PhoneAuthActivity::class.java))
+            finishAffinity()
+            return
+        }
+
         val mode           = prefs.getString("mode", "client") ?: "client"
         val wsReady        = BaleConnection.isReady
         val serviceRunning = BaleVpnService.isRunning || BaleServerService.isRunning
