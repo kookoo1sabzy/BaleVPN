@@ -82,6 +82,12 @@ class BaleWsClient {
         // than we know how to speak. Means the app needs to be updated; further
         // reconnects to the same server will hit the same wall.
         this.versionMismatch = false;
+        // RPC idx of the SubscribeToUpdates request, recorded so we can
+        // recognise its server-side responses and quietly ignore the routine
+        // 30 s `code=4 DEADLINE_EXCEEDED` end-of-stream marker. We don't
+        // re-subscribe: realtime events flow on WS frame field 2 (the
+        // standalone Push update channel) independent of this RPC, so a
+        // fresh subscribe wouldn't add anything. See _onFrame for details.
         this.subscribeIdx  = null;
         this.pending       = new Map();
         this.messages      = [];
@@ -286,17 +292,21 @@ class BaleWsClient {
                     cb.resolve(rpc.response || new Uint8Array(0));
                 }
             } else if (rpc.index === this.subscribeIdx && (rpc.error || !rpc.response)) {
-                // Bale's server enforces a 30 s deadline on SubscribeToUpdates
-                // and ends with code 4 (DEADLINE_EXCEEDED) on schedule — the
-                // web app does the same and re-subscribes via retry(). Silent
-                // for the routine rotation; loud for any other failure so
-                // genuine problems still surface.
+                // SubscribeToUpdates RPC ended. Routine — Bale's server hits
+                // its 30 s deadline waiting for our request-side EOF (which
+                // our WS-multiplexed transport can't send, unlike gRPC-web)
+                // and closes with `code=4 DEADLINE_EXCEEDED`. We do NOT
+                // re-subscribe: realtime events flow on WS field 2 (the
+                // standalone Push update channel) independently of this RPC,
+                // so a fresh subscribe wouldn't add anything. Loud only if
+                // the close reason is something other than `code=4`, so a
+                // genuine failure (auth, malformed, protocol change) still
+                // surfaces.
                 const errInfo = rpc.error ? decodeRpcError(Buffer.from(rpc.error)) : { code: 0, message: 'complete' };
                 const isRotation = errInfo.code === 4 && !rpc.response;
                 if (!isRotation) {
-                    console.log(`[WS] subscribe stream ended (idx=${rpc.index} code=${errInfo.code} message="${errInfo.message}") — re-subscribing`);
+                    console.log(`[WS] subscribe stream ended unexpectedly (idx=${rpc.index} code=${errInfo.code} message="${errInfo.message}")`);
                 }
-                this._subscribe();
             } else if (rpc.response) {
                 this._processUpdate(rpc.response);
             }
