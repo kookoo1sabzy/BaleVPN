@@ -99,6 +99,31 @@ UserEntity field 3 (`name`) is preferred; falls back to field 9 (`nick`, wrapped
 
 The result is used to label notifications/logs (e.g. `Joe (12345) connected`, `Joe wants to connect`). The Android server caches the resolved name on the `Client` object as `resolvedName` so disconnect notifications can show the same name even if the WS is being torn down at that moment.
 
+**User vs FullUser:** `LoadUsers` returns the lightweight `User` entity — id, name, nick, accessHash. The phone number lives on `FullUser` (separate `LoadFullUsers` RPC), inside a repeated `contactInfo` field at User-encoder field 17 / FullUser-encoder field 2. Each `ContactInfo` entry has `{f1 type int32 enum, f2 stringValue wrapped string, f3 longValue Int64Value}`; we extract the entry whose `type == CONTACTTYPE_PHONE` (enum value 0, the proto3 default), preferring `stringValue` (Bale pre-formats as `+989…`) over the raw `longValue`. The contacts-list batch loader fans out `LoadUsers` and `LoadFullUsers` in parallel via `coroutineScope { async { … } async { … } }` and merges phones into the User entities by uid before returning.
+
+### Contacts lazy load + cache (`ContactsActivity` / `UserCache`)
+
+The contacts screen (both `MODE_PICK` and `MODE_MANAGE`) renders large contact lists incrementally:
+
+1. **`getContactPeers()`** — single cheap `GetContacts` RPC, returns peer refs (uid + accessHash) and any inline UserEntities Bale chose to send.
+2. **Cache lookup** — for each peer ref, `UserCache[uid]` is consulted. Cache hit + accessHash match → use cached entity (`loaded = true`). Cache miss or accessHash mismatch → placeholder entity (`loaded = false`).
+3. **First-batch fetch** — placeholders queue into `pendingPeers`; the first 30 are fanned out via `loadUsersBatch` (parallel `LoadUsers` + `LoadFullUsers` → merge phones).
+4. **Scroll-triggered batches** — a `RecyclerView.OnScrollListener` fires `loadMoreBatch()` when the user is within `PREFETCH_AHEAD = 10` rows of the next placeholder. Footer "Loading more…" indicator visible only while a batch is in flight.
+5. **Unresolved fillers** — uids that LoadUsers didn't return (deleted accounts, blocked, server-side miss) are turned into "loaded but empty" entries so they don't spin "Loading…" indefinitely; cached as well so they don't re-fetch.
+
+`UserCache` (singleton, `androidApp/src/main/kotlin/.../UserCache.kt`) is an in-memory `Map<Int, UserEntity>` mirroring `${context.cacheDir}/user_cache.json`. Reads are lazy (loaded on first `init`), writes are debounced 300 ms after the last `putAll`. Atomic-ish disk writes via temp-file + rename. Persists across app launches; cleared by `Settings → Apps → Clear cache` or `adb shell run-as <pkg> rm cache/user_cache.json`.
+
+**accessHash invalidation:** Bale issues a fresh accessHash whenever a user's profile / relationship / privacy changes server-side. Comparing the cached entry's accessHash against the fresh peer-ref accessHash from `GetContacts` gives single-row invalidation: matching → cache hit → instant render; mismatching → placeholder + lazy-fetch on the next batch. So second-launch is "instant for everyone unchanged, lazy for everyone changed", with no global cache wipe ever needed.
+
+**Adapter row layout** (`item_contact.xml` — name / @nick / phone / ID, each on its own line):
+```
+John Doe                                     ← bold, full opacity (tvName)
+@johndoe                                     ← gray (tvNick), hidden if no nick
++989121234567                                ← gray (tvPhone), hidden if no phone
+ID: 12345                                    ← gray (tvId), always shown
+```
+Phone is normalised to E.164 by `formatPhone`: prepends `+` if Bale returned bare digits.
+
 ### Wire protocol (custom binary, not gRPC-web)
 Frames are hand-rolled protobuf over WebSocket. Field assignments:
 
@@ -119,6 +144,39 @@ Real-time updates flow via `bale.maviz.v1.MavizStream.SubscribeToUpdates` (empty
 - field 52808 (tag 422466) = `callAccepted` `{ call: CallEntity, participants[] }`
 - field 52809 (tag 422474) = `callEnded` — payload is a wrapped `CallEntity` (the inner `f1` length-delimited contains the entity, whose `f1` varint is the `callId`). Both peers receive this when a call terminates.
 - field 52810 (tag 422482) = `callReceived` `{ callId int64, participants[] }` — alternative incoming call notification
+
+`SubscribeResponse` envelope around the union: f1=update (xC), f2=routeId, f3=sequence, f4=timestamp, f5=weakEvent, f6=mtupdate, f7=updates. Bale fans out `weakEvent` heartbeats every ~4 s with no `update` payload — they double as keep-alives and "user X did Y" broadcasts (`{header, body, userIds, groupIds}`). The web-app dispatcher splits the stream: events with `update` go to a sequenced channel (gap-detected, gap-filled via `GetDifference`); events with only `weakEvent` go to an unsequenced broadcast channel.
+
+### Subscribe stream lifecycle (30 s rotation)
+
+Bale's server enforces a **hard 30 s deadline** on `SubscribeToUpdates` and ends each stream with gRPC `code=4 ("context deadline exceeded")` on schedule. The client is expected to immediately re-subscribe — the web app does this via `retry({initialInterval: 1s, maxInterval: 5s, maxRetries: 10000, resetOnSuccess: true})` wrapped around an RxJS observable. Both our Node and Android clients track the active `subscribeIdx` (the RPC index of the in-flight subscribe) and re-subscribe when an RPC frame for that index arrives with either an error or no payload.
+
+Behaviour:
+- Routine `code=4` rotation → silent re-subscribe.
+- Any other error code, or empty completion → loud log line (`subscribe stream ended (idx=N code=X message="…") — re-subscribing`) so genuine failures (auth, malformed request, etc.) surface.
+- Without re-subscribe, the WS itself stays open (heartbeats keep flowing on a different mechanism) but `update` events stop arriving — `callReceived` etc. silently disappear after 30 s.
+
+We do **not** call `GetDifference` after re-subscribing (the web app does, to backfill events missed during the rotation window). For real-time call detection that's irrelevant — the new subscribe picks up future calls. Worth wiring if you ever need to reconcile missed messages or read receipts.
+
+### WS log discipline
+
+Steady-state WS traffic (Bale heartbeats, push updates, the 30 s subscribe rotation, our pings/pongs) is intentionally silent in both clients. The principle is "logs surface deviations, not normality":
+
+| Silent | Loud |
+|---|---|
+| `weakEvent` / `seq` / `timestamp` / pong | `Terminate session` push |
+| `Push update` frame wrapper | `Handshake response` |
+| Subscribe rotation (`code=4`) | Subscribe end with any other code |
+| `messageRead` / `messageReadByMe` / `emptyUpdate` | Genuinely unknown xC tag |
+| `newMessage` for tunnel SOCKS5 frames | Genuine inbound chat message |
+| RPC dispatch when matched | RPC error reply (decoded code + message) |
+| Idle ≤ 15 s | Idle > 15 s (`no inbound, sending ping`) |
+| WS open and active | Idle > 30 s (`closing zombie connection`) + reconnect |
+| Per-event timestamps | callStarted/Accepted/Ended/Received |
+
+`decodeRpcError` (BaleWsClient and `wire-codecs.js`) parses Bale's RPC error envelope — `{f1 code int32, f2 message string}` — so failed RPCs log a useful `code=N message="…"` instead of opaque bytes.
+
+Liveness is detected purely by inbound activity: any frame (RPC reply, push, weakEvent, pong) updates `lastInboundTs`. The 10 s ping coroutine warns at >15 s idle, force-closes at >30 s. Reconnect runs forever with a 5 s delay between attempts; only a 4401 close code or a version mismatch breaks the loop (token expired / app needs update).
 
 ### Authentication
 - Auth uses the `access_token` JWT cookie scoped to `.bale.ai`.
@@ -318,14 +376,18 @@ gRPC-web framing: 5-byte prefix `[0x00][4B big-endian length]` for data frames; 
 
 `ContactRepository` uses gRPC-web (no WebSocket). Operations:
 
-| Method | RPC | Notes |
+| Method | RPC(s) | Notes |
 |--------|-----|-------|
-| `getContacts()` | `GetContacts` → `LoadUsers` (two-step) | full contact list; `accessHash` from peer refs is merged onto each `UserEntity` since `LoadUsers` responses don't carry it |
+| `getContactPeers()` | `GetContacts` | cheap one-RPC; returns `(peers: List<UserPeerRef>, inlineUsers: List<UserEntity>)`. Used by the lazy loader. |
+| `loadUsersBatch(peers)` | `LoadUsers` + `LoadFullUsers` (parallel) | identity from `LoadUsers`, phones from `LoadFullUsers.contactInfo`; merged by uid. Used per scroll-triggered batch. |
+| `getContacts()` | full delegation: `getContactPeers()` + `loadUsersBatch(peers)` if any | eager load — all entities in one shot. Kept for non-paginated callers. |
 | `searchByName(q)` | `Users/SearchContacts` | name substring search within existing contacts |
 | `searchByPhone(q)` | `Users/ImportContacts` | phone-number lookup; **also adds the user as a contact** |
 | `removeContact(user)` | `Users/RemoveContact` | wire payload `{uid int32 = 1, accessHash int64 = 2}` — both required |
 
-`UserEntity(id, name, nick, phone, accessHash)` — `displayName` = name ?: nick ?: id; `peerType` = 1 (private). The `accessHash` field is required by `AddContact` / `RemoveContact` and is decoded from field 2 of the User struct in `LoadUsers` responses; for results that came in via a `UserPeer` ref the hash is merged from there so every `UserEntity` carries an authoritative hash.
+`UserEntity(id, name, nick, phone, accessHash, loaded)` — `displayName` = name ?: nick ?: id; `peerType` = 1 (private). `accessHash` is required by `AddContact` / `RemoveContact` and merged from peer refs (`LoadUsers` responses don't carry it). `loaded` is the lazy-load placeholder flag — false rows render "Loading…" with `alpha=0.5` and ignore taps.
+
+`UserPeerRef(uid, accessHash)` — public peer-ref struct in `Models.kt`, the input to `LoadUsers` / `LoadFullUsers` / `RemoveContact`.
 
 **ContactsActivity modes** (intent extra `EXTRA_MODE`):
 - `MODE_PICK` (default) — client-mode peer picker. Tap a contact → save to peer prefs + `finish()`. FAB opens a phone-only search via `SearchView`; results are tap-to-select. Hint placeholder `+98912…`.
@@ -378,6 +440,8 @@ Two paths bypass reconcile because they need WS up *while the rule says down*:
 **WS multi-subscriber**: `BaleConnection.disconnect()` does NOT clear `onCallReceived` / `onCallEnded` — those subscriptions belong to `BaleServerService` and survive WS disconnect→reconnect cycles. The server's lambdas always look up `instance` from the companion at fire time, so they're safe even when no service is registered (they log a warning and return). `BaleWsClient.addOnCallEnded(cb)` returns a remover lambda; `TunnelManager` (client mode) and `BaleConnection`'s server-mode fan-out subscribe independently and neither overwrites the other.
 
 **About dialog**: action-bar overflow → "About" — shows the project motto, contact email (`mailto:` link), and `versionName (versionCode)` from `PackageManager`.
+
+**View app logs** (BaseActivity overflow item): runs `logcat -d -t 500 BaleProxy:V BaleVPN:V ContactsActivity:V UserCache:V *:S` so the dialog only shows our own log tags. The trailing `*:S` silences every other tag — without it, framework UI noise (`TextView`, `ImeTracker`, `InsetsController`, `WindowOnBackDispatcher`, `ActivityThread`, etc.) would dominate the output. When adding a new log-tag in code, append it to the `arrayOf` in `BaseActivity.readLogs()` so it stays visible in the dialog.
 
 **Main-loop crash recovery** (`BaleApp.installMainLoopCrashRecovery`): a posted `Runnable` wraps `Looper.loop()` in `while (true) { try { … } catch { log } }`. Belt-and-suspenders for unhandled coroutine exceptions on the Main dispatcher — notably the LiveKit SDK's `CommunicationWorkaroundImpl` can throw `UnsupportedOperationException` when `AudioFlinger` runs out of tracks during reconnect storms (status -12 = ENOMEM). The throttle in `BaleServerService` is the actual fix; this handler keeps the app alive if it ever leaks through.
 
