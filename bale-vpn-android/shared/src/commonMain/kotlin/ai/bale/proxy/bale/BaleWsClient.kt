@@ -113,6 +113,12 @@ class BaleWsClient(
     // the timer coroutine sees writes from the read coroutine without locking.
     @kotlin.concurrent.Volatile
     private var lastInboundTs = 0L
+    // Consecutive-failed-reconnect counter; drives the exponential back-off
+    // in `runLoop`. Reset to 0 the moment the handshake completes — a clean
+    // session shouldn't penalise a future, unrelated drop. With base=3s and
+    // cap=30s the effective wait progression is 3s → 6s → 12s → 24s → 30s.
+    @kotlin.concurrent.Volatile
+    private var reconnectAttempt = 0
     // RPC idx of the SubscribeToUpdates request, recorded so we can recognise
     // its server-side responses and quietly ignore the routine 30 s
     // `code=4 DEADLINE_EXCEEDED` end-of-stream marker.
@@ -266,7 +272,19 @@ class BaleWsClient(
                 onVersionMismatch?.invoke()
                 break
             }
-            if (scope.isActive) { log("[BaleProxy] WS reconnecting in 5s..."); delay(5_000) }
+            if (scope.isActive) {
+                // Exponential back-off: 3s, 6s, 12s, 24s, then capped at 30s.
+                // Counter resets to 0 on a successful handshake (above), so a
+                // healthy long-running session that drops once won't start at
+                // a long delay. Bounded delay avoids hammering Bale's gateway
+                // when it's genuinely down (e.g., the ECONNREFUSED clusters
+                // we've seen during operator outages).
+                val attempt = reconnectAttempt
+                val delaySec = (3L shl attempt.coerceAtMost(4)).coerceAtMost(30L)
+                reconnectAttempt = attempt + 1
+                log("[BaleProxy] WS reconnecting in ${delaySec}s (attempt ${attempt + 1})")
+                delay(delaySec * 1000)
+            }
         }
         log("[BaleProxy] WS runLoop exiting")
     }
@@ -332,6 +350,7 @@ class BaleWsClient(
                         return
                     }
                     ready = true
+                    reconnectAttempt = 0   // healthy session, reset back-off
                     log("[BaleProxy] WS handshake complete — ready=true")
                     subscribeUpdates()
                     scope.launch { loadSelf() }
