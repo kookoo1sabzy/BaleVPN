@@ -20,13 +20,32 @@ private const val WS_PATH       = "/ws/"
 private const val PROTO_VERSION = 1
 private const val API_VERSION   = 151668L
 
+/** Full Bale CallEntity (codec `Je` / `A`, web-bundle module 23186). Field
+ *  numbers verified against `index.52867891.js`'s encoder. We capture every
+ *  documented field so callers can introspect a call's full state — most
+ *  fields are unused by our VPN-tunnel logic but cheap to keep around and
+ *  useful for diagnostics / future features.
+ *
+ *  - `token` is only populated on the AcceptCall reply (callStarted /
+ *    callReceived broadcasts omit it for privacy).
+ *  - `callerId` is the int32 `adminUid` (f8). On the callee side this is
+ *    the *other party*; field 9 (`peer`) decodes to self and is intentionally
+ *    not read for callerId.
+ *  - `discardReason` is only set on callEnded; values mirror Bale's enum
+ *    (caller hangup / busy / timeout / declined / network / …).
+ */
 data class CallEntity(
-    val callId:    Long,
-    val token:     String,
-    val room:      String,
-    val url:       String,
-    val isLivekit: Boolean,
-    val callerId:  Long = 0L,  // caller's Bale user ID, extracted from push participants if available
+    val callId:        Long,
+    val token:         String,
+    val room:          String,
+    val url:           String,
+    val isLivekit:     Boolean,
+    val callerId:      Long    = 0L,
+    val video:         Boolean = false,
+    val createDate:    Long    = 0L,
+    val startDate:     Long    = 0L,
+    val duration:      Int     = 0,
+    val discardReason: Int     = 0,
 )
 
 class BaleWsClient(
@@ -143,6 +162,12 @@ class BaleWsClient(
     // by runLoop (fire callback + break the outer retry loop).
     @kotlin.concurrent.Volatile
     private var versionMismatchSeen = false
+    // Periodic `Presence/SetOnline` keep-alive job. Spawned by
+    // startSetOnlineLoop() on every successful handshake; cancelled
+    // implicitly when the runLoop coroutine ends (scope is cancelled). The
+    // ref is kept so a late re-handshake can cancel any leftover loop from
+    // the previous session before starting a fresh one.
+    private var setOnlineJob: Job? = null
 
     fun connect() {
         log("[BaleProxy] BaleWsClient.connect() called")
@@ -353,6 +378,7 @@ class BaleWsClient(
                     reconnectAttempt = 0   // healthy session, reset back-off
                     log("[BaleProxy] WS handshake complete — ready=true")
                     subscribeUpdates()
+                    startSetOnlineLoop()
                     scope.launch { loadSelf() }
                 }
                 else -> r.skip(w)
@@ -379,7 +405,13 @@ class BaleWsClient(
         }
         if (entry != null) {
             val errMsg = errBytes?.let { decodeRpcError(it) }
-            log("[BaleProxy] WS RPC ← ${entry.service}/${entry.method} idx=$idx ${if (err) "ERR ($errMsg)" else "ok"} ${payload?.size ?: 0}B (pending=$sizeAfter)")
+            // SetOnline fires every 90 s and the routine "ok 0B" reply is
+            // pure noise. Suppress its success log; errors still log so a
+            // server-side rejection surfaces.
+            val isRoutineKeepAlive = entry.method == "SetOnline" && !err
+            if (!isRoutineKeepAlive) {
+                log("[BaleProxy] WS RPC ← ${entry.service}/${entry.method} idx=$idx ${if (err) "ERR ($errMsg)" else "ok"} ${payload?.size ?: 0}B (pending=$sizeAfter)")
+            }
             if (err) entry.deferred.completeExceptionally(Exception("RPC error: $errMsg"))
             else     entry.deferred.complete(payload ?: ByteArray(0))
         } else if (idx == subscribeIdx && (err || payload == null)) {
@@ -409,17 +441,26 @@ class BaleWsClient(
      *  (auth failure, malformed request, network blip presented as a code)
      *  is a real failure worth logging. */
     private fun isExpectedSubscribeRotation(errBytes: ByteArray?, payload: ByteArray?): Boolean {
-        if (errBytes == null) return false
+        if (errBytes == null || payload != null) return false
         val r = ProtoReader(errBytes)
         var code = 0
+        var message = ""
         while (r.hasMore()) {
             val (f, w) = r.tag()
             when (f) {
-                1 -> code = r.varint().toInt()
+                1 -> code    = r.varint().toInt()
+                2 -> message = r.string()
                 else -> r.skip(w)
             }
         }
-        return code == 4 && payload == null
+        // code 4 (DEADLINE_EXCEEDED) — Bale's deadline timer fired waiting for
+        //   our (impossible-over-WS) request-side EOF.
+        // code 2 (UNKNOWN) with the gRPC "want <EOF>" string — same root cause,
+        //   server gave up earlier instead of waiting for the deadline.
+        // Both are transport-level artefacts, not real failures: the realtime
+        // event stream (WS field 2) is unaffected.
+        return code == 4 ||
+               (code == 2 && message.contains("want <EOF>"))
     }
 
     /** Bale RPC error envelope: { f1 code int32, f2 message string }. Falls
@@ -488,10 +529,12 @@ class BaleWsClient(
             when (f) {
                 52807 -> {
                     val raw = r.bytes()
-                    log("[BaleProxy] WS callStarted raw: ${dumpFields(raw)}")
-                    parseCallResponse(raw)?.let {
-                        log("[BaleProxy] WS callStarted callId=${it.callId} isLivekit=${it.isLivekit} callerId=${it.callerId}")
-                        onCallReceived(it.callId, it)
+                    val resp = parseCallResponse(raw)
+                    if (resp != null) {
+                        log("[BaleProxy] WS callStarted ${formatCall(resp)}")
+                        onCallReceived(resp.callId, resp)
+                    } else {
+                        log("[BaleProxy] WS callStarted (couldn't parse ${raw.size}B): ${dumpFields(raw)}")
                     }
                 }
                 52808 -> {
@@ -501,19 +544,26 @@ class BaleWsClient(
                     // an empty room and waiting hopefully.
                     val raw = r.bytes()
                     parseCallResponse(raw)?.let {
-                        log("[BaleProxy] WS callAccepted callId=${it.callId} isLivekit=${it.isLivekit} callerId=${it.callerId}")
+                        log("[BaleProxy] WS callAccepted ${formatCall(it)}")
                         fireCallAccepted(it.callId)
                     } ?: log("[BaleProxy] WS callAccepted (couldn't parse body)")
                 }
                 52809 -> {
                     val raw = r.bytes()
                     val callId = parseCallId(raw)
-                    log("[BaleProxy] WS callEnded callId=$callId raw: ${dumpFields(raw)}")
+                    // callEnded uses a wrapped CallEntity — the inner f1 is the
+                    // entity. Try to parse it for discardReason / duration; fall
+                    // back to bare callId if the wrapper trips us up.
+                    val entity = runCatching { parseCallEnded(raw) }.getOrNull()
+                    if (entity != null) {
+                        log("[BaleProxy] WS callEnded ${formatCall(entity)}")
+                    } else {
+                        log("[BaleProxy] WS callEnded callId=$callId")
+                    }
                     if (callId != 0L) fireCallEnded(callId)
                 }
                 52810 -> {
                     val raw = r.bytes()
-                    log("[BaleProxy] WS callReceived raw: ${dumpFields(raw)}")
                     val (callId, callerId) = parseCallReceived(raw)
                     log("[BaleProxy] WS callReceived callId=$callId callerId=$callerId")
                     if (callId != 0L) onCallReceived(callId,
@@ -532,6 +582,39 @@ class BaleWsClient(
                 }
             }
         }
+    }
+
+    /** callEnded payload is a wrapper around a CallEntity at field 1
+     *  (length-delimited). Pull the entity out and decode it via the same
+     *  parseCallEntity used for callStarted/Accepted, so discardReason /
+     *  duration / callerId are populated. Returns null if the shape isn't
+     *  the wrapped form (older payloads carried just the bare callId). */
+    private fun parseCallEnded(buf: ByteArray): CallEntity? {
+        val r = ProtoReader(buf)
+        while (r.hasMore()) {
+            val (f, w) = r.tag()
+            if (f == 1 && w == 2) return parseCallEntity(r.bytes())
+            r.skip(w)
+        }
+        return null
+    }
+
+    /** One-line summary of a CallEntity, for [BaleProxy] log lines. Includes
+     *  every field that's likely to vary by event — callId is mandatory; the
+     *  rest are skipped when at their proto3 default so a callStarted log
+     *  doesn't include `discardReason=0` etc. */
+    private fun formatCall(c: CallEntity): String = buildString {
+        append("callId=${c.callId}")
+        if (c.callerId != 0L)      append(" callerId=${c.callerId}")
+        if (c.isLivekit)           append(" livekit")
+        if (c.video)               append(" video")
+        if (c.room.isNotEmpty())   append(" room=${c.room}")
+        if (c.url.isNotEmpty())    append(" url=${c.url}")
+        if (c.token.isNotEmpty())  append(" token=${c.token.take(20)}…")
+        if (c.createDate != 0L)    append(" created=${c.createDate}")
+        if (c.startDate != 0L)     append(" started=${c.startDate}")
+        if (c.duration != 0)       append(" duration=${c.duration}s")
+        if (c.discardReason != 0)  append(" discardReason=${c.discardReason}")
     }
 
     // callEnded can carry callId either as a bare varint (field 1) or wrapped inside a
@@ -610,23 +693,42 @@ class BaleWsClient(
     fun parseCallEntity(buf: ByteArray): CallEntity {
         val r = ProtoReader(buf)
         var id = 0L; var token = ""; var room = ""; var url = ""; var lk = false; var callerId = 0L
+        var video = false; var createDate = 0L; var startDate = 0L
+        var duration = 0; var discardReason = 0
         while (r.hasMore()) {
             val (f, w) = r.tag()
             when (f) {
-                1  -> id    = r.varint()
-                2  -> token = r.string()
-                3  -> room  = r.string()
-                4  -> url   = parseWrapped(r.bytes())
-                // field 8 = adminUid (call initiator). For server-mode incoming calls
-                // this is the *caller*; field 9 ("peer") is the other party in the call
-                // ref, which from the callee's perspective is SELF — using it would
-                // give us our own uid back as the callerId.
-                8  -> callerId = r.varint()
-                12 -> lk    = r.varint() != 0L
+                1  -> id            = r.varint()
+                2  -> token         = r.string()
+                3  -> room          = r.string()
+                4  -> url           = parseWrapped(r.bytes())
+                5  -> video         = r.varint() != 0L
+                6  -> createDate    = r.varint()
+                7  -> startDate     = r.varint()
+                // field 8 = adminUid (call initiator). For server-mode incoming
+                // calls this is the *caller*; field 9 (`peer`) is the
+                // other-party-in-the-ref, which from the callee's perspective
+                // decodes to SELF — using it would give us our own uid back.
+                8  -> callerId      = r.varint()
+                10 -> duration      = r.varint().toInt()
+                11 -> discardReason = r.varint().toInt()
+                12 -> lk            = r.varint() != 0L
                 else -> r.skip(w)
             }
         }
-        return CallEntity(id, token, room, url, lk, callerId)
+        return CallEntity(
+            callId        = id,
+            token         = token,
+            room          = room,
+            url           = url,
+            isLivekit     = lk,
+            callerId      = callerId,
+            video         = video,
+            createDate    = createDate,
+            startDate     = startDate,
+            duration      = duration,
+            discardReason = discardReason,
+        )
     }
 
     private fun parseWrapped(buf: ByteArray): String {
@@ -662,6 +764,36 @@ class BaleWsClient(
         val idx = stateMutex.withLock { rpcIdx++ }
         subscribeIdx = idx
         sendCh.trySend(encodeRpc("bale.maviz.v1.MavizStream", "SubscribeToUpdates", ByteArray(0), idx))
+    }
+
+    /** Periodic `bale.presence.v1.Presence/SetOnline(isOnline=true, timeout=90s)`
+     *  — Bale's server-side presence keep-alive. Without it the server marks
+     *  the user offline after the previous timeout window expires and stops
+     *  delivering call/message events to this session. The web app does the
+     *  same: 90 s interval, 90 s declared-online timeout.
+     *
+     *  Cancelled when the WS closes (job is cancelled along with the runLoop's
+     *  child scope); restarted on the next successful handshake. The first
+     *  call fires immediately so we don't have a 90 s grace window where the
+     *  server might consider us offline. */
+    private fun startSetOnlineLoop() {
+        setOnlineJob?.cancel()
+        setOnlineJob = scope.launch {
+            // SetOnlineRequest { f1 isOnline=true, f2 timeout=90000 }
+            val payload = ProtoWriter().int32(1, 1).int64(2, 90_000L).build()
+            while (isActive && ready) {
+                // Fire-and-forget — don't let a slow / failed reply hold up
+                // the 90 s cadence. Each call gets its own child coroutine
+                // so the loop can immediately fall through to delay(90_000).
+                // Cancellation propagates from the parent setOnlineJob, so
+                // any in-flight call is cleaned up when the WS drops.
+                launch {
+                    try { rpcCall("bale.presence.v1.Presence", "SetOnline", payload) }
+                    catch (e: Exception) { log("[BaleProxy] SetOnline failed: ${e.message}") }
+                }
+                delay(90_000)
+            }
+        }
     }
 
     private fun rawSend(data: ByteArray) { sendCh.trySend(data) }

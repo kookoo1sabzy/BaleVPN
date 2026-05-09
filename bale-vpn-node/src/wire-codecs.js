@@ -420,28 +420,44 @@ function decodeCallEnded(buf) {
     return o;
 }
 
-// Call entity (A / Je codec, module 23186):
-//   field 1  (tag  8): id          int64 string
-//   field 2  (tag 18): token        string  (LiveKit JWT)
-//   field 3  (tag 26): room         string  (LiveKit room name)
-//   field 4  (tag 34): url          wrapped-string  (LiveKit server URL)
-//   field 8  (tag 64): adminUid     int32   (call initiator → callerId on the callee)
-//   field 12 (tag 96): isLivekit    bool
+// Call entity (A / Je codec, module 23186 — verified against the encoder
+// in `index.52867891.js`). Full field map:
+//   field  1 (tag   8): id                       int64    callId
+//   field  2 (tag  18): token                    string   LiveKit JWT (only on AcceptCall reply)
+//   field  3 (tag  26): room                     string   LiveKit room name
+//   field  4 (tag  34): url                      wrapped-string  LiveKit server URL
+//   field  5 (tag  40): video                    bool     video call flag
+//   field  6 (tag  48): createDate               int64    ms-epoch when call was created
+//   field  7 (tag  56): startDate                int64    ms-epoch when call actually started
+//   field  8 (tag  64): adminUid                 int32    caller (= callerId on the callee side)
+//   field  9 (tag  74): peer                     sub-msg  {type, id} other-party ref — decodes to self on the callee, intentionally ignored
+//   field 10 (tag  80): duration                 int32    seconds (set when call ends)
+//   field 11 (tag  88): discardReason            int32    enum (set when call ends)
+//   field 12 (tag  96): isLivekit                bool
+//   field 13 (tag 106): discardServiceMessageRid sub-msg
+//   field 14 (tag 114): discardServiceMessageDate sub-msg
 function decodeCallEntity(buf) {
-    const r = new Reader(buf), o = { id: '0', token: '', room: '', url: '', isLivekit: false, callerId: 0 };
+    const r = new Reader(buf), o = {
+        id: '0', token: '', room: '', url: '', isLivekit: false, callerId: 0,
+        video: false, createDate: '0', startDate: '0', duration: 0, discardReason: 0,
+    };
     while (r.pos < r.len) {
         const tag = r.uint32();
         switch (tag >>> 3) {
-            case 1:  o.id        = r.int64().toString(); break;
-            case 2:  o.token     = r.string(); break;
-            case 3:  o.room      = r.string(); break;
-            case 4:  o.url       = decodeWrappedString(r.bytes()); break;
-            // field 8 = adminUid (call initiator). On the callee side this is the
-            // *other party*; we read it as `callerId` to drive admission checks.
-            // (Field 9 is `peer`, which from the callee's perspective decodes to
-            // self — using it would attribute every incoming call to ourselves.)
-            case 8:  o.callerId  = r.int32(); break;
-            case 12: o.isLivekit = r.bool(); break;
+            case 1:  o.id            = r.int64().toString(); break;
+            case 2:  o.token         = r.string(); break;
+            case 3:  o.room          = r.string(); break;
+            case 4:  o.url           = decodeWrappedString(r.bytes()); break;
+            case 5:  o.video         = r.bool(); break;
+            case 6:  o.createDate    = r.int64().toString(); break;
+            case 7:  o.startDate     = r.int64().toString(); break;
+            // field 8 = adminUid; on the callee side this is the other party.
+            // Field 9 (peer) decodes to self for the callee, so we never read
+            // it for callerId (would attribute every incoming call to ourselves).
+            case 8:  o.callerId      = r.int32(); break;
+            case 10: o.duration      = r.int32(); break;
+            case 11: o.discardReason = r.int32(); break;
+            case 12: o.isLivekit     = r.bool(); break;
             default: r.skipType(tag & 7);
         }
     }

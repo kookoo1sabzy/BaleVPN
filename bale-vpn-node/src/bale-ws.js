@@ -70,6 +70,7 @@ class BaleWsClient {
         this.rpcIndex      = 0;
         this.pingTimer     = null;
         this.pingCounter   = 0;
+        this.setOnlineTimer = null;
         this.ready         = false;
         // Wall-clock timestamp of the last inbound WS frame. Used by _startPing
         // to detect zombie connections (TCP "open" but no application traffic).
@@ -183,6 +184,7 @@ class BaleWsClient {
 
         ws.on('close', (code) => {
             clearInterval(this.pingTimer);
+            clearInterval(this.setOnlineTimer);
             this.ready      = false;
             this.connecting = false;
             // Fail any in-flight RPCs immediately — they can never succeed once
@@ -236,6 +238,7 @@ class BaleWsClient {
         if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
         if (this.ws) { this.ws.close(); this.ws = null; }
         clearInterval(this.pingTimer);
+        clearInterval(this.setOnlineTimer);
         this._drainPending('WS disconnected by user');
         console.log('[WS] Disconnected by user');
     }
@@ -278,6 +281,7 @@ class BaleWsClient {
                 console.log('[WS] Ready — subscribing to updates');
                 this._subscribe();
                 this._startPing();
+                this._startSetOnlineLoop();
                 this.tunnel.onWsReady();
                 this.loadSelf().catch(e => console.error('[Self] loadSelf failed:', e.message));
                 this.loadContacts().catch(e => console.error('[Contacts] loadContacts failed:', e.message));
@@ -317,7 +321,15 @@ class BaleWsClient {
                 // genuine failure (auth, malformed, protocol change) still
                 // surfaces.
                 const errInfo = rpc.error ? decodeRpcError(Buffer.from(rpc.error)) : { code: 0, message: 'complete' };
-                const isRotation = errInfo.code === 4 && !rpc.response;
+                // code 4 (DEADLINE_EXCEEDED) — server's deadline timer fired
+                //   waiting for our (impossible-over-WS) request-side EOF.
+                // code 2 (UNKNOWN) with the gRPC "want <EOF>" string — same
+                //   root cause, server gave up earlier instead of timing out.
+                // Both are transport-level artefacts, not real failures.
+                const isRotation = !rpc.response && (
+                    errInfo.code === 4 ||
+                    (errInfo.code === 2 && errInfo.message.includes('want <EOF>'))
+                );
                 if (!isRotation) {
                     console.log(`[WS] subscribe stream ended unexpectedly (idx=${rpc.index} code=${errInfo.code} message="${errInfo.message}")`);
                 }
@@ -369,6 +381,27 @@ class BaleWsClient {
             }
             this.ws.send(encodePing(++this.pingCounter));
         }, 10_000);
+    }
+
+    // Periodic `bale.presence.v1.Presence/SetOnline(isOnline=true, timeout=90s)`
+    // — Bale's presence keep-alive. Without it the server marks the user
+    // offline once the previous timeout window expires and stops delivering
+    // call / message events to this session. The web app does the same:
+    // 90 s interval, 90 s declared-online timeout. First call fires
+    // immediately so we don't have a 90 s grace window where the server
+    // could consider us offline. Fire-and-forget — don't await the reply,
+    // the keep-alive shouldn't be blocked by Bale's response latency.
+    _startSetOnlineLoop() {
+        // SetOnlineRequest { f1 isOnline=true (varint), f2 timeout=90000 (int64) }
+        const payload = new Uint8Array([0x08, 0x01, 0x10, 0x90, 0xF9, 0x05]);
+        const send = () => {
+            if (!this.ready) return;
+            this._rpcCall('bale.presence.v1.Presence', 'SetOnline', payload)
+                .catch(e => console.warn('[WS] SetOnline failed:', e.message));
+        };
+        send();
+        clearInterval(this.setOnlineTimer);
+        this.setOnlineTimer = setInterval(send, 90_000);
     }
 
     _processUpdate(buf) {
