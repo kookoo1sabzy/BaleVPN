@@ -113,12 +113,23 @@ class BaleWsClient(
     // the timer coroutine sees writes from the read coroutine without locking.
     @kotlin.concurrent.Volatile
     private var lastInboundTs = 0L
-    // RPC idx of the active SubscribeToUpdates stream. Bale's server-side
-    // periodically completes/errors the stream (after some N events or N
-    // minutes — empirically observed); when that happens we get an RPC
-    // response with this idx, no payload, err=true. The web app's behaviour
-    // is to re-subscribe on completion; without that we silently stop seeing
-    // call/message events while WS heartbeats keep flowing.
+    // RPC idx of the SubscribeToUpdates request, recorded so we can recognise
+    // its server-side responses and quietly ignore the routine 30 s
+    // `code=4 DEADLINE_EXCEEDED` end-of-stream marker.
+    //
+    // *Background* — Bale's WS protocol multiplexes many logical RPCs over one
+    // TCP stream. Unlike gRPC-web, our transport can't half-close the request
+    // side of one logical RPC, so Bale's server eventually hits its
+    // "waiting for client EOF" deadline and ends the subscribe RPC with code 4.
+    // The web app uses gRPC-web (which auto-half-closes) and gets long-lived
+    // streams; for it, stream-end is genuinely exceptional (the JS logs it at
+    // warn/error level and runs a defensive retry pipe).
+    //
+    // **Crucially**, Bale's realtime events flow on WS frame field 2 (the
+    // standalone Push update channel), NOT on the subscribe RPC's response
+    // stream. Empirically: weakEvents and call updates keep arriving on
+    // field 2 long after the RPC ends, with or without re-subscription. So
+    // re-subscribing every 30 s adds nothing — it's just an extra RPC.
     @kotlin.concurrent.Volatile
     private var subscribeIdx = -1
     // Set by handleFrame's case=5 when the server reports an incompatible
@@ -353,18 +364,19 @@ class BaleWsClient(
             if (err) entry.deferred.completeExceptionally(Exception("RPC error: $errMsg"))
             else     entry.deferred.complete(payload ?: ByteArray(0))
         } else if (idx == subscribeIdx && (err || payload == null)) {
-            // SubscribeToUpdates stream ended. Bale's server enforces a hard
-            // 30 s deadline on this RPC and closes it with code 4
-            // (DEADLINE_EXCEEDED) on schedule — the web app sees the same
-            // thing and silently re-subscribes via retry(). We do the same:
-            // log only if it's not the expected rotation, so a genuine
-            // failure (auth, malformed request, etc.) still surfaces.
+            // SubscribeToUpdates RPC ended. Routine — Bale's server hits its
+            // 30 s deadline waiting for our (impossible-over-WS) request-side
+            // EOF and closes with `code=4 DEADLINE_EXCEEDED`. We don't
+            // re-subscribe: events flow on WS field 2 (Push update channel)
+            // independently of this RPC, so a fresh subscribe wouldn't add
+            // anything. Loud only if the close reason is *not* the expected
+            // `code=4`, in case Bale ever changes the end-of-stream
+            // semantics or the failure is genuine (auth, malformed, etc).
             val rotation = isExpectedSubscribeRotation(errBytes, payload)
             if (!rotation) {
                 val errMsg = errBytes?.let { decodeRpcError(it) } ?: "complete"
-                log("[BaleProxy] WS subscribe stream ended (idx=$idx $errMsg) — re-subscribing")
+                log("[BaleProxy] WS subscribe stream ended unexpectedly (idx=$idx $errMsg)")
             }
-            subscribeUpdates()
         } else if (payload != null && !err) {
             handleUpdate(payload)
         } else {
