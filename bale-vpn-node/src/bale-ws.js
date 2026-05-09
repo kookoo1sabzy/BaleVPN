@@ -75,6 +75,11 @@ class BaleWsClient {
         // to detect zombie connections (TCP "open" but no application traffic).
         // 0 = no inbound seen yet.
         this._lastInboundTs = 0;
+        // Consecutive-failed-reconnect counter; drives the exponential
+        // back-off in the close handler. Reset to 0 on every successful
+        // handshake (see _onFrame). With base=3s and cap=30s the effective
+        // wait progression is 3s → 6s → 12s → 24s → 30s.
+        this._reconnectAttempt = 0;
         // Set when Bale closes the WS with code 4401 (their custom "Unauthenticated"
         // close code) — the token is dead. Cleared by connect() on next login.
         this.sessionExpired = false;
@@ -195,11 +200,19 @@ class BaleWsClient {
                 this.accessToken    = '';
                 this.sessionExpired = true;
             } else if (this.autoReconnect) {
-                console.log(`[WS] Closed ${code} — reconnecting in 3 s`);
+                // Exponential back-off: 3s, 6s, 12s, 24s, then capped at 30s.
+                // Counter resets to 0 on a successful handshake (see _onFrame),
+                // so a healthy long-running session that drops once won't
+                // start at a long delay. Bounded delay avoids hammering Bale's
+                // gateway when it's genuinely down (e.g., the ECONNREFUSED
+                // clusters during operator outages).
+                const attempt  = this._reconnectAttempt++;
+                const delaySec = Math.min(3 * (1 << Math.min(attempt, 4)), 30);
+                console.log(`[WS] Closed ${code} — reconnecting in ${delaySec}s (attempt ${attempt + 1})`);
                 this._reconnectTimer = setTimeout(() => {
                     this._reconnectTimer = null;
                     this.connect();
-                }, 3000);
+                }, delaySec * 1000);
             } else {
                 console.log(`[WS] Closed ${code}`);
             }
@@ -261,6 +274,7 @@ class BaleWsClient {
             console.log(`[WS] Handshake: proto=${hs.mkprotoVersion} api=${hs.apiVersion}`);
             if (hs.mkprotoVersion === PROTO_VERSION && hs.apiVersion === API_VERSION) {
                 this.ready = true;
+                this._reconnectAttempt = 0;   // healthy session, reset back-off
                 console.log('[WS] Ready — subscribing to updates');
                 this._subscribe();
                 this._startPing();
