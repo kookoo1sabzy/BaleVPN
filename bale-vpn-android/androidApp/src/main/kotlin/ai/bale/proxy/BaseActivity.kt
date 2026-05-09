@@ -167,13 +167,18 @@ abstract class BaseActivity : AppCompatActivity() {
             .show()
     }
 
-    /** Read the last ~500 lines of logcat for this process. Since Android 4.1+
-     *  apps can only see their own logs without special permissions, so the
-     *  output here only contains BaleProxy's own log lines. */
+    /** Read the last ~500 lines of logcat for this process, filtered to only
+     *  the tags we use. Without the tag filter, the dialog is dominated by
+     *  framework UI noise (TextView, InsetsController, ActivityThread,
+     *  WindowOnBackDispatcher, ImeTracker, etc.) that's irrelevant to the
+     *  app's behaviour. The trailing `*:S` silences every other tag. */
     private fun readLogs(): String =
         try {
             Runtime.getRuntime()
-                .exec(arrayOf("logcat", "-d", "-t", "500", "*:V"))
+                .exec(arrayOf(
+                    "logcat", "-d", "-t", "500",
+                    "BaleProxy:V", "BaleVPN:V", "ContactsActivity:V", "UserCache:V", "*:S"
+                ))
                 .inputStream.bufferedReader().use { it.readText() }
         } catch (e: Exception) {
             "Failed to read logs: ${e.message}"
