@@ -113,6 +113,14 @@ class BaleWsClient(
     // the timer coroutine sees writes from the read coroutine without locking.
     @kotlin.concurrent.Volatile
     private var lastInboundTs = 0L
+    // RPC idx of the active SubscribeToUpdates stream. Bale's server-side
+    // periodically completes/errors the stream (after some N events or N
+    // minutes — empirically observed); when that happens we get an RPC
+    // response with this idx, no payload, err=true. The web app's behaviour
+    // is to re-subscribe on completion; without that we silently stop seeing
+    // call/message events while WS heartbeats keep flowing.
+    @kotlin.concurrent.Volatile
+    private var subscribeIdx = -1
     // Set by handleFrame's case=5 when the server reports an incompatible
     // proto/api version. Read by the WS body's read loop (close + break) and
     // by runLoop (fire callback + break the outer retry loop).
@@ -188,6 +196,15 @@ class BaleWsClient(
                                 log("[BaleProxy] WS idle ${idle}ms — closing zombie connection")
                                 close(CloseReason(CloseReason.Codes.GOING_AWAY, "ping timeout"))
                                 break
+                            }
+                            // Halfway to zombie threshold and the WS still hasn't
+                            // heard back from Bale — surface it so a slow-fail is
+                            // visible before we actually close. Bale normally
+                            // sends a weakEvent every ~4 s; idle > 15 s means
+                            // either the connection is stalling or Bale's
+                            // upstream is having a bad time.
+                            if (idle > 15_000) {
+                                log("[BaleProxy] WS idle ${idle}ms — no inbound, sending ping (zombie close at 30s)")
                             }
                             send(Frame.Binary(true, encodePing()))
                         }
@@ -268,10 +285,12 @@ class BaleWsClient(
         val r = ProtoReader(buf)
         while (r.hasMore()) {
             val (f, w) = r.tag()
-            // Suppress the pong log line — it fires every heartbeat (~10 s) and
-            // adds nothing diagnostic. Heartbeat issues are caught by the
-            // liveness coroutine and the zombie-connection log instead.
-            if (f != 4) log("[BaleProxy] WS frame: ${frameKindName(f)}")
+            // Only log frame kind for the rare/interesting ones (terminate,
+            // handshake response). RPC responses log themselves with method
+            // names; push updates are mostly weakEvent heartbeats and
+            // parseXC logs the meaningful contents. Pongs are silent —
+            // liveness/zombie logs catch heartbeat issues.
+            if (f == 3 || f == 5) log("[BaleProxy] WS frame: ${frameKindName(f)}")
             when (f) {
                 1 -> handleRpc(r.bytes())
                 2 -> handlePushContainer(r.bytes())
@@ -313,35 +332,87 @@ class BaleWsClient(
 
     private suspend fun handleRpc(buf: ByteArray) {
         val r = ProtoReader(buf)
-        var idx = 0; var payload: ByteArray? = null; var err = false
+        var idx = 0; var payload: ByteArray? = null; var errBytes: ByteArray? = null
         while (r.hasMore()) {
             val (f, w) = r.tag()
             when (f) {
-                1 -> { r.bytes(); err = true }
-                2 -> payload = r.bytes()
-                3 -> idx = r.varint().toInt()
+                1 -> errBytes = r.bytes()
+                2 -> payload  = r.bytes()
+                3 -> idx      = r.varint().toInt()
                 else -> r.skip(w)
             }
         }
+        val err = errBytes != null
         val (entry, sizeAfter) = stateMutex.withLock {
             val e = pending.remove(idx)
             e to pending.size
         }
         if (entry != null) {
-            log("[BaleProxy] WS RPC ← ${entry.service}/${entry.method} idx=$idx ${if (err) "ERR" else "ok"} ${payload?.size ?: 0}B (pending=$sizeAfter)")
-            if (err) entry.deferred.completeExceptionally(Exception("RPC error"))
+            val errMsg = errBytes?.let { decodeRpcError(it) }
+            log("[BaleProxy] WS RPC ← ${entry.service}/${entry.method} idx=$idx ${if (err) "ERR ($errMsg)" else "ok"} ${payload?.size ?: 0}B (pending=$sizeAfter)")
+            if (err) entry.deferred.completeExceptionally(Exception("RPC error: $errMsg"))
             else     entry.deferred.complete(payload ?: ByteArray(0))
+        } else if (idx == subscribeIdx && (err || payload == null)) {
+            // SubscribeToUpdates stream ended. Bale's server enforces a hard
+            // 30 s deadline on this RPC and closes it with code 4
+            // (DEADLINE_EXCEEDED) on schedule — the web app sees the same
+            // thing and silently re-subscribes via retry(). We do the same:
+            // log only if it's not the expected rotation, so a genuine
+            // failure (auth, malformed request, etc.) still surfaces.
+            val rotation = isExpectedSubscribeRotation(errBytes, payload)
+            if (!rotation) {
+                val errMsg = errBytes?.let { decodeRpcError(it) } ?: "complete"
+                log("[BaleProxy] WS subscribe stream ended (idx=$idx $errMsg) — re-subscribing")
+            }
+            subscribeUpdates()
         } else if (payload != null && !err) {
-            log("[BaleProxy] WS RPC idx=$idx not in pending — routing to handleUpdate")
             handleUpdate(payload)
         } else {
-            log("[BaleProxy] WS RPC idx=$idx dropped (err=$err payload=${payload != null})")
+            val errMsg = errBytes?.let { decodeRpcError(it) }
+            log("[BaleProxy] WS RPC idx=$idx dropped (err=$errMsg payload=${payload != null})")
         }
+    }
+
+    /** True for the routine 30 s `DEADLINE_EXCEEDED` (gRPC code 4) close
+     *  Bale uses to rotate the SubscribeToUpdates stream. Anything else
+     *  (auth failure, malformed request, network blip presented as a code)
+     *  is a real failure worth logging. */
+    private fun isExpectedSubscribeRotation(errBytes: ByteArray?, payload: ByteArray?): Boolean {
+        if (errBytes == null) return false
+        val r = ProtoReader(errBytes)
+        var code = 0
+        while (r.hasMore()) {
+            val (f, w) = r.tag()
+            when (f) {
+                1 -> code = r.varint().toInt()
+                else -> r.skip(w)
+            }
+        }
+        return code == 4 && payload == null
+    }
+
+    /** Bale RPC error envelope: { f1 code int32, f2 message string }. Falls
+     *  back to a hex dump if the bytes don't look like a known shape. */
+    private fun decodeRpcError(buf: ByteArray): String {
+        if (buf.isEmpty()) return "empty"
+        val r = ProtoReader(buf)
+        var code = 0
+        var message = ""
+        while (r.hasMore()) {
+            val (f, w) = r.tag()
+            when (f) {
+                1 -> code    = r.varint().toInt()
+                2 -> message = r.string()
+                else -> r.skip(w)
+            }
+        }
+        return if (message.isNotBlank()) "code=$code message=\"$message\""
+               else if (code != 0)       "code=$code"
+               else                      "raw=${buf.joinToString("") { "%02x".format(it) }}"
     }
 
     // Field-2 WS frame = outer container; field 1 = SubscribeResponse bytes
     private suspend fun handlePushContainer(buf: ByteArray) {
-        log("[BaleProxy] WS handlePushContainer len=${buf.size}")
         val r = ProtoReader(buf)
         while (r.hasMore()) {
             val (f, w) = r.tag()
@@ -352,21 +423,23 @@ class BaleWsClient(
     // SubscribeResponse schema (verified against Bale's web bundle):
     //   1 = update (xC union — call/message events)
     //   2 = routeId      (int32, internal routing — silent)
-    //   3 = sequence     (int32, monotonic per-stream — log as "seq")
-    //   4 = timestamp    (int64 ms since epoch)
-    //   5 = weakEvent    (sub-message)
+    //   3 = sequence     (int32, monotonic per-stream — silent)
+    //   4 = timestamp    (int64 ms since epoch — silent)
+    //   5 = weakEvent    (sub-message — silent; Bale's idle heartbeat)
     //   6 = mtupdate     (sub-message)
     //   7 = updates      (sub-message)
+    // Most pushes from Bale are weakEvent heartbeats every ~4 s. Logging
+    // them just clutters the output. Liveness is already visible through the
+    // "WS idle Nms — sending ping" warning when the stream actually goes
+    // quiet, so silence the happy-path noise here. parseXC still logs every
+    // meaningful event (calls, messages, etc).
     private suspend fun handleUpdate(buf: ByteArray) {
         val r = ProtoReader(buf)
         while (r.hasMore()) {
             val (f, w) = r.tag()
             when (f) {
                 1    -> parseXC(r.bytes())
-                2    -> r.skip(w)                                              // routeId — silent
-                3    -> log("[BaleProxy] WS update seq=${r.varint()}")
-                4    -> log("[BaleProxy] WS update timestamp=${r.varint()}")
-                5    -> { r.bytes(); log("[BaleProxy] WS update weakEvent") }
+                2, 3, 4, 5 -> r.skip(w)                       // routeId/seq/timestamp/weakEvent — silent
                 6    -> { r.bytes(); log("[BaleProxy] WS update mtupdate") }
                 7    -> { r.bytes(); log("[BaleProxy] WS update updates batch") }
                 else -> {
@@ -416,11 +489,14 @@ class BaleWsClient(
                         if (callerId != 0L) CallEntity(callId, "", "", "", false, callerId) else null)
                 }
                 else  -> {
-                    // Surface every xC event type we don't explicitly handle —
-                    // xcUpdateName names the documented ones (newMessage,
-                    // callAccepted) and falls back to "field=N" for genuinely
-                    // unknown tags so they're never silent in the log.
-                    log("[BaleProxy] WS xC event: ${xcUpdateName(f)}")
+                    // Silent for documented chat-housekeeping events that we
+                    // don't act on (new chat messages, read receipts, the
+                    // empty stream-marker). Unknown tags still log so a
+                    // protocol regression doesn't go invisible.
+                    when (f) {
+                        19, 50, 55, 85 -> { /* messageRead, messageReadByMe, newMessage, emptyUpdate */ }
+                        else -> log("[BaleProxy] WS xC event: ${xcUpdateName(f)}")
+                    }
                     r.skip(w)
                 }
             }
@@ -553,6 +629,7 @@ class BaleWsClient(
 
     private suspend fun subscribeUpdates() {
         val idx = stateMutex.withLock { rpcIdx++ }
+        subscribeIdx = idx
         sendCh.trySend(encodeRpc("bale.maviz.v1.MavizStream", "SubscribeToUpdates", ByteArray(0), idx))
     }
 

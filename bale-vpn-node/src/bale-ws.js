@@ -235,15 +235,15 @@ class BaleWsClient {
         });
     }
 
-    // Friendly name for the inbound WS frame kind. Pong is intentionally
-    // omitted — it fires every heartbeat (~10s) and adds nothing diagnostic;
-    // the zombie-connection check is the meaningful liveness signal.
+    // Friendly name for inbound WS frame kinds we want to surface. Routine
+    // RPC responses, push updates and pongs are intentionally omitted —
+    // they're noisy and have their own per-content logs (or get filtered
+    // out as routine traffic). We keep handshake + terminate-session so
+    // unexpected protocol events still log loudly.
     _frameKindName(frame) {
         if (frame.handshakeResponse) return 'Handshake response';
-        if (frame.response)          return 'RPC response / push';
-        if (frame.update)            return 'Push update';
         if (frame.terminateSession)  return 'Terminate session';
-        return null;  // pong or unknown — don't log
+        return null;
     }
 
     _onFrame(frame) {
@@ -275,17 +275,28 @@ class BaleWsClient {
             if (cb) {
                 this.pending.delete(rpc.index);
                 clearTimeout(cb.timer);
-                const status = rpc.error ? 'ERR' : 'ok';
-                const sz     = (rpc.response?.length || 0);
-                console.log(`[WS] RPC ← ${cb.service}/${cb.method} idx=${rpc.index} ${status} ${sz}B (pending=${this.pending.size})`);
                 if (rpc.error) {
                     const { code, message } = decodeRpcError(Buffer.from(rpc.error));
+                    console.log(`[WS] RPC ← ${cb.service}/${cb.method} idx=${rpc.index} ERR (code=${code} message="${message}") (pending=${this.pending.size})`);
                     const err = new Error(`${message} (RPC code ${code})`);
                     err.rpcCode    = code;
                     err.rpcMessage = message;
                     cb.reject(err);
+                } else {
+                    cb.resolve(rpc.response || new Uint8Array(0));
                 }
-                else           cb.resolve(rpc.response || new Uint8Array(0));
+            } else if (rpc.index === this.subscribeIdx && (rpc.error || !rpc.response)) {
+                // Bale's server enforces a 30 s deadline on SubscribeToUpdates
+                // and ends with code 4 (DEADLINE_EXCEEDED) on schedule — the
+                // web app does the same and re-subscribes via retry(). Silent
+                // for the routine rotation; loud for any other failure so
+                // genuine problems still surface.
+                const errInfo = rpc.error ? decodeRpcError(Buffer.from(rpc.error)) : { code: 0, message: 'complete' };
+                const isRotation = errInfo.code === 4 && !rpc.response;
+                if (!isRotation) {
+                    console.log(`[WS] subscribe stream ended (idx=${rpc.index} code=${errInfo.code} message="${errInfo.message}") — re-subscribing`);
+                }
+                this._subscribe();
             } else if (rpc.response) {
                 this._processUpdate(rpc.response);
             }
@@ -308,7 +319,6 @@ class BaleWsClient {
             new Uint8Array(0),
             this.subscribeIdx,
         ));
-        console.log(`[WS] SubscribeToUpdates sent (idx=${this.subscribeIdx})`);
     }
 
     _startPing() {
@@ -326,6 +336,13 @@ class BaleWsClient {
                 try { this.ws.terminate(); } catch (_) {}
                 return;
             }
+            // Halfway to zombie threshold and Bale still hasn't sent a frame
+            // — surface it so a slow-fail is visible before the close fires.
+            // Bale normally sends a weakEvent every ~4 s; idle > 15 s means
+            // either the connection is stalling or upstream is degraded.
+            if (idle > 15_000) {
+                console.warn(`[WS] idle ${idle}ms — no inbound, sending ping (zombie close at 30s)`);
+            }
             this.ws.send(encodePing(++this.pingCounter));
         }, 10_000);
     }
@@ -334,21 +351,15 @@ class BaleWsClient {
         let sub;
         try { sub = decodeSubscribeResponse(buf); } catch (e) { console.log('[Update] decode error:', e.message); return; }
         const update = sub.update;
-        if (sub.sequence  != null) console.log(`[Update] seq=${sub.sequence}`);
-        if (sub.timestamp != null) console.log(`[Update] timestamp=${sub.timestamp}`);
-        if (!update) { console.log('[Update] no xC payload, buf len=', buf.length); return; }
-
-        const type = update.message      ? 'message'
-                   : update.callStarted  ? 'callStarted'
-                   : update.callReceived ? 'callReceived'
-                   : update.callAccepted ? 'callAccepted'
-                   : update.callEnded    ? 'callEnded'
-                   : update._unknownFields ? `unknown(${update._unknownFields.map(_xcUpdateName).join(',')})`
-                   : 'unknown';
+        // seq / timestamp / weakEvent are silent — they fire on every Bale
+        // heartbeat (~every 4 s) and add nothing diagnostic. Liveness is
+        // already covered by the WS idle-warning path. parseXC still logs
+        // every meaningful event (calls, messages we route, etc.).
+        if (!update) return;
 
         if (update.callStarted || update.callReceived) {
             const callId = update.callReceived?.callId || update.callStarted?.call?.id;
-            console.log(`[Update] ${type}  callId=${callId}`);
+            console.log(`[Update] ${update.callReceived ? 'callReceived' : 'callStarted'}  callId=${callId}`);
             const callEntity = update.callStarted?.call || null;
             if (callId && callId !== '0') {
                 for (const cb of this._onCallReceivedListeners.slice()) {
@@ -371,19 +382,25 @@ class BaleWsClient {
                 catch (e) { console.error('[Update] onCallEnded subscriber threw:', e.message); }
             }
         } else if (update.message) {
+            // Tunnel SOCKS5 frames piggyback on text messages — those are
+            // silent (handleIncoming returns true to consume). Log only
+            // genuine human-visible chat messages.
             const tif  = update.message;
             const text = tif.message?.textMessage?.text;
             if (text) {
                 if (this.tunnel.handleIncoming(text, tif.senderUid)) return;
                 const entry = { dir: 'in', from: tif.senderUid, rid: tif.rid, text, ts: Date.now() };
-                console.log(`[Update] message  from=${entry.from}  "${entry.text}"`);
                 this.messages.push(entry);
-            } else {
-                const msgType = tif.message?.type || 'unknown';
-                console.log(`[Update] message  from=${tif.senderUid}  (${msgType})`);
             }
-        } else {
-            console.log(`[Update] ${type}`);
+            // messageRead / messageReadByMe / non-text message types — silent
+        } else if (update._unknownFields) {
+            // Surface only truly novel xC tags so a future Bale protocol
+            // change doesn't go invisible. The recognised-but-routine ones
+            // (messageRead, messageReadByMe, emptyUpdate) stay silent.
+            const novel = update._unknownFields.filter(f => f !== 19 && f !== 50 && f !== 85);
+            if (novel.length > 0) {
+                console.log(`[Update] unknown(${novel.map(_xcUpdateName).join(',')})`);
+            }
         }
     }
 
