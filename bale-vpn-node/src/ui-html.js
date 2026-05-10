@@ -301,6 +301,12 @@ const HTML = `<!DOCTYPE html>
     <div style="font-weight:600; font-size:.9rem; margin-bottom:.5rem; opacity:.7">Allowed callers</div>
     <div id="admissionList"></div>
   </div>
+
+  <!-- Blacklist (server mode) -->
+  <div id="blacklistSection" style="display:none; margin-top:1.2rem">
+    <div style="font-weight:600; font-size:.9rem; margin-bottom:.5rem; opacity:.7">Blocked callers</div>
+    <div id="blacklistList"></div>
+  </div>
 </div>
 <script>
 // Wrap fetch so every mutating request carries the per-process CSRF token
@@ -540,7 +546,7 @@ function applyState() {
   applyTunnelUI(s);
 
   // Server-mode list polls — only when accepting calls.
-  if (_tunnelMode === 'server' && s.wsReady) { pollClients(); pollPending(); pollAdmission(); }
+  if (_tunnelMode === 'server' && s.wsReady) { pollClients(); pollPending(); pollAdmission(); pollBlacklist(); }
 
   if (s.wsReady) loadPeers();   // refresh lazily; loadPeers no-ops if already populated
 }
@@ -552,7 +558,7 @@ function applyTunnelUI(s) {
   const adm  = document.getElementById('admissionSection');
 
   if (_tunnelMode === 'server') {
-    // Server: status row + admission/pending/clients panels visible while WS is up.
+    // Server: status row + admission/pending/clients/blacklist panels visible while WS is up.
     if (s.wsReady) {
       st.style.display = '';
       const n = s.lkRooms || 0;
@@ -563,7 +569,9 @@ function applyTunnelUI(s) {
     } else {
       st.style.display = 'none';
     }
-    sec.style.display = pend.style.display = adm.style.display = s.wsReady ? 'block' : 'none';
+    const bl = document.getElementById('blacklistSection');
+    sec.style.display = pend.style.display = adm.style.display = bl.style.display
+      = s.wsReady ? 'block' : 'none';
   } else {
     // Client: four sub-states:
     //   0. server rejected our last attempt → "Connection rejected by server"
@@ -986,6 +994,31 @@ async function pollAdmission() {
 async function removeAdmission(callerId) {
   await fetch('/server/admission/' + callerId, { method: 'DELETE' });
   pollAdmission();
+}
+
+async function pollBlacklist() {
+  try {
+    const r = await fetch('/server/blacklist');
+    const list = await r.json();
+    const el = document.getElementById('blacklistList');
+    if (!list.length) { el.innerHTML = '<div class="empty">No blocked callers</div>'; return; }
+    el.innerHTML = list.map(a => {
+      const who = a.callerName
+        ? escapeHtml(a.callerName) + ' <span style="opacity:.5; font-weight:400">(' + a.callerId + ')</span>'
+        : 'Caller ' + a.callerId;
+      return \`
+      <div class="admission-row">
+        <div class="admission-info">\${who}</div>
+        <button class="remove-btn" onclick="unblockCaller(\${a.callerId})">Unblock</button>
+      </div>\`;
+    }).join('');
+  } catch {}
+}
+
+async function unblockCaller(callerId) {
+  await fetch('/server/blacklist/' + callerId, { method: 'DELETE' });
+  pollBlacklist();
+  pollAdmission();   // mutual exclusion may have moved the entry; refresh the other list too
 }
 
 // Restore persisted config (localStorage → form fields), then do an initial

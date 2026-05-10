@@ -158,7 +158,11 @@ class BaleServerService : Service() {
         }
 
         fun rejectPending(callId: Long) {
-            instance?.scope?.launch { instance?.doRejectPending(callId) }
+            // UI-driven rejection: also blacklist so the caller can't keep
+            // re-sending the same incoming call. Internal paths (sweep
+            // timeout, bulk WS-teardown) call doRejectPending directly with
+            // addToBlacklist=false.
+            instance?.scope?.launch { instance?.doRejectPending(callId, addToBlacklist = true) }
         }
 
         fun setClientLimit(callId: Long, upBps: Long, downBps: Long) {
@@ -195,6 +199,7 @@ class BaleServerService : Service() {
 
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
         AdmissionStore.init(prefs)
+        BlacklistStore.init(prefs)
         // Hydrate per-caller limits from the merged admission store so a
         // service restart re-applies the same caps when those callers reconnect.
         callerLimits.clear()
@@ -251,6 +256,15 @@ class BaleServerService : Service() {
             return
         }
 
+        // Blocked callers are rejected silently — no notification, no pending entry.
+        // Their last-known disconnect already showed up in the UI; this is just the
+        // gate that enforces "we said we were done with you".
+        if (BlacklistStore.isBlocked(callerId)) {
+            Log.d(TAG, "Server: rejecting blacklisted callerId=$callerId (callId=$callId)")
+            BaleConnection.client?.discardCall(callId)
+            return
+        }
+
         if (AdmissionStore.isAllowed(callerId)) {
             // New call from the same caller always wins — handleCall replaces any
             // existing client locally. Clear any leftover pending entry first so
@@ -295,13 +309,18 @@ class BaleServerService : Service() {
         handleCall(callId, pending.entity)
     }
 
-    private suspend fun doRejectPending(callId: Long) {
+    private suspend fun doRejectPending(callId: Long, addToBlacklist: Boolean = false) {
         val pending = pendingMap.remove(callId) ?: return
         pendingSnapshot = pendingMap.values.toList()
         cancelPendingNotificationIfEmpty()
         updateNotification()
-        Log.d(TAG, "Server: rejecting call $callId callerId=${pending.callerId}")
+        Log.d(TAG, "Server: rejecting call $callId callerId=${pending.callerId} block=$addToBlacklist")
         BaleConnection.client?.discardCall(callId)
+        // Only the user's explicit Reject in the pending notification flows in
+        // here with addToBlacklist=true. Sweep timeout and bulk-WS-teardown
+        // paths leave the caller out of the blacklist — those aren't user
+        // rejections, just side effects.
+        if (addToBlacklist && pending.callerId != 0L) BlacklistStore.add(pending.callerId)
     }
 
     private suspend fun handleCall(callId: Long, incomingCall: CallEntity?) {

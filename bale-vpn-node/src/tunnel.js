@@ -33,6 +33,7 @@ const {
 } = require('./constants');
 const { LiveKitTransport, lkEncode, lkDecode } = require('./livekit');
 const { AdmissionStore } = require('./admission');
+const { BlacklistStore } = require('./blacklist');
 
 // Tunnel envelope helpers (legacy "T:" message-mode wire format — kept around
 // per the "leave unused code in place" preference; only the WebRTC path is
@@ -369,6 +370,13 @@ class TunnelManager {
             return;
         }
 
+        // Blocked callers are rejected silently — no pending entry, no UI prompt.
+        if (BlacklistStore.isBlocked(callerId)) {
+            console.log(`[Tunnel/S] rejecting blacklisted caller ${callerId} (call ${callId})`);
+            this.getBale().then(ws => ws?.discardCall(callId)).catch(() => {});
+            return;
+        }
+
         if (AdmissionStore.isAllowed(callerId)) {
             // New call from the same caller always wins — _handleCall will
             // tear down any existing room from the same caller (local cleanup
@@ -435,14 +443,18 @@ class TunnelManager {
         return true;
     }
 
-    async rejectPending(callId) {
+    async rejectPending(callId, addToBlacklist = false) {
         const callKey = String(callId);
         const pending = this.pendingMap.get(callKey);
         if (!pending) return false;
         this.pendingMap.delete(callKey);
-        console.log(`[Tunnel/S] rejecting call ${callId} from caller ${pending.callerId}`);
+        console.log(`[Tunnel/S] rejecting call ${callId} from caller ${pending.callerId} block=${addToBlacklist}`);
         const ws = await this.getBale();
         try { await ws?.discardCall(callId); } catch (_) {}
+        // Only the user's explicit Reject from the pending UI flows in here
+        // with addToBlacklist=true. Sweep timeout calls without — that's a
+        // caller who gave up, not a user choice.
+        if (addToBlacklist && pending.callerId) BlacklistStore.add(pending.callerId);
         return true;
     }
 

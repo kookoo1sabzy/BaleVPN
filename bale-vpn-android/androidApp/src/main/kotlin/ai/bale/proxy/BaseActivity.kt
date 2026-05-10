@@ -34,6 +34,11 @@ abstract class BaseActivity : AppCompatActivity() {
         const val MENU_APP_LOGS  = 1003
         const val ABOUT_EMAIL    = "kookoo.sabzy@proton.me"
         const val ABOUT_REPO     = "https://github.com/kookoo1sabzy/BaleVPN"
+        // GitHub auto-redirects this to the most recent non-prerelease's HTML
+        // page; the user picks the APK from there. We don't link the asset
+        // directly because release filenames are versioned and there's no
+        // stable "latest APK" URL without renaming the gradle output.
+        const val ABOUT_LATEST   = "https://github.com/kookoo1sabzy/BaleVPN/releases/latest"
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -119,6 +124,21 @@ abstract class BaseActivity : AppCompatActivity() {
             paintFlags = paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
             setTextColor(ContextCompat.getColor(context, android.R.color.holo_blue_dark))
             setOnClickListener { openUrl(ABOUT_REPO) }
+        })
+        layout.addView(TextView(this).apply {
+            text     = "Download the latest APK from:"
+            textSize = 14f
+            gravity  = Gravity.CENTER_HORIZONTAL
+            setPadding(0, (16 * dp).toInt(), 0, (4 * dp).toInt())
+        })
+        layout.addView(TextView(this).apply {
+            text       = ABOUT_LATEST
+            textSize   = 13f
+            typeface   = Typeface.MONOSPACE
+            gravity    = Gravity.CENTER_HORIZONTAL
+            paintFlags = paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
+            setTextColor(ContextCompat.getColor(context, android.R.color.holo_blue_dark))
+            setOnClickListener { openUrl(ABOUT_LATEST) }
         })
         layout.addView(TextView(this).apply {
             text     = "Version ${appVersion()}"
