@@ -214,9 +214,15 @@ class TunnelManager {
         this._snatPool        = null;       // queue of free IPs (strings)
         this._snatByLk        = new Map();  // lk → assigned IP
         this._lkBySnat        = new Map();  // assigned IP → lk
-        // Per-caller bandwidth overrides (in-memory, like Android). Re-applied
-        // when the same caller reconnects within the same process lifetime.
-        this._callerLimits    = new Map();  // callerId → { upBps, downBps }
+        // Per-caller bandwidth overrides. Hydrated from AdmissionStore (the
+        // merged allow-list-with-limits store) so a process restart still
+        // applies the same cap when an admitted caller reconnects. Filter out
+        // entries with zero limits — those mean "use default", same as not being
+        // in the override map at all.
+        this._callerLimits    = new Map();
+        for (const [callerId, lim] of AdmissionStore.getAllLimits()) {
+            if (lim.upBps > 0 || lim.downBps > 0) this._callerLimits.set(callerId, lim);
+        }
         // Client tunnel state — single attempt, no auto-retry.
         this._callId           = null;     // most recent callId of our outgoing client-mode call
         this._callIds          = new Set();// callIds whose callEnded should still trip a permanent stop
@@ -298,8 +304,13 @@ class TunnelManager {
         if (!lk) return false;
         if (lk._upBucket)   lk._upBucket.setRate(upBps);
         if (lk._downBucket) lk._downBucket.setRate(downBps);
-        // Persist per-caller so a reconnect picks up the same cap.
-        if (lk._callerId) this._callerLimits.set(lk._callerId, { upBps, downBps });
+        if (lk._callerId) {
+            this._callerLimits.set(lk._callerId, { upBps, downBps });
+            // Persist only for admitted callers (AdmissionStore.setLimit returns false
+            // otherwise — that's a session-only override matching the user's mental
+            // model where limits "stick to admissions").
+            AdmissionStore.setLimit(lk._callerId, upBps, downBps);
+        }
         return true;
     }
 
