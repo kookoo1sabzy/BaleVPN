@@ -142,10 +142,13 @@ class AndroidLiveKitTransport(
         scope.launch {
             for (data in sendQueue) {
                 try {
-                    withContext(Dispatchers.Main) {
-                        // LOSSY → WebRTC data channel with maxRetransmits=0, ordered=false
-                        r.localParticipant.publishData(data, DataPublishReliability.LOSSY)
-                    }
+                    // publishData → engine.sendData → DataChannel.send(). DataChannel.send
+                    // is thread-safe in libwebrtc (internally posts to its own signaling
+                    // thread), so calling it from this IO coroutine is fine — no need to
+                    // bounce through Dispatchers.Main per packet. The Main hop used to add
+                    // a dispatch-back-and-forth on every send, queueing behind UI work.
+                    // LOSSY → WebRTC data channel with maxRetransmits=0, ordered=false.
+                    r.localParticipant.publishData(data, DataPublishReliability.LOSSY)
                 } catch (e: Exception) {
                     // Transient publish errors are normal at the start of a session
                     // ("Publisher isn't setup yet!") and after disconnect. Drop the packet
