@@ -26,20 +26,27 @@
 process.on('uncaughtException',  e => console.error('[Process] uncaughtException:',  e.message, e.stack));
 process.on('unhandledRejection', e => console.error('[Process] unhandledRejection:', e?.message ?? e));
 
-const { TUNNEL_MODE, HTTP_PORT, RUNTIME_DIR } = require('./constants');
+const { TUNNEL_MODE, HTTP_PORT } = require('./constants');
 const { BaleWsClient }           = require('./bale-ws');
 const httpServer                 = require('./http-server');
 
 // ── Single-instance guard ─────────────────────────────────────────────────────
 //
-// Two instances would compete for the same TUN device and trash each other's
-// routing. We claim a PID lock file at startup; if another live instance
-// already holds it, refuse to start. Stale locks (process died without
-// cleaning up) are taken over after a `process.kill(pid, 0)` liveness probe.
+// Two instances would compete for the same TUN device (`bale0`) and trash
+// each other's routing. The TUN device is system-wide, so the guard must be
+// system-wide too — one shared lock file across all users on the host. We
+// claim a PID lock at startup; if another live instance already holds it,
+// refuse to start. Stale locks (process died without cleaning up) are taken
+// over after a `process.kill(pid, 0)` liveness probe.
+//
+// Lives in the OS temp dir (not next to the binary) because it's process
+// state, not user config — temp files are cleared on reboot, which is exactly
+// what we want for stale-lock recovery.
 (function acquireSingleInstanceLock() {
     const fs   = require('fs');
     const path = require('path');
-    const lockPath = path.join(RUNTIME_DIR, '.bale-vpn.lock');
+    const os   = require('os');
+    const lockPath = path.join(os.tmpdir(), '.bale-vpn.lock');
 
     if (fs.existsSync(lockPath)) {
         const txt = (() => { try { return fs.readFileSync(lockPath, 'utf8').trim(); } catch (_) { return ''; } })();

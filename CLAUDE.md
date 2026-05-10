@@ -266,7 +266,7 @@ The Android server (`BaleServerService`) doesn't need SNAT — its per-client `P
 
 ### Single-instance lock (Node)
 
-`bale-proxy.js` claims a PID lock file at `${RUNTIME_DIR}/.bale-vpn.lock` **before any other startup** — running TUN setup or HTTP listen first would step on a live instance. On startup:
+`bale-proxy.js` claims a PID lock file at `${os.tmpdir()}/.bale-vpn.lock` **before any other startup** — running TUN setup or HTTP listen first would step on a live instance. The lock lives in the OS temp dir (not next to the binary or config) because it's process state — temp files are cleared on reboot, exactly what we want for stale-lock recovery. One shared lock per host (no username suffix) because the TUN device `bale0` is system-wide; only one instance can own it regardless of which user runs it. On startup:
 1. If lock file exists → read PID → probe with `process.kill(pid, 0)` (`ESRCH` ⇒ dead, `EPERM` ⇒ alive on another user, no-throw ⇒ alive).
 2. Live PID → print error and `exit(1)` with the lock path so the user can manually clear it if needed.
 3. Dead PID → log "stale lock, taking over" and overwrite.
