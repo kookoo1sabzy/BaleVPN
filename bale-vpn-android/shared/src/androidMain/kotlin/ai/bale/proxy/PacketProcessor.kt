@@ -69,8 +69,32 @@ import java.nio.channels.Selector
 import java.nio.channels.SocketChannel
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.random.Random
+
+/** Aggregate per-PacketProcessor stats snapshot. Computed on NatDispatcher every
+ *  STATS_REFRESH_MS and read across threads via the @Volatile field on PacketProcessor. */
+data class PacketStats(
+    val tcpFlows:        Int,
+    val udpFlows:        Int,
+    val stateBreakdown:  Map<String, Int>,   // ESTABLISHED → 7, TIME_WAIT → 2, …
+    val srttMinMs:       Long,
+    val srttMedianMs:    Long,
+    val srttMaxMs:       Long,
+    val rttvarMedianMs:  Long,
+    val rtoMedianMs:     Long,
+    val cwndAvgSegs:     Float,
+    val flightTotalBytes: Long,
+    val rtoRetxTotal:    Long,
+    val fastRetxTotal:   Long,
+    val tlpFiresTotal:   Long,
+    val sackLossesTotal: Long,
+    val incomingQueueDepth: Int,
+    val incomingDrops:   Long,
+    val fragmentStreams: Int,
+    val globalRwndScale: Float,
+)
 
 private class TokenBucket {
     @Volatile var ratePerSec: Long = 0L   // 0 = unlimited
@@ -120,6 +144,9 @@ private const val TCP_IDLE_MS      = 5 * 60 * 1000L
 private const val UDP_IDLE_MS      = 2 * 60 * 1000L
 // Hashed-wheel slot interval and slot counts (= idleMs / checkMs + 1).
 private const val SESSION_CHECK_MS = 30_000L
+// Cadence of the in-process stats snapshot. Reads tcp/udp/fragBufs maps (NatDispatcher-only)
+// and stashes a PacketStats into lastSnapshot for cross-thread UI consumption.
+private const val STATS_SNAPSHOT_MS = 1_000L
 private const val TCP_SLOTS        = 11
 private const val UDP_SLOTS        = 5
 // On-the-wire MSS for the IP packets we synthesize back to the peer (1500-byte MTU minus headers).
@@ -150,6 +177,11 @@ class PacketProcessor(
     // ever happen on NatDispatcher, so no atomicity needed for ++ updates.
     @Volatile var rxPkts = 0L; @Volatile var rxBytes = 0L   // client → internet (charged after upload bucket admits)
     @Volatile var txPkts = 0L; @Volatile var txBytes = 0L   // internet → client (charged at sendToClient)
+    /** Incremented from any thread when process()'s offer to `incoming` fails (queue full). */
+    private val incomingDrops = AtomicLong(0L)
+    /** Last computed stats snapshot; refreshed on NatDispatcher every STATS_SNAPSHOT_MS.
+     *  Readers (UI thread) use the @Volatile read directly — no synchronisation needed. */
+    @Volatile var lastSnapshot: PacketStats? = null
 
     // ── Rate limiting (per direction) ────────────────────────────────────────
     private val upBucket   = TokenBucket()   // gates client → internet (drops drain rate of `incoming`)
@@ -221,13 +253,84 @@ class PacketProcessor(
     init {
         scope.launch { mainLoop() }
         scope.launch { cleanupLoop() }
+        scope.launch { snapshotLoop() }
     }
 
     // Enqueue a raw IP packet from the TUN read loop (may be called from any thread).
     // Drops silently when the queue is full; wakeup() lets mainLoop drain immediately.
     fun process(pkt: ByteArray) {
         if (incoming.offer(pkt)) selector.wakeup()
-        else dbg { "drop: incoming queue full (${pkt.size}B, cap=$MAX_INCOMING_PKTS)" }
+        else { incomingDrops.incrementAndGet(); dbg { "drop: incoming queue full (${pkt.size}B, cap=$MAX_INCOMING_PKTS)" } }
+    }
+
+    private suspend fun snapshotLoop() {
+        while (scope.isActive) {
+            delay(STATS_SNAPSHOT_MS)
+            lastSnapshot = computeSnapshot()
+        }
+    }
+
+    private fun computeSnapshot(): PacketStats {
+        val n = tcp.size
+        val srtts   = LongArray(n)
+        val rttvars = LongArray(n)
+        val rtos    = LongArray(n)
+        val states  = HashMap<String, Int>()
+        var i = 0
+        var cwndSum    = 0L
+        var flightTot  = 0L
+        var rtoRetx    = 0L
+        var fastRetx   = 0L
+        var tlpFires   = 0L
+        var sackLosses = 0L
+        for (s in tcp.values) {
+            srtts[i]   = s.srttMs
+            rttvars[i] = s.rttvarMs
+            rtos[i]    = s.rtoMs
+            i++
+            cwndSum    += s.cwndSegs
+            flightTot  += s.flightBytes()
+            rtoRetx    += s.rtoRetxCount
+            fastRetx   += s.fastRetxCount
+            tlpFires   += s.tlpFireCount
+            sackLosses += s.sackLossCount
+            states.merge(s.tcpStateName, 1) { old, _ -> old + 1 }
+        }
+        // Median = middle of sorted array (or average of two middles for even n);
+        // we just take the lower middle since UI display rounds to whole ms anyway.
+        srtts.sort(); rttvars.sort(); rtos.sort()
+        val srttMed   = if (n == 0) 0L else srtts[n / 2]
+        val rttvarMed = if (n == 0) 0L else rttvars[n / 2]
+        val rtoMed    = if (n == 0) 0L else rtos[n / 2]
+        // Skip 0 (no-RTT-sample-yet) when computing min so a freshly opened flow
+        // doesn't make every aggregate read as "0 ms".
+        var srttMin = Long.MAX_VALUE; var srttMax = 0L
+        for (v in srtts) {
+            if (v <= 0L) continue
+            if (v < srttMin) srttMin = v
+            if (v > srttMax) srttMax = v
+        }
+        if (srttMin == Long.MAX_VALUE) srttMin = 0L
+        return PacketStats(
+            tcpFlows           = n,
+            udpFlows           = udp.size,
+            stateBreakdown     = states,
+            srttMinMs          = srttMin,
+            srttMedianMs       = srttMed,
+            srttMaxMs          = srttMax,
+            rttvarMedianMs     = rttvarMed,
+            rtoMedianMs        = rtoMed,
+            cwndAvgSegs        = if (n == 0) 0f else cwndSum.toFloat() / n,
+            flightTotalBytes   = flightTot,
+            rtoRetxTotal       = rtoRetx,
+            fastRetxTotal      = fastRetx,
+            tlpFiresTotal      = tlpFires,
+            sackLossesTotal    = sackLosses,
+            incomingQueueDepth = incoming.size,
+            incomingDrops      = incomingDrops.get(),
+            fragmentStreams    = fragBufs.size,
+            globalRwndScale    = globalRwndScale,
+        )
     }
 
     private fun processPacket(pkt: ByteArray) {
@@ -894,6 +997,23 @@ class TcpSession(
 
     var closed = false
 
+    // ── Stats counters (read-only from snapshot path) ────────────────────────
+    // Incremented only on NatDispatcher; read on the same dispatcher in
+    // PacketProcessor.computeSnapshot. Tally events worth surfacing in the UI.
+    var rtoRetxCount:  Long = 0L     // RTO firings that actually retransmitted data (incl. SYN-ACK retries)
+    var fastRetxCount: Long = 0L     // fast-recovery entries (3-dup-ACK or RFC 6675 SACK-IsLost)
+    var tlpFireCount:  Long = 0L     // RFC 8985 Tail Loss Probes fired
+    var sackLossCount: Long = 0L     // fast-recovery entries that came from the SACK-IsLost path
+
+    // Snapshot accessors. Members are private to keep the public surface small;
+    // these are deliberately exposed for the stats path.
+    internal val tcpStateName: String get() = state.name
+    internal val srttMs:       Long   get() = srtt
+    internal val rttvarMs:     Long   get() = rttvar
+    internal val rtoMs:        Long   get() = rto
+    internal val cwndSegs:     Int    get() = cwnd
+    internal fun  flightBytes(): Long = flightSize()
+
     private fun seq32After(a: Long, b: Long): Boolean {
         val d = (a - b) and 0xFFFFFFFFL
         return d in 1L..0x7FFFFFFFL
@@ -1292,18 +1412,20 @@ class TcpSession(
         // makes single-dup-ACK responses to a TLP probe trigger immediate recovery instead of
         // waiting for the RFC 5681 3-dup-ACK threshold (which usually never arrives on tail loss).
         if (sackPermitted && hasLostSegment()) {
-            enterFastRecovery()
+            enterFastRecovery(viaSack = true)
             return
         }
         // RFC 5681 fallback: classic 3-dup-ACK threshold (no SACK, or insufficient evidence yet).
-        if (++dupAckCount == DUP_ACK_THRESH) enterFastRecovery()
+        if (++dupAckCount == DUP_ACK_THRESH) enterFastRecovery(viaSack = false)
     }
 
-    private fun enterFastRecovery() {
+    private fun enterFastRecovery(viaSack: Boolean) {
         ssthresh = maxOf((flightSize() / (2L * TCP_MSS)).toInt(), SSTHRESH_MIN)
         cwnd = ssthresh + DUP_ACK_THRESH                          // inflate cwnd
         recoverPoint = ourSeq                                     // sndNxt at recovery entry
         inFastRecovery = true; dupAckCount = 0; acksInCa = 0
+        fastRetxCount++
+        if (viaSack) sackLossCount++
         retransmitAllHoles()                                      // RFC 6675: retransmit holes within cwnd-pipe budget
         dbg { "TCP $dPort fast-recovery cwnd→$cwnd ssthresh=$ssthresh recover@$recoverPoint" }
     }
@@ -1514,6 +1636,7 @@ class TcpSession(
     fun fireTlp() {
         tlpDeadlineMs = Long.MAX_VALUE
         if (closed || sndBuf.isEmpty()) return
+        tlpFireCount++
         // Karn's algorithm: don't sample RTT on a retransmitted segment, otherwise we'd
         // measure original-send → ACK and corrupt the smoothed estimator with huge values.
         if (rttSeq != null) rttSeq = null
@@ -1547,6 +1670,7 @@ class TcpSession(
                 return true
             }
             rto = minOf(rto * 2, RTO_MAX)
+            rtoRetxCount++
             dbg { "TCP $dPort SYN-ACK retransmit (try=$rtoRetries next-rto=${rto}ms)" }
             sendSynAck()
             rtoDeadlineMs = System.currentTimeMillis() + rto
@@ -1563,6 +1687,7 @@ class TcpSession(
         sackedBytes = 0L
         ssthresh = maxOf((flightSize() / (2L * TCP_MSS)).toInt(), SSTHRESH_MIN); cwnd = 1; acksInCa = 0
         rto = minOf(rto * 2, RTO_MAX)
+        rtoRetxCount++
         dbg { "TCP $dPort RTO retransmit (try=$rtoRetries flight=${flightSize()}B cwnd→1 ssthresh→$ssthresh next-rto=${rto}ms)" }
         retransmitFirst()
         rtoDeadlineMs = System.currentTimeMillis() + rto   // re-arm

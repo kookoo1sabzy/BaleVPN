@@ -54,6 +54,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("debug")
             ndk { abiFilters += listOf("arm64-v8a") }
             if (hasReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")

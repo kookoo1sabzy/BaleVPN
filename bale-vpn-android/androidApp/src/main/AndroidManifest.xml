@@ -40,6 +40,10 @@
             android:name=".ServerClientsActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".ClientStatsActivity"
+            android:exported="false" />
+
         <service
             android:name=".BaleServerService"
             android:exported="false"

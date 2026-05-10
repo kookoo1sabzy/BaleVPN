@@ -3,6 +3,7 @@ package ai.bale.proxy
 import ai.bale.proxy.bale.CallEntity
 import ai.bale.proxy.livekit.AndroidLiveKitTransport
 import ai.bale.proxy.tunnel.DataTransport
+import ai.bale.proxy.tunnel.LiveKitStats
 import ai.bale.proxy.tunnel.TFrame
 import ai.bale.proxy.tunnel.lkDecode
 import ai.bale.proxy.tunnel.lkEncode
@@ -34,6 +35,13 @@ class BaleServerService : Service() {
         val limitUpBps:   Long    = 0,
         val limitDownBps: Long    = 0,
         val isThrottled:  Boolean = false,
+        // Latest TCP/UDP/IP stats from this client's PacketProcessor (null until the
+        // first snapshot has been computed). Read by ClientStatsActivity.
+        val packetStats:  PacketStats? = null,
+        // Latest WebRTC transport stats from this client's LiveKit room. Null when
+        // the SDK hasn't reported a nominated candidate-pair yet (usually the first
+        // ~1 s after connect).
+        val lkStats:      LiveKitStats? = null,
     )
 
     data class PendingCall(
@@ -418,6 +426,8 @@ class BaleServerService : Service() {
                 limitUpBps   = c.processor.limitUpBps,
                 limitDownBps = c.processor.limitDownBps,
                 isThrottled  = c.processor.isThrottled,
+                packetStats  = c.processor.lastSnapshot,
+                lkStats      = c.transport.lastStats,
             )
         }.sortedBy { it.connectedAt }
     }
