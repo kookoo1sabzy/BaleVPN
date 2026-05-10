@@ -1,6 +1,7 @@
 package ai.bale.proxy.livekit
 
 import ai.bale.proxy.tunnel.DataTransport
+import ai.bale.proxy.tunnel.LiveKitStats
 import android.content.Context
 import android.util.Log
 import io.livekit.android.AudioOptions
@@ -15,10 +16,16 @@ import io.livekit.android.room.Room
 import io.livekit.android.room.track.DataPublishReliability
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import livekit.org.webrtc.RTCStatsReport
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.resume
 
 private const val TAG            = "BaleVPN"
 private const val QUEUE_CAPACITY = 256
+// Cadence of LiveKit getStats() polling. Cheap call (~ms) but no point flooring it
+// finer than UI refresh; the candidate-pair RTT itself is computed roughly once
+// per STUN binding, which is on the order of seconds.
+private const val LK_STATS_POLL_MS = 1_000L
 
 class AndroidLiveKitTransport(
     private val context:    Context,
@@ -30,6 +37,9 @@ class AndroidLiveKitTransport(
         get() = room?.remoteParticipants?.isNotEmpty() == true
     override var onData:         ((ByteArray) -> Unit)? = null
     override var onDisconnected: (() -> Unit)?          = null
+
+    @Volatile private var _lastStats: LiveKitStats? = null
+    override val lastStats: LiveKitStats? get() = _lastStats
 
     private var room:           Room? = null
     private val scope           = CoroutineScope(dispatcher + SupervisorJob())
@@ -145,6 +155,48 @@ class AndroidLiveKitTransport(
                 }
             }
         }
+
+        scope.launch { statsPollLoop() }
+    }
+
+    private suspend fun statsPollLoop() {
+        while (scope.isActive) {
+            delay(LK_STATS_POLL_MS)
+            val r = room ?: continue
+            if (!isConnected) continue
+            val report = runCatching { collectPublisherStats(r) }.getOrNull() ?: continue
+            _lastStats = parseStats(report)
+        }
+    }
+
+    private suspend fun collectPublisherStats(r: Room): RTCStatsReport =
+        suspendCancellableCoroutine { cont ->
+            r.getPublisherRTCStats { report -> if (cont.isActive) cont.resume(report) }
+        }
+
+    /** Pulls the nominated ICE candidate-pair from an `RTCStatsReport` and pulls the
+     *  fields we care about. Field types follow the WebRTC stats spec — `Double` for
+     *  rates and times, `BigInteger` for byte/packet counters. */
+    private fun parseStats(report: RTCStatsReport): LiveKitStats {
+        var rttMs:     Long = -1
+        var bytesS:    Long = -1
+        var bytesR:    Long = -1
+        var pktsS:     Long = -1
+        var pktsR:     Long = -1
+        var availOut:  Long = -1
+        for (s in report.statsMap.values) {
+            if (s.type != "candidate-pair") continue
+            if (s.members["nominated"] != true) continue
+            val m = s.members
+            (m["currentRoundTripTime"] as? Double)?.let { rttMs = (it * 1000.0).toLong() }
+            (m["bytesSent"] as? java.math.BigInteger)?.let { bytesS = it.toLong() }
+            (m["bytesReceived"] as? java.math.BigInteger)?.let { bytesR = it.toLong() }
+            (m["packetsSent"] as? java.math.BigInteger)?.let { pktsS = it.toLong() }
+            (m["packetsReceived"] as? java.math.BigInteger)?.let { pktsR = it.toLong() }
+            (m["availableOutgoingBitrate"] as? Double)?.let { availOut = it.toLong() }
+            break  // there's only one nominated pair at a time
+        }
+        return LiveKitStats(rttMs, bytesS, bytesR, pktsS, pktsR, availOut)
     }
 
     override fun send(data: ByteArray) { sendQueue.trySend(data) }

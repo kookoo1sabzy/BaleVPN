@@ -138,8 +138,10 @@ class ServerClientsActivity : BaseActivity() {
             alpha     = 0.7f
             visibility = View.GONE
         }
+        // Vertical container that holds 1–2 horizontal sub-rows of action buttons.
+        // We wrap to 2 rows so 4 buttons aren't squeezed into a single line on narrow phones.
         val btnRow = LinearLayout(this).apply {
-            orientation  = LinearLayout.HORIZONTAL
+            orientation  = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             setPadding(0, (4 * dp).toInt(), 0, 0)
@@ -160,14 +162,17 @@ class ServerClientsActivity : BaseActivity() {
 
         val dp       = resources.displayMetrics.density
         val btnStyle = com.google.android.material.R.attr.materialButtonOutlinedStyle
-        val hPad     = (10 * dp).toInt(); val vPad = (2 * dp).toInt()
-        fun makeBtn(label: String, onClick: () -> Unit) =
+        val hPad     = (8 * dp).toInt(); val vPad = (2 * dp).toInt()
+        val gap      = (6 * dp).toInt()
+        // Each button gets weight=1 inside its row, so a row with 1 button stretches it
+        // full-width and a row with 2 splits 50/50. Touch targets stay finger-friendly
+        // even on narrow phones.
+        fun makeBtn(label: String, isFirstInRow: Boolean, onClick: () -> Unit) =
             MaterialButton(this, null, btnStyle).apply {
                 text     = label; textSize = 11f
                 setPadding(hPad, vPad, hPad, vPad); insetTop = 0; insetBottom = 0
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-                    .also { it.setMargins(0, 0, (6 * dp).toInt(), 0) }
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    .also { it.setMargins(if (isFirstInRow) 0 else gap, 0, 0, 0) }
                 setOnClickListener { onClick() }
             }
 
@@ -210,17 +215,44 @@ class ServerClientsActivity : BaseActivity() {
             row.setBackgroundColor(Color.TRANSPARENT)
         }
 
-        // Rebuild button row to reflect current connected/allowed state
+        // Rebuild button rows. Order is Disconnect, Remove, Limit, Stats — ordered roughly
+        // by how disruptive the action is, with read-only Stats last. Buttons are wrapped
+        // 2-per-row so 4 of them don't crowd a single line.
         btnRow.removeAllViews()
-        if (entry.info != null) {
-            btnRow.addView(makeBtn("Disconnect") { BaleServerService.disconnectClient(entry.info.callId) })
-            btnRow.addView(makeBtn("Limit") { showLimitDialog(entry.info) })
+        val actions = mutableListOf<Pair<String, () -> Unit>>()
+        if (entry.info != null) actions += "Disconnect" to { BaleServerService.disconnectClient(entry.info.callId) }
+        if (entry.isAllowed)    actions += "Remove" to {
+            AdmissionStore.remove(entry.callerId)
+            if (entry.info != null) BaleServerService.disconnectClient(entry.info.callId)
         }
-        if (entry.isAllowed) {
-            btnRow.addView(makeBtn("Remove") {
-                AdmissionStore.remove(entry.callerId)
-                if (entry.info != null) BaleServerService.disconnectClient(entry.info.callId)
-            })
+        if (entry.info != null) {
+            actions += "Limit" to { showLimitDialog(entry.info) }
+            actions += "Stats" to {
+                startActivity(android.content.Intent(this, ClientStatsActivity::class.java)
+                    .putExtra(ClientStatsActivity.EXTRA_CALL_ID, entry.info.callId))
+            }
+        }
+        val rows = actions.chunked(2)
+        // Pad short trailing rows with invisible spacers only when there's a wider row
+        // above — a single-row layout (e.g. lone "Remove") should still stretch full-width.
+        val widestRow = rows.maxOfOrNull { it.size } ?: 0
+        rows.forEachIndexed { rowIdx, chunk ->
+            val sub = LinearLayout(this).apply {
+                orientation  = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                ).also { if (rowIdx > 0) it.topMargin = gap }
+            }
+            chunk.forEachIndexed { i, (label, onClick) ->
+                sub.addView(makeBtn(label, isFirstInRow = (i == 0), onClick = onClick))
+            }
+            repeat(widestRow - chunk.size) {
+                sub.addView(View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, 0, 1f)
+                        .also { it.setMargins(gap, 0, 0, 0) }
+                })
+            }
+            btnRow.addView(sub)
         }
     }
 

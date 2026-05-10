@@ -341,6 +341,7 @@ bale-vpn-android/
     OtpActivity.kt               # OTP code + optional name → validateCode/signUp → token
     ContactsActivity.kt          # contact list — pick mode (client) or manage mode (server) with Add/Remove
     ServerClientsActivity.kt     # server-mode UI: per-client live stats, bandwidth caps, admission
+    ClientStatsActivity.kt       # per-client TCP/UDP/transport telemetry (RTT, retx, cwnd, …)
 ```
 
 ### Auth flow (SMS OTP)
@@ -583,12 +584,31 @@ Each row shows:
 - Background turns **green** for connected, **red** while `isThrottled` is true
 
 Per-row actions:
+- **Stats** — opens `ClientStatsActivity` for that client (see below).
 - **Disconnect** — `BaleServerService.disconnectClient`.
-- **Limit** — dialog to set per-direction kbps cap (1–500). Stored by `callerId`, re-applied on reconnect. Pre-fills with the current value or the default cap if none.
+- **Limit** — dialog to set per-direction kbps cap (1–1000). Stored by `callerId`, re-applied on reconnect. Pre-fills with the current value or the default cap if none.
 - **Remove** — only on rows in the allow-list; removes and disconnects.
 
 Action-bar overflow:
 - **Debug logs ON/OFF** — toggles `BaleServerService.debug`, propagated to every live `PacketProcessor` and persisted.
+
+### Per-client stats (`ClientStatsActivity`)
+
+Reached from the **Stats** button on a row in `ServerClientsActivity`. Reads the same `BaleServerService.getClientInfos()` snapshot every 1 s, picks out the row matching the `callId` it was opened with, and finishes itself if the client disconnects or the server stops.
+
+Three data sources merge per snapshot:
+
+1. **`PacketProcessor.lastSnapshot`** (`PacketStats`) — recomputed every `STATS_SNAPSHOT_MS` (1 s) on the NAT dispatcher and stashed in a `@Volatile` field for lock-free cross-thread reads. Iterates `tcp.values` / `udp.values` / `fragBufs` in-place (safe because the read happens on the same NAT dispatcher as all mutations) and emits aggregates: flow counts, state breakdown, SRTT min/median/max, RTTVar median, RTO median, cwnd avg, FlightSize total, and the four event counters (`rtoRetxCount`, `fastRetxCount`, `tlpFireCount`, `sackLossCount` — incremented in `fireRto`, `enterFastRecovery`, `fireTlp` respectively). Plus `incoming.size` / `incomingDrops` / `globalRwndScale`.
+2. **`AndroidLiveKitTransport.lastStats`** (`LiveKitStats`) — polled every 1 s via `Room.getPublisherRTCStats { … }`. Filters the `RTCStatsReport` for `type=candidate-pair && nominated=true` and pulls `currentRoundTripTime` (×1000 → ms), `bytesSent` / `bytesReceived` / `packetsSent` / `packetsReceived` (BigInteger), `availableOutgoingBitrate` (bps). All fields are `-1` until the SDK has reported a nominated pair (≈ first second after connect).
+3. **Live IP-level counters** (`PacketProcessor.{rxPkts,rxBytes,txPkts,txBytes}`) — already on `ClientInfo`; rendered alongside the WebRTC byte counters as a sanity cross-check.
+
+Layout: vertical-scroll programmatic UI with sections (Transport / TCP / UDP / System), monospace key-value rows. No XML layout — the row count is small and dense.
+
+`PacketStats` semantics:
+- `srttMinMs` skips zero-valued sessions (no RTT sample yet) so a freshly-opened flow doesn't drag the min to 0.
+- `srttMedianMs` / `rttvarMedianMs` / `rtoMedianMs` use the lower-middle index (no average for even n) — display is rounded to whole ms anyway.
+- `cwndAvgSegs` is in MSS-sized units, matching `TcpSession.cwnd`'s internal unit.
+- `incomingDrops` is an `AtomicLong` because `PacketProcessor.process()` may be invoked from any thread.
 
 ### Proto extraction caveats
 - `bytes` fields in generated `.proto` files are sometimes actually nested submessages serialized as raw bytes (the extractor couldn't resolve the type name from minified code).
