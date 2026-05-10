@@ -96,9 +96,13 @@ class BaleServerService : Service() {
         // replaces an older "connected" alert from the same caller.
         private const val CLIENT_EVENT_NOTIF_BASE = 1_000
         // Default per-client cap. Stored as bytes/sec (the token-bucket charges packet sizes
-        // in bytes), but expressed to the user in kilobits/sec. 37_500 B/s = 300 kbps.
+        // in bytes), expressed to the user in kilobits/sec. 62_500 B/s = 500 kbps.
         // Every client is rate-limited; there is no "unlimited".
-        const val DEFAULT_LIMIT_BPS: Long = 62_500L   // 500 kbps
+        const val DEFAULT_LIMIT_BPS: Long = 62_500L    // 500 kbps
+        // Hard ceiling for per-caller overrides. The UI dialog clamps input here; AdmissionStore
+        // clamps stored values too so a hand-edited shared_prefs/config.xml can't smuggle in a
+        // 100 Mbps override.
+        const val MAX_LIMIT_BPS:     Long = 125_000L   // 1000 kbps = 1 Mbps
 
         @Volatile var isRunning   = false
         @Volatile var clientCount = 0
@@ -162,7 +166,13 @@ class BaleServerService : Service() {
             inst.clients[callId]?.also { c ->
                 c.processor.limitUpBps   = upBps
                 c.processor.limitDownBps = downBps
-                if (c.callerId != 0L) inst.callerLimits[c.callerId] = upBps to downBps
+                if (c.callerId != 0L) {
+                    inst.callerLimits[c.callerId] = upBps to downBps
+                    // Persist only for admitted callers. AdmissionStore.setLimit returns
+                    // false when the caller isn't in the allow-list — that's a session-only
+                    // override and matches the user's "limits stick to admissions" mental model.
+                    AdmissionStore.setLimit(c.callerId, upBps, downBps)
+                }
             }
         }
     }
@@ -185,6 +195,10 @@ class BaleServerService : Service() {
 
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
         AdmissionStore.init(prefs)
+        // Hydrate per-caller limits from the merged admission store so a
+        // service restart re-applies the same caps when those callers reconnect.
+        callerLimits.clear()
+        callerLimits.putAll(AdmissionStore.getAllLimits().filterValues { it.first > 0L || it.second > 0L })
         debug = prefs.getBoolean("packet_debug", false)
 
         // Always re-register; idempotent and ensures the latest lambda is in place

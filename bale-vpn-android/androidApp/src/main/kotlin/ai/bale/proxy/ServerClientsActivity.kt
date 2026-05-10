@@ -59,7 +59,10 @@ class ServerClientsActivity : BaseActivity() {
     // Overflow menu (About / TCP debug toggle / View app logs) lives in BaseActivity.
 
     companion object {
-        private const val MAX_LIMIT_KBPS   = 1000L   // hard ceiling for per-client bandwidth caps (1Mbps)
+        // Hard ceiling for per-client bandwidth caps. Derived from the shared
+        // BaleServerService.MAX_LIMIT_BPS so the dialog and AdmissionStore agree
+        // on the cap. 125_000 B/s × 8 / 1000 = 1000 kbps = 1 Mbps.
+        private val MAX_LIMIT_KBPS: Long = BaleServerService.MAX_LIMIT_BPS * 8L / 1_000L
     }
 
     // ── Unified list ──────────────────────────────────────────────────────────

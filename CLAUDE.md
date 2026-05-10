@@ -403,7 +403,7 @@ gRPC-web framing: 5-byte prefix `[0x00][4B big-endian length]` for data frames; 
 | `peerType` | `ContactsActivity` | `1`=private, `2`=group |
 | `peerName` | `ContactsActivity` | display name |
 | `packet_debug` | `BaleServerService.debug` setter | toggle verbose `PacketProcessor` diagnostics |
-| `allowed_callers` | `AdmissionStore` | comma-separated `callerId` allow-list |
+| `admissionList` | `AdmissionStore` | comma-separated allow-list with optional per-caller caps. Format: `<id>[:<upBps>:<downBps>]`, e.g. `12345,67890:62500:62500`. Bare IDs mean "use default cap." |
 
 **Startup routing** (`MainActivity.onCreate`):
 - No `token` → `PhoneAuthActivity`
@@ -498,7 +498,7 @@ Unlike the Node.js server mode (which requires Linux + `setcap cap_net_admin` + 
 **Per-caller state in `BaleServerService`**:
 - `clients` — map from `callId` to active `Client(callId, callerId, transport, processor)`.
 - `pendingMap` — calls waiting for user approval (deduplicated by `callerId`).
-- `callerLimits` — per-`callerId` bandwidth overrides; restored on reconnect within the same service lifetime.
+- `callerLimits` — in-memory per-`callerId` bandwidth overrides. Hydrated on service start from `AdmissionStore.getAllLimits()` (the merged allow-list-with-limits store). Writes go through `AdmissionStore.setLimit` for admitted callers; non-admitted callers' limits are session-only.
 
 **WS event reactions** (`checkAndHandleCall`):
 - **callerId == 0 → defer**. Bale fans out two updates per incoming call: `callReceived` (52810, sometimes with empty participants list → callerId=0) and `callStarted` (52807, carries adminUid). Order isn't guaranteed; the callerId=0 variant is dropped silently and the followup carries the real id. Prevents a transient "unknown caller" pending entry.
@@ -556,7 +556,7 @@ Defaults / ceilings:
 - **Node**: `DEFAULT_LIMIT_KBPS = 500`, `MAX_LIMIT_KBPS = 1000` (`constants.js`). Higher defaults reflect the typical Linux-server-with-bandwidth use case. Every client is rate-limited; there is no "unlimited" option.
 - Conversion in the UI: `kbpsToBytesPerSec(k) = k * 1_000 / 8`, `bytesPerSecToKbps(b) = b * 8 / 1_000`.
 
-Per-caller overrides live in `BaleServerService.callerLimits` (in-memory) and are re-applied automatically when the same caller reconnects within the same service lifetime.
+Per-caller overrides live in `BaleServerService.callerLimits` (in-memory), backed by `AdmissionStore` itself — the allow-list and the per-caller caps live in one store, one prefs key. Survives service restarts, mode toggles, and device reboots; same caller reconnects pick up their saved cap automatically. Limits set on a non-admitted caller (one-time accept without "remember") are session-only and never flush to disk. Stored values are clamped to `[0, BaleServerService.MAX_LIMIT_BPS]` on load so a hand-edited prefs file can't smuggle in an absurd override; identical clamp on the Node side via `MAX_LIMIT_KBPS` from `constants.js`.
 
 **Global TCP rwnd backpressure** (`PacketProcessor.updateGlobalPressure`): independent of the per-direction caps. Each `mainLoop` iteration after `drainIncoming` recomputes a `globalRwndScale ∈ [0, 1]` from the depth of the inbound `incoming` queue (`MAX_INCOMING_PKTS = 512`). Linear ramp between `GLOBAL_RWND_LO = 0.50` and `GLOBAL_RWND_HI = 0.90`. Each `TcpSession`'s advertised receive window is multiplied by the scale on every header build (`effectiveRcvAvail()`), so peers' kernels see a smaller window and reduce sending. When the scale rises by ≥0.1 (or unblocks from 0), `onGlobalRwndGrew` fans an ACK to every active session so any peer stalled at scale=0 wakes up promptly. UDP isn't covered — UDP has no flow control to push back on; oversize UDP bursts still drop at the `incoming` queue.
 
