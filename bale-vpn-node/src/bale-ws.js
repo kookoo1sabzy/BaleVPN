@@ -13,26 +13,22 @@
 //     authority — this class doesn't try to override that.
 
 const WebSocket = require('ws');
-const fs   = require('fs');
-const path = require('path');
 const {
     ACCESS_TOKEN, WS_URL, API_VERSION, PROTO_VERSION,
     PEERTYPE_PRIVATE, PEERTYPE_GROUP, EXPEERTYPE_PRIVATE, EXPEERTYPE_GROUP,
-    RUNTIME_DIR,
 } = require('./constants');
+const { ConfigStore } = require('./config-store');
 
-// Persistent token storage. Sits alongside .allowed-callers.json in the
-// runtime dir (next to the binary when packaged via pkg, or the package
-// root in dev). Mode 0600 — readable only by the user running the process.
-// Keeping the token here (and out of the browser) means an XSS in the UI
-// can no longer exfiltrate it: /config and /state report only a boolean.
-const TOKEN_FILE = path.join(RUNTIME_DIR, '.bale-token');
+// Persistent token storage. Lives in `.bale-vpn_config.json` (mode 0600)
+// alongside the admission/blacklist state — keeping it out of the browser
+// means an XSS in the UI can't exfiltrate it: /config and /state report
+// only a boolean.
 function loadPersistedToken() {
-    try { return fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch { return ''; }
+    return ConfigStore.get('token', '');
 }
 function persistToken(t) {
-    if (t) fs.writeFileSync(TOKEN_FILE, t, { mode: 0o600 });
-    else   try { fs.unlinkSync(TOKEN_FILE); } catch {}
+    if (t) ConfigStore.set('token', t);
+    else   ConfigStore.delete('token');
 }
 const {
     encodeHandshake, encodePing, encodeRpcRequest,

@@ -20,6 +20,7 @@ const {
 } = require('./wire-codecs');
 const { grpcCall, fetchAccessToken } = require('./grpc-web');
 const { AdmissionStore } = require('./admission');
+const { BlacklistStore } = require('./blacklist');
 const { HTML, csrfToken } = require('./ui-html');
 
 function create(client, connection) {
@@ -365,6 +366,9 @@ function create(client, connection) {
 
         if (req.method === 'POST' && url.pathname.startsWith('/tunnel/clients/') && url.pathname.endsWith('/disconnect')) {
             const callKey = decodeURIComponent(url.pathname.slice('/tunnel/clients/'.length, -'/disconnect'.length));
+            // Disconnect kicks the active session only. The caller stays in the
+            // allow-list (if they were there) and is free to call back. To
+            // permanently bar them, /server/pending/.../reject blacklists.
             const ok = client.tunnel.disconnectClient(callKey);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok }));
@@ -423,7 +427,9 @@ function create(client, connection) {
 
         if (req.method === 'POST' && url.pathname.startsWith('/server/pending/') && url.pathname.endsWith('/reject')) {
             const callId = decodeURIComponent(url.pathname.slice('/server/pending/'.length, -'/reject'.length));
-            const ok = await client.tunnel.rejectPending(callId);
+            // UI-driven reject blacklists; sweep-timeout (in tunnel.js) calls
+            // rejectPending without the flag.
+            const ok = await client.tunnel.rejectPending(callId, /* addToBlacklist */ true);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok }));
         }
@@ -457,6 +463,45 @@ function create(client, connection) {
         if (req.method === 'DELETE' && url.pathname.startsWith('/server/admission/')) {
             const callerId = Number(decodeURIComponent(url.pathname.slice('/server/admission/'.length)));
             const ok = AdmissionStore.remove(callerId);
+            // Mirror the Android Manage Clients "Remove" button: drop from allow-list
+            // AND kick any active session for this caller. Future calls go to pending.
+            for (const [callKey, lk] of client.tunnel.lkRooms) {
+                if (lk._callerId === callerId) { client.tunnel.disconnectClient(callKey); break; }
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ ok }));
+        }
+
+        // ── Blacklist management ──────────────────────────────────────────
+        if (req.method === 'GET' && url.pathname === '/server/blacklist') {
+            const list = await Promise.all(BlacklistStore.getAll().map(async callerId => ({
+                callerId,
+                callerName: await resolveCallerName(callerId),
+            })));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify(list));
+        }
+
+        if (req.method === 'POST' && url.pathname === '/server/blacklist') {
+            let body = '';
+            req.on('data', c => body += c);
+            req.on('end', () => {
+                try {
+                    const { callerId } = JSON.parse(body || '{}');
+                    const ok = BlacklistStore.add(Number(callerId));
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok }));
+                } catch (e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
+            return;
+        }
+
+        if (req.method === 'DELETE' && url.pathname.startsWith('/server/blacklist/')) {
+            const callerId = Number(decodeURIComponent(url.pathname.slice('/server/blacklist/'.length)));
+            const ok = BlacklistStore.remove(callerId);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok }));
         }

@@ -38,6 +38,9 @@ object AdmissionStore {
         if (callerId <= 0L) return
         val map = load()
         if (map.putIfAbsent(callerId, 0L to 0L) == null) save(map)
+        // Mutual exclusion with BlacklistStore: a caller can't be both allowed
+        // and blocked at the same time. Adding here un-blocks.
+        BlacklistStore.remove(callerId)
     }
 
     fun remove(callerId: Long) {

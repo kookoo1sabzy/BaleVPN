@@ -16,12 +16,10 @@
 // on load so a hand-edited `.allowed-callers.json` can't smuggle in an
 // absurd override (e.g. someone bumping their own cap to 1 Gbps via vim).
 
-const fs   = require('fs');
-const path = require('path');
-const { RUNTIME_DIR, MAX_LIMIT_KBPS } = require('./constants');
+const { MAX_LIMIT_KBPS } = require('./constants');
+const { ConfigStore }    = require('./config-store');
 
-const ADMISSION_FILE = path.join(RUNTIME_DIR, '.allowed-callers.json');
-const MAX_LIMIT_BPS  = MAX_LIMIT_KBPS * 1000 / 8;   // kbps → bytes/sec
+const MAX_LIMIT_BPS = MAX_LIMIT_KBPS * 1000 / 8;   // kbps → bytes/sec
 
 const clamp = v => Math.max(0, Math.min(MAX_LIMIT_BPS, Number(v) || 0));
 
@@ -29,36 +27,31 @@ const AdmissionStore = {
     _map: null,  // Map<number, { upBps, downBps }> — lazy-loaded
     _load() {
         if (this._map) return this._map;
-        try {
-            const raw = fs.readFileSync(ADMISSION_FILE, 'utf8');
-            const arr = JSON.parse(raw);
-            this._map = new Map();
-            for (const e of arr) {
-                if (typeof e === 'number' && Number.isInteger(e) && e > 0) {
-                    this._map.set(e, { upBps: 0, downBps: 0 });
-                } else if (e && Number.isInteger(e.callerId) && e.callerId > 0) {
-                    const upRaw   = Number(e.upBps)   || 0;
-                    const downRaw = Number(e.downBps) || 0;
-                    const up   = clamp(upRaw);
-                    const down = clamp(downRaw);
-                    if (up !== upRaw || down !== downRaw) {
-                        console.warn(`[Admission] clamped caller ${e.callerId} limits ` +
-                                     `(up=${upRaw}→${up}, down=${downRaw}→${down})`);
-                    }
-                    this._map.set(e.callerId, { upBps: up, downBps: down });
+        const arr = ConfigStore.get('admission', []);
+        this._map = new Map();
+        for (const e of arr) {
+            if (typeof e === 'number' && Number.isInteger(e) && e > 0) {
+                this._map.set(e, { upBps: 0, downBps: 0 });
+            } else if (e && Number.isInteger(e.callerId) && e.callerId > 0) {
+                const upRaw   = Number(e.upBps)   || 0;
+                const downRaw = Number(e.downBps) || 0;
+                const up   = clamp(upRaw);
+                const down = clamp(downRaw);
+                if (up !== upRaw || down !== downRaw) {
+                    console.warn(`[Admission] clamped caller ${e.callerId} limits ` +
+                                 `(up=${upRaw}→${up}, down=${downRaw}→${down})`);
                 }
+                this._map.set(e.callerId, { upBps: up, downBps: down });
             }
-        } catch { this._map = new Map(); }
+        }
         return this._map;
     },
     _save() {
-        try {
-            const arr = [...this._map.entries()].map(([callerId, { upBps, downBps }]) => {
-                if (!upBps && !downBps) return callerId;          // bare-ID for compactness
-                return { callerId, upBps, downBps };
-            });
-            fs.writeFileSync(ADMISSION_FILE, JSON.stringify(arr));
-        } catch (e) { console.error('[Admission] save failed:', e.message); }
+        const arr = [...this._map.entries()].map(([callerId, { upBps, downBps }]) => {
+            if (!upBps && !downBps) return callerId;          // bare-ID for compactness
+            return { callerId, upBps, downBps };
+        });
+        ConfigStore.set('admission', arr);
     },
     isAllowed(uid) { return Number(uid) > 0 && this._load().has(Number(uid)); },
     getAll()       { return [...this._load().keys()]; },
@@ -76,10 +69,12 @@ const AdmissionStore = {
         const n = Number(uid);
         if (!n || n <= 0) return false;
         const m = this._load();
-        if (m.has(n)) return false;
-        m.set(n, { upBps: 0, downBps: 0 });
-        this._save();
-        return true;
+        const newlyAdded = !m.has(n);
+        if (newlyAdded) { m.set(n, { upBps: 0, downBps: 0 }); this._save(); }
+        // Mutual exclusion with BlacklistStore: a caller can't be both allowed
+        // and blocked. Lazy-require to avoid a circular module-load cycle.
+        try { require('./blacklist').BlacklistStore.remove(n); } catch {}
+        return newlyAdded;
     },
     remove(uid) {
         const n = Number(uid);

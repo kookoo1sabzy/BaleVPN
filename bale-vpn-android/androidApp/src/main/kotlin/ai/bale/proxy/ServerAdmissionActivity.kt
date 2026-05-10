@@ -21,7 +21,9 @@ class ServerAdmissionActivity : BaseActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        AdmissionStore.init(getSharedPreferences("config", MODE_PRIVATE))
+        val prefs = getSharedPreferences("config", MODE_PRIVATE)
+        AdmissionStore.init(prefs)
+        BlacklistStore.init(prefs)
         setContentView(R.layout.activity_server_admission)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.title = "Allowed Clients"

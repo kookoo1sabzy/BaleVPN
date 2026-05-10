@@ -29,7 +29,9 @@ class ServerClientsActivity : BaseActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        AdmissionStore.init(getSharedPreferences("config", MODE_PRIVATE))
+        val prefs = getSharedPreferences("config", MODE_PRIVATE)
+        AdmissionStore.init(prefs)
+        BlacklistStore.init(prefs)
         setContentView(R.layout.activity_server_clients)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         supportActionBar?.title = "Manage Clients"
@@ -67,27 +69,51 @@ class ServerClientsActivity : BaseActivity() {
 
     // ── Unified list ──────────────────────────────────────────────────────────
 
+    /** Visual grouping for separator placement. Two consecutive entries with
+     *  different groups get a divider between them. */
+    private enum class Group { CONNECTED, ALLOWED, BLOCKED, OTHER }
+
+    private fun buildSeparator(): View {
+        val dp = resources.displayMetrics.density
+        return View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, (1 * dp).toInt()
+            ).also {
+                it.topMargin    = (8 * dp).toInt()
+                it.bottomMargin = (8 * dp).toInt()
+            }
+            setBackgroundColor(Color.argb(60, 128, 128, 128))
+        }
+    }
+
     private data class Entry(
         val rowKey:    Long,
         val callerId:  Long,
         val isAllowed: Boolean,
+        val isBlocked: Boolean,
         val info:      BaleServerService.ClientInfo?,
     )
 
     private fun buildEntries(): List<Entry> {
         val infos     = BaleServerService.getClientInfos()
         val allowed   = AdmissionStore.getAll()
+        val blocked   = BlacklistStore.getAll()
         val connected = infos.associateBy { if (it.callerId != 0L) it.callerId else -it.callId }
 
         val entries = mutableListOf<Entry>()
-        // Connected clients first (shown in green)
+        // Connected clients first (shown in green or red-throttle).
         for (info in infos) {
             val key = if (info.callerId != 0L) info.callerId else -info.callId
-            entries.add(Entry(key, info.callerId, info.callerId in allowed, info))
+            entries.add(Entry(key, info.callerId, info.callerId in allowed, info.callerId in blocked, info))
         }
-        // Allowed but not currently connected
+        // Allowed but not currently connected.
         for (id in allowed.sorted()) {
-            if (id !in connected) entries.add(Entry(id, id, true, null))
+            if (id !in connected) entries.add(Entry(id, id, true, false, null))
+        }
+        // Blocked callers go last — auto-rejected on next attempt, listed here so
+        // the user can unblock them.
+        for (id in blocked.sorted()) {
+            if (id !in connected && id !in allowed) entries.add(Entry(id, id, false, true, null))
         }
         return entries
     }
@@ -96,18 +122,31 @@ class ServerClientsActivity : BaseActivity() {
         val entries = buildEntries()
         val entryKeys = entries.map { it.rowKey }.toSet()
 
-        // Remove stale rows
+        // Drop stale row state for entries that no longer exist.
         val stale = rowViews.keys.filter { it !in entryKeys }
-        stale.forEach { k -> llClients.removeView(rowViews.remove(k)); sampleCache.remove(k) }
+        stale.forEach { k -> rowViews.remove(k); sampleCache.remove(k) }
 
-        // Add new rows; update all rows
+        // Detach every child and re-attach in the correct order. Reusing existing
+        // row Views (rather than buildRow each time) preserves their tag triple and
+        // avoids flicker — Android batches removeAllViews + addView within the same
+        // measure-layout cycle so the user sees the final result on the next frame.
+        // Separator lines are inserted between group transitions (connected → allowed
+        // → blocked) so the three categories read at a glance.
+        llClients.removeAllViews()
+        var prevGroup: Group? = null
         for (entry in entries) {
-            if (entry.rowKey !in rowViews) {
-                val row = buildRow(entry)
-                llClients.addView(row)
-                rowViews[entry.rowKey] = row
+            val group = when {
+                entry.info != null -> Group.CONNECTED
+                entry.isAllowed    -> Group.ALLOWED
+                entry.isBlocked    -> Group.BLOCKED
+                else               -> Group.OTHER
             }
-            updateRow(rowViews[entry.rowKey]!!, entry)
+            if (prevGroup != null && prevGroup != group) llClients.addView(buildSeparator())
+            prevGroup = group
+
+            val row = rowViews[entry.rowKey] ?: buildRow(entry).also { rowViews[entry.rowKey] = it }
+            llClients.addView(row)
+            updateRow(row, entry)
         }
 
         tvEmpty.visibility = if (entries.isEmpty()) View.VISIBLE else View.GONE
@@ -185,6 +224,13 @@ class ServerClientsActivity : BaseActivity() {
             entry.callerId != 0L  -> "${entry.callerId}"
             else                  -> "Unknown (call ${entry.info?.callId ?: "?"})"
         }
+        // Inline membership tag, mirroring the "Blocked" tag — so an at-a-glance
+        // scan tells you which list a row is in (allow, block, or neither).
+        val labelWithStatus = when {
+            entry.isBlocked -> "$label  ·  Blocked"
+            entry.isAllowed -> "$label  ·  Allowed"
+            else            -> label
+        }
 
         if (entry.info != null) {
             val now      = System.currentTimeMillis()
@@ -206,33 +252,64 @@ class ServerClientsActivity : BaseActivity() {
             } else { rxRate = 0L; txRate = 0L }
             sampleCache[entry.rowKey] = Sample(entry.info.rxBytes, entry.info.txBytes, now)
 
-            infoTv.text      = label
+            infoTv.text      = labelWithStatus
             infoTv.setTextColor(if (throttled) Color.parseColor("#C62828") else Color.parseColor("#2E7D32"))
             statsTv.text     = "connected ${uptime}s  ↑ ${fmtRate(rxRate)} (${rxKB}KB)$upLimit  ↓ ${fmtRate(txRate)} (${txKB}KB)$dnLimit"
             statsTv.visibility = View.VISIBLE
             row.setBackgroundColor(if (throttled) Color.argb(20, 200, 0, 0) else Color.argb(20, 0, 180, 0))
-        } else {
-            infoTv.text      = label
+        } else if (entry.isBlocked) {
+            // Greyed-out for blocked rows — strikethrough effect via reduced alpha.
+            infoTv.text      = labelWithStatus
             infoTv.setTextColor(resolveDefaultTextColor())
+            infoTv.alpha     = 0.5f
+            statsTv.visibility = View.GONE
+            row.setBackgroundColor(Color.argb(15, 128, 128, 128))
+        } else {
+            infoTv.text      = labelWithStatus
+            infoTv.setTextColor(resolveDefaultTextColor())
+            infoTv.alpha     = 1.0f
             statsTv.visibility = View.GONE
             row.setBackgroundColor(Color.TRANSPARENT)
         }
 
         // Rebuild button rows. Order is Disconnect, Remove, Limit, Stats — ordered roughly
         // by how disruptive the action is, with read-only Stats last. Buttons are wrapped
-        // 2-per-row so 4 of them don't crowd a single line.
+        // 2-per-row so 4 of them don't crowd a single line. Blocked rows show only Unblock.
         btnRow.removeAllViews()
         val actions = mutableListOf<Pair<String, () -> Unit>>()
-        if (entry.info != null) actions += "Disconnect" to { BaleServerService.disconnectClient(entry.info.callId) }
-        if (entry.isAllowed)    actions += "Remove" to {
-            AdmissionStore.remove(entry.callerId)
-            if (entry.info != null) BaleServerService.disconnectClient(entry.info.callId)
-        }
-        if (entry.info != null) {
-            actions += "Limit" to { showLimitDialog(entry.info) }
-            actions += "Stats" to {
-                startActivity(android.content.Intent(this, ClientStatsActivity::class.java)
-                    .putExtra(ClientStatsActivity.EXTRA_CALL_ID, entry.info.callId))
+        // The row gets rebuilt on the next 500 ms poll, so visual cues (button
+        // disappearing, row vanishing for offline+allowed) can feel like nothing
+        // happened. A short Toast confirms each action so the user sees the click
+        // landed before the row mutates. `name` was already resolved above for the row label.
+        val who  = name ?: (if (entry.callerId > 0L) "${entry.callerId}" else "this caller")
+
+        if (entry.isBlocked) {
+            actions += "Unblock" to {
+                BlacklistStore.remove(entry.callerId)
+                Toast.makeText(this, "Unblocked $who", Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            // Disconnect: kick the active session only. Doesn't blacklist — caller
+            // is free to call back. To permanently bar a caller, the user rejects
+            // them in the pending notification (which routes through rejectPending,
+            // which blacklists).
+            if (entry.info != null) actions += "Disconnect" to {
+                BaleServerService.disconnectClient(entry.info.callId)
+                Toast.makeText(this, "Disconnected $who", Toast.LENGTH_SHORT).show()
+            }
+            // Remove: drop from allow-list AND kick the active session if any.
+            // Future calls land in pending; the running session ends now.
+            if (entry.isAllowed) actions += "Remove" to {
+                AdmissionStore.remove(entry.callerId)
+                if (entry.info != null) BaleServerService.disconnectClient(entry.info.callId)
+                Toast.makeText(this, "Removed $who from allow list", Toast.LENGTH_SHORT).show()
+            }
+            if (entry.info != null) {
+                actions += "Limit" to { showLimitDialog(entry.info) }
+                actions += "Stats" to {
+                    startActivity(android.content.Intent(this, ClientStatsActivity::class.java)
+                        .putExtra(ClientStatsActivity.EXTRA_CALL_ID, entry.info.callId))
+                }
             }
         }
         val rows = actions.chunked(2)

@@ -404,6 +404,7 @@ gRPC-web framing: 5-byte prefix `[0x00][4B big-endian length]` for data frames; 
 | `peerName` | `ContactsActivity` | display name |
 | `packet_debug` | `BaleServerService.debug` setter | toggle verbose `PacketProcessor` diagnostics |
 | `admissionList` | `AdmissionStore` | comma-separated allow-list with optional per-caller caps. Format: `<id>[:<upBps>:<downBps>]`, e.g. `12345,67890:62500:62500`. Bare IDs mean "use default cap." |
+| `blacklist` | `BlacklistStore` | comma-separated `callerId` block-list. Calls from these IDs are auto-rejected (`discardCall`) before reaching the pending flow. Mutually exclusive with `admissionList`. |
 
 **Startup routing** (`MainActivity.onCreate`):
 - No `token` → `PhoneAuthActivity`
@@ -560,15 +561,24 @@ Per-caller overrides live in `BaleServerService.callerLimits` (in-memory), backe
 
 **Global TCP rwnd backpressure** (`PacketProcessor.updateGlobalPressure`): independent of the per-direction caps. Each `mainLoop` iteration after `drainIncoming` recomputes a `globalRwndScale ∈ [0, 1]` from the depth of the inbound `incoming` queue (`MAX_INCOMING_PKTS = 512`). Linear ramp between `GLOBAL_RWND_LO = 0.50` and `GLOBAL_RWND_HI = 0.90`. Each `TcpSession`'s advertised receive window is multiplied by the scale on every header build (`effectiveRcvAvail()`), so peers' kernels see a smaller window and reduce sending. When the scale rises by ≥0.1 (or unblocks from 0), `onGlobalRwndGrew` fans an ACK to every active session so any peer stalled at scale=0 wakes up promptly. UDP isn't covered — UDP has no flow control to push back on; oversize UDP bursts still drop at the `incoming` queue.
 
-### Admission control (`AdmissionStore`)
+### Admission control (`AdmissionStore` + `BlacklistStore`)
 
-Persisted allow-list of `callerId` longs in `SharedPreferences("config", "allowed_callers")` (comma-separated).
+Two persisted per-caller stores, mutually exclusive — a callerId is in at most one of them at any time:
+- `AdmissionStore` — allow-list with per-caller bandwidth caps. SharedPreferences `"config"` key `admissionList`.
+- `BlacklistStore` — block-list. Same prefs file, key `blacklist`. Bare IDs only.
 
-When a `callReceived` arrives:
-- Caller in allow-list → `acceptCall` immediately, `PacketProcessor` created.
-- Otherwise → caller added to `pendingMap`; pending notification fires with caller's display name. The user clicks Allow (with optional "remember") or Reject in `MainActivity` / `ServerClientsActivity`. Reject sends `discardCall`; the peer's VPN sees the rejection and tears down cleanly.
+`AdmissionStore.add(id)` un-blocks; `BlacklistStore.add(id)` un-allows. The mutual exclusion lives in the stores themselves (Node: lazy-required to avoid circular module load), so call sites don't need to coordinate.
+
+`checkAndHandleCall` order on incoming `callReceived`:
+1. **Blocked** → `discardCall` immediately, no pending entry, no UI prompt. Silent.
+2. **Allowed** → `acceptCall`, `PacketProcessor` created, per-caller cap re-applied from `AdmissionStore.getAllLimits()`.
+3. **Neither** → caller added to `pendingMap`; pending notification fires with caller's display name. The user clicks Allow (with optional "remember") or Reject in `MainActivity` / `ServerClientsActivity`. Reject sends `discardCall`; the peer's VPN sees the rejection and tears down cleanly.
 
 Duplicate pending requests from the same caller are deduplicated — a new `callReceived` replaces the older pending entry rather than queueing another notification.
+
+The "Disconnect" button in `ServerClientsActivity` (and the equivalent `POST /tunnel/clients/:callKey/disconnect` HTTP route on Node) **adds the caller to the blacklist** as well as kicking the current call. Internal disconnects (peer-join watchdog, idle timeout, `disconnectAllClients` on WS teardown) don't blacklist — only explicit user-initiated kicks do.
+
+Node mirrors the Android stores file-for-file: `admission.js` ↔ `AdmissionStore.kt`, `blacklist.js` ↔ `BlacklistStore.kt`. Both go through **`config-store.js`**, which owns a single `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600) with all server-side persistent state under one JSON object. The Bale `access_token` is also keyed in there (was previously `.bale-token`). On first load, `ConfigStore` transparently migrates from the legacy single-purpose files (`.allowed-callers.json`, `.blacklisted-callers.json`, `.bale-token`) and leaves them in place — they're user data, the user can delete once satisfied.
 
 ### Manage Clients UI (`ServerClientsActivity`)
 
