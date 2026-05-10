@@ -90,7 +90,7 @@ class BaleServerService : Service() {
         // Default per-client cap. Stored as bytes/sec (the token-bucket charges packet sizes
         // in bytes), but expressed to the user in kilobits/sec. 37_500 B/s = 300 kbps.
         // Every client is rate-limited; there is no "unlimited".
-        const val DEFAULT_LIMIT_BPS: Long = 37_500L   // 300 kbps
+        const val DEFAULT_LIMIT_BPS: Long = 62_500L   // 500 kbps
 
         @Volatile var isRunning   = false
         @Volatile var clientCount = 0

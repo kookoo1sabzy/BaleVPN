@@ -59,7 +59,7 @@ class ServerClientsActivity : BaseActivity() {
     // Overflow menu (About / TCP debug toggle / View app logs) lives in BaseActivity.
 
     companion object {
-        private const val MAX_LIMIT_KBPS   = 500L   // hard ceiling for per-client bandwidth caps (500 kbps)
+        private const val MAX_LIMIT_KBPS   = 1000L   // hard ceiling for per-client bandwidth caps (1Mbps)
     }
 
     // ── Unified list ──────────────────────────────────────────────────────────
