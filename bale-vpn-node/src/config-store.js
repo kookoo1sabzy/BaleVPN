@@ -2,14 +2,18 @@
 
 // Single-file config store. All persistent server-side state lives in
 // `${RUNTIME_DIR}/.bale-vpn_config.json` under one JSON object, keyed by
-// concern (admission, blacklist, token). Mirrors the Android approach
-// where everything lives in one SharedPreferences file under different
-// keys — easier to back up, easier to inspect, one mode-0600 surface to
-// protect.
+// concern. Current keys:
+//   • admission   — array of allow-list entries with optional bandwidth caps
+//   • blacklist   — array of blocked callerIds
+//   • token       — Bale access_token (auth credential)
+//   • maxClients  — int, cap on simultaneously-connected clients
+// Mirrors the Android approach where everything lives in one SharedPreferences
+// file under different keys — easier to back up, easier to inspect, one
+// mode-0600 surface to protect.
 //
 // This module is the single owner of the file. AdmissionStore /
-// BlacklistStore / token persistence go through the get/set/delete API
-// here rather than touching `fs` themselves.
+// BlacklistStore / token / max-clients persistence all go through the
+// get/set/delete API here rather than touching `fs` themselves.
 //
 // Migration: on first load, only the legacy `.bale-token` file is auto-migrated
 // (you can lose your admission list and re-allow callers, but losing the auth

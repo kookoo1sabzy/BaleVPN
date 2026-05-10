@@ -58,13 +58,53 @@ class ServerClientsActivity : BaseActivity() {
     override fun onSupportNavigateUp(): Boolean { finish(); return true }
     override fun onDestroy() { uiScope.cancel(); super.onDestroy() }
 
-    // Overflow menu (About / TCP debug toggle / View app logs) lives in BaseActivity.
+    // Overflow menu — base items live in BaseActivity; we extend with a
+    // "Max clients..." entry that lets the user cap simultaneous sessions.
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menu.add(0, MENU_MAX_CLIENTS, 0, "Max clients…")
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+        return super.onCreateOptionsMenu(menu)
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean = when (item.itemId) {
+        MENU_MAX_CLIENTS -> { showMaxClientsDialog(); true }
+        else             -> super.onOptionsItemSelected(item)
+    }
+
+    private fun showMaxClientsDialog() {
+        val prefs   = getSharedPreferences("config", MODE_PRIVATE)
+        val current = BaleServerService.getMaxClients(prefs)
+        val dp      = resources.displayMetrics.density
+        val et = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            hint      = "1–${BaleServerService.MAX_CLIENTS_LIMIT}"
+            setText(current.toString())
+        }
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding((24 * dp).toInt(), (12 * dp).toInt(), (24 * dp).toInt(), 0)
+            addView(et)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Max simultaneous clients")
+            .setMessage("Cap on simultaneously-connected clients. New incoming calls are rejected once this limit is reached.")
+            .setView(layout)
+            .setPositiveButton("Apply") { _, _ ->
+                val n = (et.text.toString().toIntOrNull() ?: current)
+                    .coerceIn(1, BaleServerService.MAX_CLIENTS_LIMIT)
+                BaleServerService.setMaxClients(prefs, n)
+                Toast.makeText(this, "Max clients set to $n", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
 
     companion object {
         // Hard ceiling for per-client bandwidth caps. Derived from the shared
         // BaleServerService.MAX_LIMIT_BPS so the dialog and AdmissionStore agree
         // on the cap. 125_000 B/s × 8 / 1000 = 1000 kbps = 1 Mbps.
         private val MAX_LIMIT_KBPS: Long = BaleServerService.MAX_LIMIT_BPS * 8L / 1_000L
+        private const val MENU_MAX_CLIENTS = 2001  // disjoint from BaseActivity's 1000-range ids
     }
 
     // ── Unified list ──────────────────────────────────────────────────────────

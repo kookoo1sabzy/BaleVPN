@@ -405,6 +405,7 @@ gRPC-web framing: 5-byte prefix `[0x00][4B big-endian length]` for data frames; 
 | `packet_debug` | `BaleServerService.debug` setter | toggle verbose `PacketProcessor` diagnostics |
 | `admissionList` | `AdmissionStore` | comma-separated allow-list with optional per-caller caps. Format: `<id>[:<upBps>:<downBps>]`, e.g. `12345,67890:62500:62500`. Bare IDs mean "use default cap." |
 | `blacklist` | `BlacklistStore` | comma-separated `callerId` block-list. Calls from these IDs are auto-rejected (`discardCall`) before reaching the pending flow. Mutually exclusive with `admissionList`. |
+| `maxClients` | `BaleServerService.{getMaxClients,setMaxClients}` | int in `[1, 253]`. Cap on simultaneously-connected clients. Default 5. New incoming calls (allowed or pending) above this cap are silently `discardCall`ed; not blacklisted. Hard ceiling matches the Node SNAT pool (10.8.0.2–10.8.0.254 = 253 slots). |
 
 **Startup routing** (`MainActivity.onCreate`):
 - No `token` → `PhoneAuthActivity`
@@ -578,7 +579,7 @@ Duplicate pending requests from the same caller are deduplicated — a new `call
 
 The "Disconnect" button in `ServerClientsActivity` (and the equivalent `POST /tunnel/clients/:callKey/disconnect` HTTP route on Node) **adds the caller to the blacklist** as well as kicking the current call. Internal disconnects (peer-join watchdog, idle timeout, `disconnectAllClients` on WS teardown) don't blacklist — only explicit user-initiated kicks do.
 
-Node mirrors the Android stores file-for-file: `admission.js` ↔ `AdmissionStore.kt`, `blacklist.js` ↔ `BlacklistStore.kt`. Both go through **`config-store.js`**, which owns a single `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600) with all server-side persistent state under one JSON object. The Bale `access_token` is also keyed in there (was previously `.bale-token`). On first load, `ConfigStore` transparently migrates from the legacy single-purpose files (`.allowed-callers.json`, `.blacklisted-callers.json`, `.bale-token`) and leaves them in place — they're user data, the user can delete once satisfied.
+Node mirrors the Android stores file-for-file: `admission.js` ↔ `AdmissionStore.kt`, `blacklist.js` ↔ `BlacklistStore.kt`. Both go through **`config-store.js`**, which owns a single `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600) with all server-side persistent state under one JSON object. The Bale `access_token` is also keyed in there (was previously `.bale-token`). On first load, `ConfigStore` migrates **only the token** from the legacy `.bale-token` file — losing the token forces a re-OTP, but admission/blacklist entries are easy to re-add via the UI so their pre-split files (`.allowed-callers.json`, `.blacklisted-callers.json`) are intentionally not migrated.
 
 ### Manage Clients UI (`ServerClientsActivity`)
 

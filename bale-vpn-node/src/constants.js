@@ -59,6 +59,12 @@ const DEFAULT_LIMIT_KBPS = 500;
 const MAX_LIMIT_KBPS     = 1000;
 const THROTTLE_FLAG_MS   = 2000;   // row stays "throttled" 2s after last drop
 
+// Cap on simultaneously-connected clients. Hard limit matches the SNAT pool
+// (10.8.0.2–10.8.0.254 = 253 slots); the user-facing default is 5. Mirrors
+// Android's BaleServerService.MAX_CLIENTS_DEFAULT / MAX_CLIENTS_LIMIT.
+const MAX_CLIENTS_DEFAULT = 5;
+const MAX_CLIENTS_LIMIT   = 253;
+
 module.exports = {
     ACCESS_TOKEN,
     WS_URL, GRPC_HOST, API_VERSION, PROTO_VERSION,
@@ -69,6 +75,7 @@ module.exports = {
     CALL_ACCEPTED_TIMEOUT_MS, PEER_TIMEOUT_MS, PEER_JOIN_TIMEOUT_MS,
     PENDING_TIMEOUT_MS, PENDING_SWEEP_MS,
     DEFAULT_LIMIT_KBPS, MAX_LIMIT_KBPS, THROTTLE_FLAG_MS,
+    MAX_CLIENTS_DEFAULT, MAX_CLIENTS_LIMIT,
     RUNTIME_DIR,
     // Helpers
     toLong: v => Number(v.toString()),

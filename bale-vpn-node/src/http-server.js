@@ -11,7 +11,9 @@ const http = require('http');
 const {
     TUNNEL_MODE, PEERTYPE_PRIVATE, PEERTYPE_GROUP,
     MAX_LIMIT_KBPS, HTTP_PORT,
+    MAX_CLIENTS_DEFAULT, MAX_CLIENTS_LIMIT,
 } = require('./constants');
+const { ConfigStore } = require('./config-store');
 const {
     buildStartPhoneAuthRequest, decodeStartPhoneAuthResponse,
     buildValidateCodeRequest, decodeAuthResponse, buildSignUpRequest,
@@ -504,6 +506,35 @@ function create(client, connection) {
             const ok = BlacklistStore.remove(callerId);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok }));
+        }
+
+        // ── Max simultaneous clients ───────────────────────────────────────
+        if (req.method === 'GET' && url.pathname === '/server/max-clients') {
+            const value = Number(ConfigStore.get('maxClients', MAX_CLIENTS_DEFAULT)) || MAX_CLIENTS_DEFAULT;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({
+                value: Math.max(1, Math.min(MAX_CLIENTS_LIMIT, value)),
+                max:   MAX_CLIENTS_LIMIT,
+                default: MAX_CLIENTS_DEFAULT,
+            }));
+        }
+
+        if (req.method === 'POST' && url.pathname === '/server/max-clients') {
+            let body = '';
+            req.on('data', c => body += c);
+            req.on('end', () => {
+                try {
+                    const { value } = JSON.parse(body || '{}');
+                    const n = Math.max(1, Math.min(MAX_CLIENTS_LIMIT, Number(value) || MAX_CLIENTS_DEFAULT));
+                    ConfigStore.set('maxClients', n);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true, value: n }));
+                } catch (e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
+            return;
         }
 
         res.writeHead(404);
