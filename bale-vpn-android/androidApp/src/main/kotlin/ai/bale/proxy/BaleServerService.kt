@@ -103,6 +103,19 @@ class BaleServerService : Service() {
         // clamps stored values too so a hand-edited shared_prefs/config.xml can't smuggle in a
         // 100 Mbps override.
         const val MAX_LIMIT_BPS:     Long = 125_000L   // 1000 kbps = 1 Mbps
+        // Cap on simultaneously-connected clients. Hard limit matches the Node side's
+        // SNAT pool size (10.8.0.2–10.8.0.254 = 253 slots) so the two platforms behave
+        // identically when paired with the same kind of peer. The user-facing default
+        // is 5 — most people have 2-3 devices, the extra headroom covers occasional
+        // family/guest peers.
+        const val MAX_CLIENTS_DEFAULT: Int = 5
+        const val MAX_CLIENTS_LIMIT:   Int = 253
+
+        fun getMaxClients(prefs: android.content.SharedPreferences): Int =
+            prefs.getInt("maxClients", MAX_CLIENTS_DEFAULT).coerceIn(1, MAX_CLIENTS_LIMIT)
+        fun setMaxClients(prefs: android.content.SharedPreferences, n: Int) {
+            prefs.edit().putInt("maxClients", n.coerceIn(1, MAX_CLIENTS_LIMIT)).apply()
+        }
 
         @Volatile var isRunning   = false
         @Volatile var clientCount = 0
@@ -265,6 +278,17 @@ class BaleServerService : Service() {
             return
         }
 
+        // Capacity gate. Applies to allowed and not-yet-allowed callers alike — a
+        // pending entry queued past the cap would just stall waiting for a slot
+        // that may never open. Rejection is silent (no blacklist) so the caller is
+        // free to re-call once a slot frees up.
+        val maxClients = getMaxClients(getSharedPreferences("config", MODE_PRIVATE))
+        if (clients.size >= maxClients) {
+            Log.d(TAG, "Server: rejecting callerId=$callerId — at capacity ${clients.size}/$maxClients")
+            BaleConnection.client?.discardCall(callId)
+            return
+        }
+
         if (AdmissionStore.isAllowed(callerId)) {
             // New call from the same caller always wins — handleCall replaces any
             // existing client locally. Clear any leftover pending entry first so
@@ -303,6 +327,16 @@ class BaleServerService : Service() {
     private suspend fun doAcceptPending(callId: Long, addToList: Boolean) {
         val pending = pendingMap.remove(callId) ?: return
         pendingSnapshot = pendingMap.values.toList()
+        // Re-check capacity at accept time. The caller might have been queued
+        // at the limit; in the time since, other slots may have filled up.
+        val maxClients = getMaxClients(getSharedPreferences("config", MODE_PRIVATE))
+        if (clients.size >= maxClients) {
+            Log.d(TAG, "Server: cannot accept pending $callId — at capacity ${clients.size}/$maxClients")
+            cancelPendingNotificationIfEmpty()
+            updateNotification()
+            BaleConnection.client?.discardCall(callId)
+            return
+        }
         if (addToList && pending.callerId != 0L) AdmissionStore.add(pending.callerId)
         cancelPendingNotificationIfEmpty()
         updateNotification()

@@ -6,15 +6,17 @@
 // fs.writeFileSync. A caller in this map is auto-answered on incoming call;
 // anyone else lands in the pending map and waits for an Accept/Reject.
 //
-// Stored as JSON of either form (mixed allowed):
-//   12345                                          // bare ID, no per-caller limit
-//   { callerId: 12345, upBps: 62500, downBps: 62500 }
-// Bare numbers are accepted for back-compat with older files where this
-// store held only IDs.
+// Stored as a JSON array of homogeneous objects, every entry shaped the same:
+//   [
+//     { "callerId": 12345, "upBps": 0,     "downBps": 0     },
+//     { "callerId": 67890, "upBps": 62500, "downBps": 62500 }
+//   ]
+// `upBps` / `downBps` are bytes/sec; 0 means "use the server default cap".
+// Always-objects keeps the file regular for hand-inspection and JSON tooling.
 //
 // Stored values are clamped to [0, MAX_LIMIT_KBPS converted to bytes/sec]
-// on load so a hand-edited `.allowed-callers.json` can't smuggle in an
-// absurd override (e.g. someone bumping their own cap to 1 Gbps via vim).
+// on load so a hand-edited config can't smuggle in an absurd override
+// (e.g. someone bumping their own cap to 1 Gbps via vim).
 
 const { MAX_LIMIT_KBPS } = require('./constants');
 const { ConfigStore }    = require('./config-store');
@@ -30,27 +32,25 @@ const AdmissionStore = {
         const arr = ConfigStore.get('admission', []);
         this._map = new Map();
         for (const e of arr) {
-            if (typeof e === 'number' && Number.isInteger(e) && e > 0) {
-                this._map.set(e, { upBps: 0, downBps: 0 });
-            } else if (e && Number.isInteger(e.callerId) && e.callerId > 0) {
-                const upRaw   = Number(e.upBps)   || 0;
-                const downRaw = Number(e.downBps) || 0;
-                const up   = clamp(upRaw);
-                const down = clamp(downRaw);
-                if (up !== upRaw || down !== downRaw) {
-                    console.warn(`[Admission] clamped caller ${e.callerId} limits ` +
-                                 `(up=${upRaw}→${up}, down=${downRaw}→${down})`);
-                }
-                this._map.set(e.callerId, { upBps: up, downBps: down });
+            if (!e || !Number.isInteger(e.callerId) || e.callerId <= 0) continue;
+            const upRaw   = Number(e.upBps)   || 0;
+            const downRaw = Number(e.downBps) || 0;
+            const up   = clamp(upRaw);
+            const down = clamp(downRaw);
+            if (up !== upRaw || down !== downRaw) {
+                console.warn(`[Admission] clamped caller ${e.callerId} limits ` +
+                             `(up=${upRaw}→${up}, down=${downRaw}→${down})`);
             }
+            this._map.set(e.callerId, { upBps: up, downBps: down });
         }
         return this._map;
     },
     _save() {
-        const arr = [...this._map.entries()].map(([callerId, { upBps, downBps }]) => {
-            if (!upBps && !downBps) return callerId;          // bare-ID for compactness
-            return { callerId, upBps, downBps };
-        });
+        // Always write the homogeneous {callerId, upBps, downBps} shape — even
+        // when the per-caller cap is zero — so the file is regular and easy
+        // to read with `jq` / `cat` / hand-edit.
+        const arr = [...this._map.entries()].map(([callerId, { upBps, downBps }]) =>
+            ({ callerId, upBps, downBps }));
         ConfigStore.set('admission', arr);
     },
     isAllowed(uid) { return Number(uid) > 0 && this._load().has(Number(uid)); },

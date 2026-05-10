@@ -284,6 +284,17 @@ const HTML = `<!DOCTYPE html>
   </div>
   </div>
 
+  <!-- Max simultaneous clients (server mode) -->
+  <div id="maxClientsSection" style="display:none; margin-top:1rem">
+    <div style="display:flex; align-items:center; gap:.5rem; font-size:.85rem">
+      <span style="opacity:.7">Max simultaneous clients:</span>
+      <input id="maxClientsInput" type="number" min="1" max="253"
+             style="width:5rem; padding:.25rem .4rem; font-family:inherit">
+      <button id="maxClientsApply" class="lim-btn" type="button" style="width:auto">Apply</button>
+      <span id="maxClientsHint" style="opacity:.5; font-size:.8rem"></span>
+    </div>
+  </div>
+
   <!-- Pending admission requests (server mode) -->
   <div id="pendingSection" style="display:none; margin-top:1.2rem">
     <div style="font-weight:600; font-size:.9rem; margin-bottom:.5rem; opacity:.7">Pending requests</div>
@@ -546,7 +557,7 @@ function applyState() {
   applyTunnelUI(s);
 
   // Server-mode list polls — only when accepting calls.
-  if (_tunnelMode === 'server' && s.wsReady) { pollClients(); pollPending(); pollAdmission(); pollBlacklist(); }
+  if (_tunnelMode === 'server' && s.wsReady) { pollClients(); pollPending(); pollAdmission(); pollBlacklist(); pollMaxClients(); }
 
   if (s.wsReady) loadPeers();   // refresh lazily; loadPeers no-ops if already populated
 }
@@ -570,7 +581,8 @@ function applyTunnelUI(s) {
       st.style.display = 'none';
     }
     const bl = document.getElementById('blacklistSection');
-    sec.style.display = pend.style.display = adm.style.display = bl.style.display
+    const mc = document.getElementById('maxClientsSection');
+    sec.style.display = pend.style.display = adm.style.display = bl.style.display = mc.style.display
       = s.wsReady ? 'block' : 'none';
   } else {
     // Client: four sub-states:
@@ -595,6 +607,10 @@ function applyTunnelUI(s) {
       st.style.display = 'none';
     }
     sec.style.display = pend.style.display = adm.style.display = 'none';
+    const bl = document.getElementById('blacklistSection');
+    const mc = document.getElementById('maxClientsSection');
+    if (bl) bl.style.display = 'none';
+    if (mc) mc.style.display = 'none';
   }
 }
 
@@ -1020,6 +1036,36 @@ async function unblockCaller(callerId) {
   pollBlacklist();
   pollAdmission();   // mutual exclusion may have moved the entry; refresh the other list too
 }
+
+async function pollMaxClients() {
+  try {
+    const r = await fetch('/server/max-clients');
+    const { value, max } = await r.json();
+    const inp  = document.getElementById('maxClientsInput');
+    const hint = document.getElementById('maxClientsHint');
+    // Don't clobber the user's in-progress edit on a poll tick.
+    if (document.activeElement !== inp) inp.value = value;
+    if (max) inp.max = max;
+    if (hint) hint.textContent = max ? '(max ' + max + ')' : '';
+  } catch {}
+}
+
+async function applyMaxClients() {
+  const inp = document.getElementById('maxClientsInput');
+  const v = parseInt(inp.value, 10);
+  if (!Number.isFinite(v) || v < 1) return;
+  await fetch('/server/max-clients', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value: v }),
+  });
+  pollMaxClients();
+}
+document.getElementById('maxClientsApply').addEventListener('click', applyMaxClients);
+// Fetch the persisted value on page load too, so the input shows the saved
+// number before the WS comes up — otherwise the field appears blank until the
+// first server-mode pollState() tick and the user might think nothing was saved.
+pollMaxClients();
 
 // Restore persisted config (localStorage → form fields), then do an initial
 // state fetch and start the single 2-s render loop. The token is no longer

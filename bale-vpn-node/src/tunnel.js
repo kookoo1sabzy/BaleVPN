@@ -30,10 +30,18 @@ const {
     CALL_ACCEPTED_TIMEOUT_MS, PEER_TIMEOUT_MS, PEER_JOIN_TIMEOUT_MS,
     PENDING_TIMEOUT_MS, PENDING_SWEEP_MS,
     DEFAULT_LIMIT_KBPS, MAX_LIMIT_KBPS, THROTTLE_FLAG_MS,
+    MAX_CLIENTS_DEFAULT, MAX_CLIENTS_LIMIT,
 } = require('./constants');
+
+// Read the persisted max-clients setting, clamped to the hard pool ceiling.
+function getMaxClients() {
+    const v = Number(ConfigStore.get('maxClients', MAX_CLIENTS_DEFAULT)) || MAX_CLIENTS_DEFAULT;
+    return Math.max(1, Math.min(MAX_CLIENTS_LIMIT, v));
+}
 const { LiveKitTransport, lkEncode, lkDecode } = require('./livekit');
 const { AdmissionStore } = require('./admission');
 const { BlacklistStore } = require('./blacklist');
+const { ConfigStore }    = require('./config-store');
 
 // Tunnel envelope helpers (legacy "T:" message-mode wire format — kept around
 // per the "leave unused code in place" preference; only the WebRTC path is
@@ -377,6 +385,16 @@ class TunnelManager {
             return;
         }
 
+        // Capacity gate. Applies to allowed and not-yet-allowed callers alike;
+        // pending entries above the cap would just stall waiting for a slot.
+        // Silent rejection (no blacklist) — caller can re-call once a slot frees.
+        const maxClients = getMaxClients();
+        if (this.lkRooms.size >= maxClients) {
+            console.log(`[Tunnel/S] rejecting caller ${callerId} — at capacity ${this.lkRooms.size}/${maxClients}`);
+            this.getBale().then(ws => ws?.discardCall(callId)).catch(() => {});
+            return;
+        }
+
         if (AdmissionStore.isAllowed(callerId)) {
             // New call from the same caller always wins — _handleCall will
             // tear down any existing room from the same caller (local cleanup
@@ -438,6 +456,14 @@ class TunnelManager {
         const pending = this.pendingMap.get(callKey);
         if (!pending) return false;
         this.pendingMap.delete(callKey);
+        // Re-check capacity at accept time — slots may have filled while pending.
+        const maxClients = getMaxClients();
+        if (this.lkRooms.size >= maxClients) {
+            console.log(`[Tunnel/S] cannot accept pending ${callId} — at capacity ${this.lkRooms.size}/${maxClients}`);
+            const ws = await this.getBale();
+            try { await ws?.discardCall(callId); } catch (_) {}
+            return false;
+        }
         if (addToList && pending.callerId) AdmissionStore.add(pending.callerId);
         await this._handleCall(callId, pending.callerId, pending._entity);
         return true;
@@ -524,10 +550,15 @@ class TunnelManager {
 
         // Per-direction token buckets. Default to DEFAULT_LIMIT_KBPS, override
         // from any per-caller cap remembered from a previous session.
+        // `||` (not `??`) so a 0 in either direction falls back to the default
+        // — matches Android's per-direction default semantics. Without this,
+        // a mixed-zero override like {upBps: 62500, downBps: 0} would create
+        // a rate-0 download bucket, which Node's TokenBucket treats as
+        // "block everything" rather than "unlimited".
         const defaultBps = DEFAULT_LIMIT_KBPS * 1000 / 8;
         const override   = callerId ? this._callerLimits.get(callerId) : null;
-        lk._upBucket   = new TokenBucket(override?.upBps   ?? defaultBps);
-        lk._downBucket = new TokenBucket(override?.downBps ?? defaultBps);
+        lk._upBucket   = new TokenBucket(override?.upBps   || defaultBps);
+        lk._downBucket = new TokenBucket(override?.downBps || defaultBps);
         lk.onData = (data) => {
             lk._rxPkts++;
             lk._rxBytes += data.length;
