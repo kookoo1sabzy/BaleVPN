@@ -38,6 +38,12 @@ class TunnelManager(
 
     private val scope            = CoroutineScope(dispatcher + SupervisorJob())
     private var transport        = newTransport()
+    // @Volatile because it's written from at least three thread sources —
+    // stop() (caller's thread), the addOnCallEnded callback (WS reader's
+    // dispatcher), and transport.onDisconnected (LiveKit SDK thread) — and
+    // read from tight `while (!stopped) delay(...)` loops where the JIT
+    // could otherwise hoist the read.
+    @Volatile
     private var stopped          = false
     /** The callId of the in-flight call. */
     @Volatile
