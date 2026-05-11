@@ -1699,6 +1699,13 @@ class TcpSession(
         dbg { "TCP $dPort RTO retransmit (try=$rtoRetries flight=${flightSize()}B cwnd→1 ssthresh→$ssthresh next-rto=${rto}ms)" }
         retransmitFirst()
         rtoDeadlineMs = System.currentTimeMillis() + rto   // re-arm
+        // Re-arm TLP for the remainder of recovery. scheduleTlp is otherwise
+        // only called from onDataFromServer, so after an RTO the next tail
+        // loss would have to wait for *another* full RTO instead of being
+        // caught by a fast TLP probe. Reset to MAX first to defeat the
+        // "already scheduled" guard inside scheduleTlp.
+        tlpDeadlineMs = Long.MAX_VALUE
+        scheduleTlp()
         return false
     }
 
