@@ -148,6 +148,25 @@ class BaleWsClient {
     connect(token) {
         if (token) this.accessToken = token;
         if (!this.accessToken) throw new Error('No access token set');
+
+        // If a previous socket is still alive (rapid reconcile() / retry race),
+        // tear it down deterministically before opening a new one. Without
+        // this, the old socket's close handler later fires and mutates shared
+        // state that now belongs to the new connection: ping/SetOnline timers,
+        // _drainPending, and — if the close code happens to be 4401 — the
+        // access token. removeAllListeners first so the close event doesn't
+        // reach the shared-state handlers.
+        if (this.ws) {
+            const old = this.ws;
+            this.ws = null;
+            try { old.removeAllListeners(); old.close(); } catch (_) {}
+            // The old socket's close handler is no longer wired up, so clean
+            // its by-products here.
+            if (this.pingTimer)      { clearInterval(this.pingTimer);      this.pingTimer      = null; }
+            if (this.setOnlineTimer) { clearInterval(this.setOnlineTimer); this.setOnlineTimer = null; }
+            this._drainPending('superseded by new connect()');
+        }
+
         // Clear transient flags — a fresh connect starts from a clean slate.
         this.sessionExpired  = false;
         this.versionMismatch = false;
