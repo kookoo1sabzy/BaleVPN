@@ -30,7 +30,9 @@ The LiveKit data channel is encrypted with **DTLS**, so traffic is opaque to pas
 
 Treat this tunnel like a corporate VPN whose operator you don't fully trust — fine for IP-level reachability (uncensoring), **not adequate as an anonymity or end-to-end privacy layer**. Use TLS at the application level (HTTPS, encrypted DNS, etc.).
 
-**Recommendation from the author:** register the Bale account used with this tool on a *virtual phone number* rather than your primary one, so the call metadata above can't be tied back to your real identity. Bale accepts non-Iranian numbers — the typical path is: get a virtual number that can receive SMS, register a Telegram account on it (Telegram OTP arrives by SMS), then register Bale on the same number — Bale's OTP is delivered through your Telegram account.
+### 📌 Recommendation from the author
+
+Register the Bale account used with this tool on a **virtual phone number** rather than your primary one, so the call metadata above can't be tied back to your real identity. Bale accepts non-Iranian numbers — the typical path is: get a virtual number that can receive SMS (providers like [Sonetel](https://app.sonetel.com/) work), register a Telegram account on it (Telegram OTP arrives by SMS), then register Bale on the same number — Bale's OTP is delivered through your Telegram account.
 
 <div dir="rtl">
 
@@ -44,7 +46,9 @@ Treat this tunnel like a corporate VPN whose operator you don't fully trust — 
 
 این تونل را مثل VPN شرکتی‌ای ببینید که گرداننده‌اش را کاملاً نمی‌شناسید — برای دسترسی IP (دور زدن مسدودی) خوب است، **اما برای ناشناسی یا حریم خصوصی انتها به انتها کافی نیست**. در سطح برنامه از TLS (HTTPS، DNS رمزنگاری‌شده و…) استفاده کنید.
 
-**توصیهٔ نویسنده:** برای حساب بله‌ای که با این ابزار استفاده می‌کنید، از یک *شمارهٔ تلفن مجازی* استفاده کنید نه شمارهٔ اصلی‌تان، تا متادیتای تماس بالا به هویت واقعی شما گره نخورد. بله شماره‌های غیرایرانی را هم می‌پذیرد — مسیر معمول این است: یک شمارهٔ مجازی که SMS دریافت می‌کند تهیه کنید، اول با همان شماره روی تلگرام ثبت‌نام کنید (OTP تلگرام با SMS می‌آید)، سپس با همان شماره روی بله ثبت‌نام کنید — OTP بله از طریق حساب تلگرام شما می‌رسد.
+### 📌 توصیهٔ نویسنده
+
+برای حساب بله‌ای که با این ابزار استفاده می‌کنید، از یک **شمارهٔ تلفن مجازی** استفاده کنید نه شمارهٔ اصلی‌تان، تا متادیتای تماس بالا به هویت واقعی شما گره نخورد. بله شماره‌های غیرایرانی را هم می‌پذیرد — مسیر معمول این است: یک شمارهٔ مجازی که SMS دریافت می‌کند تهیه کنید (ارائه‌دهنده‌هایی مثل [Sonetel](https://app.sonetel.com/) کار می‌کنند)، اول با همان شماره روی تلگرام ثبت‌نام کنید (OTP تلگرام با SMS می‌آید)، سپس با همان شماره روی بله ثبت‌نام کنید — OTP بله از طریق حساب تلگرام شما می‌رسد.
 
 </div>
 
@@ -52,27 +56,28 @@ Treat this tunnel like a corporate VPN whose operator you don't fully trust — 
 
 ## Supported features
 
-| Role | Platform | SOCKS5 proxy | VPN (full IP routing) |
-|---|---|:---:|:---:|
-| Client | Node.js — Linux / macOS / Windows | ✓ | — |
-| Client | Android | — | ✓ &nbsp;*(kernel TUN via `VpnService`)* |
-| Server | Node.js — Linux / macOS / Windows | ✓ | — |
-| Server | Node.js — **Linux** | ✓ | ✓ &nbsp;*(kernel TUN; needs `setcap cap_net_admin` + `iptables` MASQUERADE)* |
-| Server | Android | — | ✓ &nbsp;*(in-process userspace TCP/IP NAT; no root, no kernel TUN, no iptables)* |
+| Role | Platform | SOCKS5 proxy | VPN (IP routing via TUN) | Notes |
+|---|---|:---:|:---:|---|
+| Client | Node.js — Linux / macOS / Windows | ✓ | — | local SOCKS5 listener |
+| Client | Android | — | ✓ | system `VpnService` (kernel TUN) |
+| Server | Node.js — Windows | ✓ | — | |
+| Server | Node.js — Linux | ✓ | ✓ | **hybrid — both modes simultaneously on one instance.** Needs `setcap cap_net_admin` + `iptables` MASQUERADE for TUN |
+| Server | Node.js — macOS | ✓ | ✓ | **hybrid — both modes simultaneously on one instance.** Runs as root; `pf` anchor + IP forwarding auto-set |
+| Server | Android | — | ✓ | in-process userspace TCP/IP NAT; no root, no kernel TUN, no iptables |
 
-> **Easiest start: Android server + Android client.** Two phones, install the APK on both, sign in to Bale, flip the toggle. No root, no command line, no firewall rules.
+> **Easiest start: Android server + Android client.** Two phones, install the APK on both, sign in with your Bale account in the BaleVPN app, flip the toggle. No root, no command line, no firewall rules.
 >
-> **Most efficient: Linux Node TUN VPN server + Android client.** On Linux the kernel does the IP forwarding (TUN device) and the NAT (`iptables` MASQUERADE rule) — both substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
+> **Most efficient: Linux or macOS Node TUN server + Android client.** The kernel does the IP forwarding (TUN device) and the NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS) — both substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
 
-The Node.js side is platform-agnostic for **SOCKS5** in both directions — pick any OS for either end. Full **VPN** routing on the Node side is Linux-only because it relies on the kernel TUN device and `iptables`-managed NAT. The Android app does not expose a SOCKS5 mode; it always uses the system VPN.
+The Node.js side is platform-agnostic for **SOCKS5** in both directions — pick any OS for either end. **TUN VPN** routing on the Node side works on Linux and macOS (each uses its native kernel TUN device plus the platform's NAT mechanism — `iptables` on Linux, `pf` on macOS); a Linux/macOS Node server runs **hybrid**, accepting both SOCKS5 clients and IP-mode (TUN) clients on the same instance over their own LiveKit calls. The Android app does not expose a SOCKS5 mode; it always uses the system VPN, in either role.
 
 <div dir="rtl">
 
-> **شروع آسان: سرور اندرویدی + کلاینت اندرویدی.** فقط دو گوشی؛ APK را روی هر دو نصب کنید، در بله وارد شوید، و کلید حالت را جابه‌جا کنید. نه روت، نه خط فرمان، نه قواعد دیوارهٔ آتش.
+> **شروع آسان: سرور اندرویدی + کلاینت اندرویدی.** فقط دو گوشی؛ APK را روی هر دو نصب کنید، با حساب بلهٔ خود در اپ BaleVPN وارد شوید، و کلید حالت را جابه‌جا کنید. نه روت، نه خط فرمان، نه قواعد دیوارهٔ آتش.
 >
-> **پربازده‌ترین: سرور TUN روی Node لینوکسی + کلاینت اندرویدی.** روی لینوکس، خودِ هستهٔ سیستم‌عامل فوروارد IP را انجام می‌دهد (دستگاه TUN) و NAT را هم با قاعدهٔ `iptables` MASQUERADE اعمال می‌کند — هر دو مسیر به‌مراتب سریع‌تر از جایگزین‌های فضای کاربری هستند. کلاینت اندرویدی هم از طریق `VpnService` استاندارد به یک VPN کاملاً یکپارچهٔ سیستمی وصل می‌شود.
+> **پربازده‌ترین: سرور TUN روی Node لینوکسی یا macOS + کلاینت اندرویدی.** هستهٔ سیستم‌عامل فوروارد IP را انجام می‌دهد (دستگاه TUN) و NAT را هم (روی لینوکس با قاعدهٔ `iptables` MASQUERADE، روی macOS با اَنکر `pf`) اعمال می‌کند — هر دو مسیر به‌مراتب سریع‌تر از جایگزین‌های فضای کاربری هستند. کلاینت اندرویدی هم از طریق `VpnService` استاندارد به یک VPN کاملاً یکپارچهٔ سیستمی وصل می‌شود.
 
-نسخهٔ Node برای **SOCKS5** در هر دو جهت مستقل از سیستم‌عامل است — می‌توانید برای هر طرف هر OS را انتخاب کنید. ولی **مسیریابی کامل VPN** در سمت Node فقط روی لینوکس کار می‌کند، چون به دستگاه TUN هسته و NAT مدیریت‌شده با iptables متکی است. اپلیکیشن اندروید حالت SOCKS5 ندارد و همیشه از VPN سیستمی استفاده می‌کند.
+نسخهٔ Node برای **SOCKS5** در هر دو جهت مستقل از سیستم‌عامل است — می‌توانید برای هر طرف هر OS را انتخاب کنید. **مسیریابی TUN VPN** در سمت Node روی لینوکس و macOS کار می‌کند (هر کدام از دستگاه TUN بومی هسته و سازوکار NAT پلتفرم استفاده می‌کنند — `iptables` روی لینوکس، `pf` روی macOS)؛ یک سرور Node روی لینوکس/macOS به‌صورت **ترکیبی** اجرا می‌شود و در یک نمونه، هم کلاینت‌های SOCKS5 و هم کلاینت‌های حالت IP (TUN) را روی تماس‌های جداگانهٔ LiveKit‌شان می‌پذیرد. اپلیکیشن اندروید حالت SOCKS5 ندارد و در هر نقشی همیشه از VPN سیستمی استفاده می‌کند.
 
 </div>
 
@@ -94,25 +99,31 @@ For protocol internals, wire formats, and architecture details: [CLAUDE.md](CLAU
 ## Architecture
 
 ```
-       ┌────────────────────────────────────────────────────────────┐
-       │                  Bale signaling (WebSocket)                │
-       │              wss://next-ws.bale.ai/ws/                     │
-       └──┬───────────────────────────────────────────────────┬─────┘
-          │                                                   │
-          ▼                                                   ▼
-  ┌───────────────┐    LiveKit "voice call"         ┌───────────────┐
-  │  VPN client   │   raw IP packets in the         │  VPN server   │
-  │  (Android,    │   data channel (DTLS)           │  (Android, or │
-  │   or Node     │ ◄─────────────────────────────► │   Node Linux  │
-  │   SOCKS5)     │                                 │   TUN, or     │
-  │               │                                 │   Node SOCKS5)│
-  └───────────────┘                                 └───────┬───────┘
-                                                            │
-                                                            ▼
-                                                       open internet
+   ┌──────────────────────────────────────────────────────────────┐
+   │     Bale signaling WS  ·  wss://next-ws.bale.ai/ws/          │
+   │     (call setup, presence, push events)                      │
+   └────┬─────────────────────────────────────────────────┬───────┘
+        │ signaling                                signaling
+        ▼                                                 ▼
+ ┌─────────────────┐                            ┌─────────────────┐               ┌──────────┐
+ │     client      │                            │     server      │ ── egress ───►│   open   │
+ │  (Android, or   │                            │  (Android, or   │      NAT      │ internet │
+ │   Node SOCKS5)  │                            │   Node any-OS)  │               └──────────┘
+ └────────┬────────┘                            └────────┬────────┘
+          │                                              │
+          │     ── DTLS-encrypted WebRTC data channel ── │
+          └──────────────┐                  ┌────────────┘
+                         ▼                  ▼
+            ┌────────────────────────────────────────┐
+            │    LiveKit SFU  ·  livekit.bale.ai     │
+            │    (relays the data channel)           │
+            └────────────────────────────────────────┘
 ```
 
-Both ends speak the **Bale signaling WS** to set up the call, then exchange traffic on the **LiveKit data channel** that Bale provisions for that call. The Bale WS is dropped after signaling (and brought back automatically when needed); the LiveKit data channel carries all the steady-state IP / TCP traffic.
+- **Bale signaling WS** — call setup and Bale-side push events. Dropped once the call is up; brought back automatically when needed.
+- **LiveKit SFU** — Bale-operated WebRTC server that relays the DTLS-encrypted data channel between client and server. Carries either raw IP packets (TUN pairings) or multiplexed SOCKS5 frames (proxy pairings) — see [Supported features](#supported-features).
+- **Server** owns the egress NAT to the open internet. The SFU just relays; it doesn't route to the internet itself.
+- Bale operates both the signaling WS and the SFU, so they can see traffic metadata and any payload that isn't itself end-to-end encrypted (see the [privacy note](#%EF%B8%8F-privacy--encryption) above).
 
 ---
 
