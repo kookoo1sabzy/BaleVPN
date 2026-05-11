@@ -26,6 +26,14 @@ sealed class TFrame {
     }
 }
 
+/** Build an Ip lk-frame directly from a (buf, off, len) slice — one allocation
+ *  and one copy total, vs the two-of-each round trip through
+ *  `buf.copyOf(n)` → `lkEncode(TFrame.Ip(arr))`. Hot path: TUN read loop in
+ *  BaleVpnService and any site that wants to ship raw IP without staging
+ *  through an intermediate ByteArray. */
+fun lkEncodeIp(buf: ByteArray, off: Int, len: Int): ByteArray =
+    ByteArray(len + 1).also { it[0] = 0x49; buf.copyInto(it, 1, off, off + len) }
+
 fun lkEncode(f: TFrame): ByteArray {
     // Hot path: called once per outbound IP packet on client and server.
     // The naive `byteArrayOf(0x49) + f.data` allocates twice and copies twice
