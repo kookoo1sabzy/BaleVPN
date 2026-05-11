@@ -1517,6 +1517,14 @@ class TcpSession(
             while (j < blocks.size) {
                 val left  = blocks[j]
                 val right = blocks[j + 1]
+                // Reject malformed blocks: an inverted (left > right) or empty
+                // (left == right) block must not be treated as covering anything.
+                // Without this, a peer can craft `[left=high, right=low]` to
+                // wrap the comparison space, satisfy both coverage tests for
+                // unrelated segments, and inflate sackedBytes until pipe()
+                // underflows — sender stops sending. RFC 2018 says blocks
+                // must satisfy left < right; enforce it.
+                if (!seq32After(right, left)) { j += 2; continue }
                 if (!seq32After(left, unackedStart) && !seq32After(segEnd, right)) {
                     seg.sacked = true
                     sackedBytes += seg.data.size.toLong()
