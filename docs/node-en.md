@@ -16,10 +16,10 @@ The same binary runs on Linux, macOS, and Windows. The VPN-server mode is Linux-
 | Mode | Platform | What it does |
 |---|---|---|
 | **SOCKS5 client** | Linux / macOS / Windows | Listens on `127.0.0.1:1080`, tunnels TCP through the chosen Bale contact (the contact must be running a server). |
-| **SOCKS5 server** | Linux / macOS / Windows | Auto-answers Bale calls and relays the caller's TCP traffic. Useful for tunneling without VPN setup. |
-| **VPN server (TUN)** | **Linux / macOS** | Auto-answers Bale calls, terminates raw IP traffic on a kernel TUN device (`bale0` on Linux, `utunN` on macOS), and uses kernel NAT (iptables MASQUERADE on Linux, pf on macOS) to forward everything to the open internet. |
+| **SOCKS5 server** | Linux / macOS / Windows | Accepts Bale calls from allow-listed contacts and relays the caller's TCP traffic. No kernel TUN, no `iptables`/`pf`, no root needed. |
+| **VPN server (TUN)** | **Linux / macOS** | Accepts Bale calls from allow-listed contacts and terminates raw IP traffic on a kernel TUN device (`bale0` on Linux, `utunN` on macOS), using kernel NAT (iptables MASQUERADE on Linux, pf on macOS) to forward everything to the open internet. |
 
-Same binary, behaviour selected at startup by command-line argument (`server` for server mode; default is client).
+One binary picks its role at startup: `server` argument runs as server, no argument runs as client. In server mode on Linux/macOS the binary runs **hybrid** — accepting both SOCKS5 and TUN-mode clients in parallel; on Windows it serves SOCKS5 only.
 
 ---
 
@@ -32,15 +32,28 @@ Download a prebuilt `balevpn-<version>-<platform>` binary from the repository's 
 ```bash
 # Linux / macOS:
 chmod +x balevpn-*-{linux,macos}-*
-./balevpn-...           # client mode (default), web UI at http://localhost:3001
-./balevpn-... server    # server mode
+./balevpn-...                # client mode (default), web UI at http://localhost:3001
+./balevpn-... server         # server mode
+./balevpn-... 3001           # client mode, explicit port (any bare number works)
+./balevpn-... server 3001    # server mode, explicit port
 
 # Windows (PowerShell):
 .\balevpn-...-win-x64.exe
 .\balevpn-...-win-x64.exe server
+.\balevpn-...-win-x64.exe 3001
 ```
 
-In **client mode** the binary auto-opens `http://localhost:3001` in your default browser — that's the entire configuration surface (sign in, pick a Bale contact, click Activate). Server mode does not auto-open since servers commonly run on headless hosts.
+Arguments are positional and order-insensitive: any bare number is taken as the web-UI port (default `3001`); the literal word `server` flips role to server. Anything else is ignored.
+
+In **client mode** the binary auto-opens `http://localhost:<port>` in your default browser — that's the entire configuration surface (sign in, pick a Bale contact, click Activate). Server mode does not auto-open since servers commonly run on headless hosts.
+
+> The web UI binds to **`127.0.0.1` only** — it's never reachable from another machine over the network. For a headless server, use SSH local port forwarding to reach it from your laptop:
+>
+> ```bash
+> ssh -L 3001:127.0.0.1:3001 user@your-server
+> ```
+>
+> then open `http://localhost:3001` in your local browser. The forwarding tunnel must stay open while you're using the UI.
 
 ---
 
@@ -48,7 +61,7 @@ In **client mode** the binary auto-opens `http://localhost:3001` in your default
 
 When you launch in client mode, the binary opens `http://localhost:3001` in your default browser. The UI flow:
 
-1. **Sign in** — phone number → SMS code, or paste an `access_token` JWT cookie from `web.bale.ai` directly. Once signed in, the token is persisted in browser `localStorage` so it survives reloads.
+1. **Sign in** — phone number → SMS code, or paste an `access_token` JWT cookie from `web.bale.ai` directly. The token is persisted server-side in `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600); the browser only ever sees a `tokenSet` boolean, never the JWT itself.
 
    <p align="center"><img src="screens/07-node-login.png" alt="Sign-in screen" width="640"></p>
 
@@ -158,7 +171,7 @@ sudo ./balevpn-<version>-macos-arm64 server
 2. Creates the TUN device and assigns `10.8.0.1/24`.
 3. Enables IPv4 forwarding (`/proc/sys/net/ipv4/ip_forward` on Linux, `net.inet.ip.forwarding` on macOS).
 4. Loads the platform-specific NAT rule (iptables MASQUERADE on Linux, pf anchor on macOS).
-5. Subscribes to Bale incoming-call updates and starts auto-answering.
+5. Starts receiving incoming Bale calls — allow-listed callers connect automatically; everyone else lands in a pending queue (see [Server admission control](#server-admission-control)).
 
 When an Android client connects, it gets `10.8.0.2/24` and routes all of its traffic into the tunnel. Up to 253 clients can connect simultaneously — the server transparently rewrites each client's source address to a distinct IP in `10.8.0.0/24` so the kernel can disambiguate concurrent flows.
 
@@ -174,12 +187,10 @@ Whether running as SOCKS5 server or TUN VPN server, every incoming call from a c
 
 <p align="center"><img src="screens/08-server-client-pending.png" alt="Server: pending request" width="640"></p>
 
-- "Accept once" handles this single call but doesn't persist the caller.
-- "Allow always" persists the caller's user-id to `bale-vpn-node/.allowed-callers.json`. Future calls from the same caller auto-accept.
-- "Reject" sends a `DiscardCall` so the caller's tunnel tears down immediately instead of waiting for a timeout.
-- Pending entries auto-reject after 60 s.
-
-Connected clients show their resolved Bale contact name (and user-id) in the **Connected clients** card. Each row has its own Disconnect button.
+- **Accept once** handles this single call but doesn't persist the caller. Future calls land in pending again.
+- **Allow always** adds the caller to the allow-list (persisted server-side in `${RUNTIME_DIR}/.bale-vpn_config.json` under the `admission` key, mode 0600). Future calls from the same caller auto-accept.
+- **Reject** sends a `DiscardCall` so the caller's tunnel tears down immediately **and** adds the caller's id to the **block-list** — future calls from this id are silently rejected (no notification, no pending entry). Undo via the **Blocked callers** list shown below the pending queue (per-row Unblock button).
+- Pending entries auto-reject after 60 s. The 60-second timeout does NOT blacklist — only an explicit Reject does.
 
 <p align="center"><img src="screens/09-server-client-connected.png" alt="Server: connected client" width="640"></p>
 
@@ -189,7 +200,7 @@ Connected clients show their resolved Bale contact name (and user-id) in the **C
 
 Two ways to get an `access_token` JWT into the app:
 
-1. **Phone OTP via the UI** — enter your phone, type the SMS code, the binary fetches the cookie via the standard `web.bale.ai/set-cookie/?jwt=…` flow and stores it in browser `localStorage`. This is the recommended path.
+1. **Phone OTP via the UI** — enter your phone, type the SMS code, the binary fetches the cookie via the standard `web.bale.ai/set-cookie/?jwt=…` flow and persists it in `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600). This is the recommended path.
 2. **Paste a token** — copy the `access_token` cookie from a logged-in `web.bale.ai` Chrome session (DevTools → Application → Cookies) and paste it into the textarea on the UI.
 
 WebSocket close code `4401` means the token expired; sign in again.

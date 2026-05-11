@@ -42,19 +42,40 @@ To disconnect, press **Disconnect**.
 
 1. Toggle the mode switch to **Server**. The foreground service starts automatically and waits for incoming calls.
 2. (Optional) **Contacts** — add anyone else by phone number who should be able to connect to you.
-3. (Optional) **Manage Clients** — set per-client bandwidth caps. Default is 300 kbps; max 500 kbps.
 
 <p align="center"><img src="screens/04-server-mode.jpg" alt="Server mode" width="320"></p>
 
-When someone outside the allow-list calls in, you'll get a notification to **Accept** or **Reject**. Pending requests auto-reject after 60 seconds.
+### Approving callers (allow / block lists)
+
+When someone calls in for the first time you'll get a notification. Open the app and you'll see a pending row with two buttons:
+
+- **Allow** — accepts the caller and adds them to the **allow-list**. Future calls from this ID connect without prompting.
+- **Reject** — disconnects them and adds the caller ID to the **block-list**. Future calls from that ID are auto-rejected silently (no notification, no prompt). To undo this, open **Manage Clients** (described below) and press **Unblock** on their row.
+
+The two lists are mutually exclusive — explicit Allow/Reject moves a caller between them. Pending requests auto-reject after 60 seconds (without blacklisting; the caller can retry later).
 
 <p align="center"><img src="screens/05-pending-request.jpg" alt="Pending request notification" width="320"></p>
 
-The **Manage Clients** screen shows every active client with its live throughput, total bytes, and the current bandwidth cap. Each row has its own Disconnect button.
+### Manage Clients
+
+Rows are grouped (with divider lines) into **connected**, **allowed offline**, and **blocked**. Each row shows the caller's name, ID, an inline `· Allowed` / `· Blocked` membership tag, and — for connected clients — live throughput and totals.
+
+Per-row actions:
+- **Disconnect** — kicks the current session only. There's no auto-retry from the client app — the caller has to manually re-initiate from their side. If they're still on the allow-list, that new call is auto-accepted.
+- **Remove** — drops them from the allow-list and kicks the active session. Future calls go to the pending notification (no auto-accept), but the caller isn't blocked.
+- **Limit** — set per-direction kbps cap, 1–1000. Default is 500 kbps. Persists for admitted callers; session-only otherwise.
+- **Stats** — opens a per-client detail screen with live RTT, retransmits / TLP fires / SACK losses, congestion-window averages, TCP flow-state breakdown, and incoming-queue depth.
+- **Unblock** — only on blocked rows; removes the caller from the block-list.
+
+Action-bar overflow:
+- **Max clients…** — cap on simultaneously-connected callers (1–253, default 5). New calls above the cap are dropped without blacklisting.
+- **Debug logs ON/OFF** — verbose TCP/IP diagnostics in logcat.
 
 <p align="center"><img src="screens/06-manage-clients.jpg" alt="Manage clients" width="320"></p>
 
-To stop the server, toggle the mode back to **Client**. To disconnect every active client without stopping the server (e.g., before sleep), press the WebSocket Disconnect button.
+All settings (allow-list, block-list, per-caller caps, max-clients) persist in `SharedPreferences("config")` across app restarts and device reboots. Clear them via Settings → Apps → Storage → Clear data.
+
+To stop the server, press the **Disconnect** button on the server screen. This kicks every active client and stops accepting new incoming calls. Press **Connect** to resume.
 
 ## 4 · Sharing the tunnel with other devices (optional)
 

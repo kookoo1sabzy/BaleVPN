@@ -335,7 +335,8 @@ bale-vpn-android/
     BaleConnection.kt            # singleton: WS owner, connection rule reconciler (mode + foreground + sticky-disconnect)
     BaleVpnService.kt            # client mode: VpnService — TUN fd, raw IP read loop, IPv6 rejection, stats
     BaleServerService.kt         # server mode: foreground service — auto-answers calls, hosts PacketProcessor per client
-    AdmissionStore.kt            # caller allow-list persisted to SharedPreferences
+    AdmissionStore.kt            # allow-list + per-caller bandwidth caps (SharedPreferences)
+    BlacklistStore.kt            # block-list, mutually exclusive with AdmissionStore
     MainActivity.kt              # VPN start/stop screen; shows live traffic stats when connected
     PhoneAuthActivity.kt         # phone number input → startPhoneAuth
     OtpActivity.kt               # OTP code + optional name → validateCode/signUp → token
@@ -404,8 +405,8 @@ gRPC-web framing: 5-byte prefix `[0x00][4B big-endian length]` for data frames; 
 | `peerName` | `ContactsActivity` | display name |
 | `packet_debug` | `BaleServerService.debug` setter | toggle verbose `PacketProcessor` diagnostics |
 | `admissionList` | `AdmissionStore` | comma-separated allow-list with optional per-caller caps. Format: `<id>[:<upBps>:<downBps>]`, e.g. `12345,67890:62500:62500`. Bare IDs mean "use default cap." |
-| `blacklist` | `BlacklistStore` | comma-separated `callerId` block-list. Calls from these IDs are auto-rejected (`discardCall`) before reaching the pending flow. Mutually exclusive with `admissionList`. |
-| `maxClients` | `BaleServerService.{getMaxClients,setMaxClients}` | int in `[1, 253]`. Cap on simultaneously-connected clients. Default 5. New incoming calls (allowed or pending) above this cap are silently `discardCall`ed; not blacklisted. Hard ceiling matches the Node SNAT pool (10.8.0.2–10.8.0.254 = 253 slots). |
+| `blacklist` | `BlacklistStore` | comma-separated `callerId` block-list. Calls from these IDs are silently rejected (`discardCall`) before reaching the pending flow. Only the user's explicit **Reject** from a pending notification adds an entry — never Disconnect/Remove. Mutually exclusive with `admissionList`. |
+| `maxClients` | `BaleServerService.{getMaxClients,setMaxClients}` | int in `[1, 253]`. Cap on simultaneously-connected clients. Default 5. New incoming calls above the cap are silently `discardCall`ed (no blacklist). Hard ceiling matches the Node SNAT pool (`10.8.0.2`–`10.8.0.254` = 253 slots). Node has the same setting in `.bale-vpn_config.json` key `maxClients`. |
 
 **Startup routing** (`MainActivity.onCreate`):
 - No `token` → `PhoneAuthActivity`
@@ -564,22 +565,30 @@ Per-caller overrides live in `BaleServerService.callerLimits` (in-memory), backe
 
 ### Admission control (`AdmissionStore` + `BlacklistStore`)
 
-Two persisted per-caller stores, mutually exclusive — a callerId is in at most one of them at any time:
-- `AdmissionStore` — allow-list with per-caller bandwidth caps. SharedPreferences `"config"` key `admissionList`.
-- `BlacklistStore` — block-list. Same prefs file, key `blacklist`. Bare IDs only.
+Two persisted per-caller stores, **mutually exclusive** — a callerId is in at most one of them at any time:
+- `AdmissionStore` — allow-list with per-caller bandwidth caps. Android: SharedPreferences `"config"` key `admissionList` (text `<id>[:<upBps>:<downBps>]`, comma-joined). Node: `.bale-vpn_config.json` key `admission` (JSON array of `{callerId, upBps, downBps}`).
+- `BlacklistStore` — block-list. Android: prefs key `blacklist` (comma-joined bare IDs). Node: config key `blacklist` (JSON array of numbers).
 
-`AdmissionStore.add(id)` un-blocks; `BlacklistStore.add(id)` un-allows. The mutual exclusion lives in the stores themselves (Node: lazy-required to avoid circular module load), so call sites don't need to coordinate.
+`AdmissionStore.add(id)` un-blocks; `BlacklistStore.add(id)` un-allows. The mutual exclusion lives in the stores themselves (Node: lazy-required to avoid a circular module load), so call sites don't need to coordinate.
 
-`checkAndHandleCall` order on incoming `callReceived`:
-1. **Blocked** → `discardCall` immediately, no pending entry, no UI prompt. Silent.
-2. **Allowed** → `acceptCall`, `PacketProcessor` created, per-caller cap re-applied from `AdmissionStore.getAllLimits()`.
-3. **Neither** → caller added to `pendingMap`; pending notification fires with caller's display name. The user clicks Allow (with optional "remember") or Reject in `MainActivity` / `ServerClientsActivity`. Reject sends `discardCall`; the peer's VPN sees the rejection and tears down cleanly.
+A third per-server setting lives alongside:
+- `maxClients` — cap on simultaneously-connected clients. Android: SharedPreferences int, helpers on `BaleServerService`. Node: `.bale-vpn_config.json` key `maxClients`, helper `getMaxClients()` in `tunnel.js`. Default 5, hard ceiling 253 (matches Node's SNAT pool size).
+
+`checkAndHandleCall` (Android) / `onCallReceived` (Node) gate order on incoming `callReceived`:
+1. **Blocked** → `discardCall` immediately. No pending entry, no UI prompt. Silent.
+2. **At capacity** (`active >= maxClients`) → `discardCall`. No blacklist — caller can re-call when a slot frees.
+3. **Allowed** → `acceptCall`, `PacketProcessor` created, per-caller cap re-applied from `AdmissionStore.getAllLimits()` (or default cap on Node).
+4. **Neither allowed nor blocked** → pending. The user gets a notification (Android) or a pending row in the web UI (Node) and chooses **Allow** (optionally "remember" → adds to admission), or **Reject**.
+
+**Only the user's explicit Reject from the pending UI adds to the blacklist**, via `rejectPending(callId, addToBlacklist=true)`. Sweep-timeout (`PENDING_TIMEOUT_MS` = 60 s) and bulk-WS-teardown also call `rejectPending`/`doRejectPending` but with `addToBlacklist=false` — those aren't user choices.
+
+The **Disconnect** and **Remove** buttons in the Manage Clients UI do NOT blacklist:
+- **Disconnect** — just kicks the active session via `disconnectClient(callId)`. Caller is free to call back; if they're admitted they get auto-accepted again.
+- **Remove** — drops the caller from `AdmissionStore` AND kicks any active session for that caller. Future calls land in pending (no auto-accept), but the caller isn't blocked.
 
 Duplicate pending requests from the same caller are deduplicated — a new `callReceived` replaces the older pending entry rather than queueing another notification.
 
-The "Disconnect" button in `ServerClientsActivity` (and the equivalent `POST /tunnel/clients/:callKey/disconnect` HTTP route on Node) **adds the caller to the blacklist** as well as kicking the current call. Internal disconnects (peer-join watchdog, idle timeout, `disconnectAllClients` on WS teardown) don't blacklist — only explicit user-initiated kicks do.
-
-Node mirrors the Android stores file-for-file: `admission.js` ↔ `AdmissionStore.kt`, `blacklist.js` ↔ `BlacklistStore.kt`. Both go through **`config-store.js`**, which owns a single `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600) with all server-side persistent state under one JSON object. The Bale `access_token` is also keyed in there (was previously `.bale-token`). On first load, `ConfigStore` migrates **only the token** from the legacy `.bale-token` file — losing the token forces a re-OTP, but admission/blacklist entries are easy to re-add via the UI so their pre-split files (`.allowed-callers.json`, `.blacklisted-callers.json`) are intentionally not migrated.
+Node mirrors the Android stores file-for-file: `admission.js` ↔ `AdmissionStore.kt`, `blacklist.js` ↔ `BlacklistStore.kt`. Both go through **`config-store.js`**, which owns a single `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600) with all server-side persistent state (admission, blacklist, maxClients, token) under one JSON object. On first load, `ConfigStore` migrates **only the token** from the legacy `.bale-token` file — losing the token forces a re-OTP, but admission/blacklist entries are easy to re-add via the UI so their pre-split files (`.allowed-callers.json`, `.blacklisted-callers.json`) are intentionally not migrated.
 
 ### Manage Clients UI (`ServerClientsActivity`)
 
@@ -587,20 +596,28 @@ Reachable from `MainActivity` while server mode is active. Polls `BaleServerServ
 
 If `BaleServerService.isRunning` is false (server stopped externally — e.g., user toggled to client mode while the activity was open), the activity calls `finish()` and bails out.
 
-Each row shows:
-- Caller display name + `callerId` (name resolved async)
-- Live throughput rate `↑ N kbps ↓ N kbps` (formatted via `fmtRate`: kbps under 1 Mbps, Mbps above; computed from successive 500-ms snapshots in `sampleCache`)
-- Cumulative byte counters (still in KB)
-- Bandwidth caps if set (kbps)
-- Background turns **green** for connected, **red** while `isThrottled` is true
+Row grouping (top → bottom, divider line between groups):
+1. **Connected** clients (any admission state) — green background, throughput stats line.
+2. **Allowed offline** — neutral, just the membership tag.
+3. **Blocked** — greyed-out at 0.5 alpha.
 
-Per-row actions:
+Each row shows:
+- Caller display name + `callerId` (name resolved async via `loadUserName`, cached in `nameCache`)
+- Inline membership tag — `· Allowed` or `· Blocked` (matches the agent-symmetric scan pattern; connected non-admitted callers have no tag because they're one-time accepts)
+- For connected rows: live throughput `↑ N kbps ↓ N kbps` (kbps under 1 Mbps, Mbps above; from successive 500-ms snapshots in `sampleCache`), cumulative byte counters in KB, bandwidth caps if explicitly set
+- Background flips **red** while `isThrottled` is true
+
+Per-row actions (wrapped into a 2-per-row button grid so 4 buttons don't crowd a single line):
+- **Disconnect** — kicks the active session via `BaleServerService.disconnectClient`. Does NOT blacklist; caller can call back.
+- **Remove** — drops from `AdmissionStore` AND kicks any active session. Future calls land in pending. Only shown on rows in the allow-list.
+- **Limit** — dialog to set per-direction kbps cap (1–1000 = `MAX_LIMIT_BPS / 1000 * 8`). Stored by `callerId` in `AdmissionStore.setLimit` (persistent only if admitted; session-only otherwise). Pre-fills with current value or `DEFAULT_LIMIT_BPS` (500 kbps).
 - **Stats** — opens `ClientStatsActivity` for that client (see below).
-- **Disconnect** — `BaleServerService.disconnectClient`.
-- **Limit** — dialog to set per-direction kbps cap (1–1000). Stored by `callerId`, re-applied on reconnect. Pre-fills with the current value or the default cap if none.
-- **Remove** — only on rows in the allow-list; removes and disconnects.
+- **Unblock** — only on blocked rows; removes from `BlacklistStore`. Replaces all other buttons.
+
+Each action shows a `Toast` confirmation so the user sees the click landed before the row mutates (since `syncList` rebuilds row order on every 500-ms poll).
 
 Action-bar overflow:
+- **Max clients…** — dialog to set the simultaneous-clients cap (1–253). Persists to SharedPreferences `maxClients` via `BaleServerService.setMaxClients`.
 - **Debug logs ON/OFF** — toggles `BaleServerService.debug`, propagated to every live `PacketProcessor` and persisted.
 
 ### Per-client stats (`ClientStatsActivity`)
