@@ -27,7 +27,14 @@ sealed class TFrame {
 }
 
 fun lkEncode(f: TFrame): ByteArray {
-    if (f is TFrame.Ip) return byteArrayOf(0x49.toByte()) + f.data
+    // Hot path: called once per outbound IP packet on client and server.
+    // The naive `byteArrayOf(0x49) + f.data` allocates twice and copies twice
+    // (the 1-byte array, the `+` result, then the contents). Single-alloc
+    // single-copy version below.
+    if (f is TFrame.Ip) return ByteArray(f.data.size + 1).also {
+        it[0] = 0x49
+        f.data.copyInto(it, 1)
+    }
     val sid  = f.sid.hexToBytes()
     val type = when (f) {
         is TFrame.Connect -> 'C'; is TFrame.Ack -> 'A'
