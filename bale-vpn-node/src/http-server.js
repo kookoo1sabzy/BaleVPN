@@ -27,6 +27,7 @@ const { HTML, csrfToken } = require('./ui-html');
 
 function create(client, connection) {
     return http.createServer(async (req, res) => {
+      try {
         const url = new URL(req.url, 'http://localhost');
 
         // CSRF gate — any state-changing request must carry the per-process
@@ -539,6 +540,22 @@ function create(client, connection) {
 
         res.writeHead(404);
         res.end();
+      } catch (e) {
+        // Last-resort handler for any await that rejects without a local
+        // try/catch. Without this, the async request handler's returned
+        // promise rejects, Node logs `unhandledRejection`, and the HTTP
+        // response is never written — the browser sits on the request
+        // until socket timeout. headersSent guard avoids the "Cannot
+        // write to a closed response" error if the route had already
+        // started streaming.
+        console.error(`[HTTP] route ${req.method} ${req.url} threw:`, e.message);
+        if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+        } else {
+            try { res.end(); } catch (_) {}
+        }
+      }
     });
 }
 
