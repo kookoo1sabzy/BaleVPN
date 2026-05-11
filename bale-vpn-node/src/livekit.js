@@ -72,21 +72,20 @@ class LiveKitTransport {
 
     send(data) {
         if (!this.room) return;
-        this._normalQueue.push(data instanceof Uint8Array ? data : new Uint8Array(data));
+        this._normalQueue.push(data);
         this._drain();
     }
 
     sendUrgent(data) {
         if (!this.room) return;
-        this._urgentQueue.push(data instanceof Uint8Array ? data : new Uint8Array(data));
+        this._urgentQueue.push(data);
         this._drain();
     }
 
     // Fire-and-forget LOSSY send for raw IP packets — no queuing, no back pressure.
     sendLossy(data) {
         if (!this.room) return;
-        const d = data instanceof Uint8Array ? data : new Uint8Array(data);
-        Promise.resolve(this.room.localParticipant.publishData(d, { reliable: false }))
+        Promise.resolve(this.room.localParticipant.publishData(data, { reliable: false }))
             .catch(e => console.error('[LK] LOSSY send failed:', e.message));
     }
 

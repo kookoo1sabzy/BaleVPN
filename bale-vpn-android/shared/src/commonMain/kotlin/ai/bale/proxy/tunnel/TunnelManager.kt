@@ -63,8 +63,11 @@ class TunnelManager(
         scope.coroutineContext.cancelChildren()
     }
 
-    fun sendPacket(data: ByteArray) {
-        transport.send(lkEncode(TFrame.Ip(data)))
+    /** `off`/`len` let the TUN read loop pass its shared buffer directly without
+     *  an intermediate `copyOf` — the framing alloc absorbs the slice in one go.
+     *  Default args keep no-offset callers (e.g. server NAT egress) unchanged. */
+    fun sendPacket(data: ByteArray, off: Int = 0, len: Int = data.size) {
+        transport.send(lkEncodeIp(data, off, len))
     }
 
     /** Single connect attempt — no auto-retry. On any failure (callAccepted

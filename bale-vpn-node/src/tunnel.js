@@ -929,7 +929,14 @@ class TunnelManager {
                         rewriteIp(pkt, 16, '10.8.0.2');
                         this._tunTxPkts++; this._tunTxBytes += pkt.length;
                         lk._txPkts++; lk._txBytes += pkt.length;
-                        lk.sendLossy(lkEncode({ t: 'I', data: Buffer.from(pkt) }));
+                        // Fuse the TUN-read copy with the lk-frame build —
+                        // one alloc, one copy directly from the (reused) TUN
+                        // buffer into the lk frame. Saves a Buffer.from(pkt)
+                        // and the Buffer.concat inside lkEncode.
+                        const out = Buffer.allocUnsafe(pkt.length + 1);
+                        out[0] = 0x49;
+                        pkt.copy(out, 1);
+                        lk.sendLossy(out);
                     }
                     // Packets to addresses with no lease (or non-IPv4) are dropped silently.
                 }

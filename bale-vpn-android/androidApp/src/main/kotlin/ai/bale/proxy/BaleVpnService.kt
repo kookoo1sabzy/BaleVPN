@@ -223,7 +223,10 @@ class BaleVpnService : VpnService() {
                 if (n >= 40 && (buf[0].toInt() and 0xF0) == 0x60) {
                     rejectIpv6(buf, n, out)
                 } else {
-                    mgr.sendPacket(buf.copyOf(n))
+                    // Pass (buf, 0, n) instead of buf.copyOf(n) — the lk-frame
+                    // alloc inside sendPacket absorbs the slice, saving one
+                    // full-payload copy per packet on the hottest path.
+                    mgr.sendPacket(buf, 0, n)
                 }
             }
             Log.d(TAG, "VPN: TUN read loop exited cleanly (scope.isActive=${scope.isActive})")
