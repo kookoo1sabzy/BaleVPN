@@ -116,7 +116,16 @@ class LiveKitTransport {
 
 // Binary framing for WebRTC DataChannel — no base64, no JSON, no seq numbers.
 function lkEncode(obj) {
-    if (obj.t === 'I') return Buffer.concat([Buffer.from([0x49]), obj.data]);
+    // Hot path: called once per outbound IP packet on the server TUN loop.
+    // The naive Buffer.concat([Buffer.from([0x49]), data]) allocates three
+    // Buffers (singleton header, the literal [0x49], and the concat result)
+    // and copies twice. Single-alloc single-copy version below.
+    if (obj.t === 'I') {
+        const out = Buffer.allocUnsafe(obj.data.length + 1);
+        out[0] = 0x49;
+        obj.data.copy(out, 1);
+        return out;
+    }
     const sidBuf = Buffer.from(obj.s, 'hex');
     const hdr    = Buffer.from([obj.t.charCodeAt(0)]);
     if (obj.t === 'C') {
