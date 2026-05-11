@@ -60,7 +60,13 @@ object BaleConnection {
 
     fun init(context: Context) { appContext = context.applicationContext }
 
-    /** Bring the WS up or down to match the desired state. Idempotent. */
+    /** Bring the WS up or down to match the desired state. Idempotent.
+     *  Synchronized because call sites span Main thread (lifecycle / UI),
+     *  IO coroutines (`BaleVpnService.resolveWs`), and TunnelManager callbacks
+     *  (`onTunnelReady` fires on whichever dispatcher completed the deferred).
+     *  Without the lock, two threads could each see `client == null`, both
+     *  build a WS, and leave the first orphaned with a still-live scope. */
+    @Synchronized
     fun reconcile() {
         if (!::appContext.isInitialized) return
         val prefs = appContext.getSharedPreferences("config", Context.MODE_PRIVATE)
@@ -77,6 +83,7 @@ object BaleConnection {
         }
     }
 
+    @Synchronized
     fun connect(token: String) {
         if (client != null) { Log.d(TAG, "BaleConnection.connect: already connected, skipping"); return }
         if (token.isBlank())  { Log.w(TAG, "BaleConnection.connect: empty token, skipping"); return }
@@ -96,27 +103,38 @@ object BaleConnection {
         // sessionExpired flag for MainActivity.tick() to act on. Clearing the
         // token also makes reconcile() short-circuit (its empty-token guard
         // prevents an immediate re-dial with the same dead credential).
+        // The state mutation is synchronized(BaleConnection) because this
+        // lambda fires on the WS reader's coroutine and races against
+        // concurrent connect()/disconnect() calls on Main/IO. ws.disconnect()
+        // cancels the BaleWsClient scope so its ping/SetOnline timers stop
+        // instead of leaking. Logs sit outside the lock — no need to hold the
+        // monitor across logcat I/O.
         ws.onTokenExpired = {
             Log.w(TAG, "BaleConnection: session expired — clearing token")
-            appContext.getSharedPreferences("config", Context.MODE_PRIVATE)
-                .edit().remove("token").apply()
-            sessionExpired   = true
-            callEndedRemover?.invoke(); callEndedRemover = null
-            client = null
-            http?.close(); http = null
+            synchronized(BaleConnection) {
+                appContext.getSharedPreferences("config", Context.MODE_PRIVATE)
+                    .edit().remove("token").apply()
+                sessionExpired = true
+                callEndedRemover?.invoke(); callEndedRemover = null
+                client?.disconnect(); client = null
+                http?.close(); http = null
+            }
         }
         ws.onVersionMismatch = {
             Log.w(TAG, "BaleConnection: version mismatch — app needs update")
-            versionMismatch = true
-            callEndedRemover?.invoke(); callEndedRemover = null
-            client = null
-            http?.close(); http = null
+            synchronized(BaleConnection) {
+                versionMismatch = true
+                callEndedRemover?.invoke(); callEndedRemover = null
+                client?.disconnect(); client = null
+                http?.close(); http = null
+            }
         }
         ws.connect()
         callEndedRemover = ws.addOnCallEnded { id -> BaleConnection.onCallEnded?.invoke(id) }
         client = ws
     }
 
+    @Synchronized
     fun disconnect() {
         Log.d(TAG, "BaleConnection.disconnect")
         // Don't null onCallReceived / onCallEnded — those are subscriptions installed
