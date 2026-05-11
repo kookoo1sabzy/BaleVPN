@@ -66,8 +66,15 @@ class ProtoReader(private val buf: ByteArray) {
 
     fun skip(wire: Int) {
         when (wire) {
-            0    -> varint()
-            2    -> { val n = varint().toInt(); pos += n }
+            0    -> varint()                            // varint
+            1    -> pos += 8                            // fixed64 / sfixed64 / double
+            2    -> { val n = varint().toInt(); pos += n }  // length-delimited
+            5    -> pos += 4                            // fixed32 / sfixed32 / float
+
+            // Wire types 3/4 are start/end-group, deprecated since proto2 and
+            // not emitted by Bale. Throw rather than silent-loop — a future
+            // field with one of these would otherwise hang the WS reader.
+            else -> throw IllegalArgumentException("Unsupported proto wire type: $wire")
         }
     }
 }
