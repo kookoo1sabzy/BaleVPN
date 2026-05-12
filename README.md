@@ -1,5 +1,9 @@
 # Bale VPN
 
+> 🟢 **Simplest start — two Android phones.** A peer-to-peer VPN over Bale messenger: one phone shares its working internet with the other, with no third-party server, no signup, and no command line. Install the APK on both, sign in with your Bale account in the app, flip one to **Server** and the other to **Client**.
+>
+> **→ [Android setup guide](docs/android-en.md)**
+
 A peer-to-peer VPN that tunnels IP traffic over the voice-call infrastructure of [**Bale**](https://bale.ai/), the national Iranian messaging app. One device runs as the *server* (provides internet); another as the *client* (consumes it). To Bale's servers the link looks like a long voice call between two contacts.
 
 The point: when one person has a working / uncensored connection and the other doesn't, the second person can route their traffic through the first — without any extra server, account, payment, or signup. Just install the app on two phones (or a laptop on the server side), make sure the two accounts have each other in their contact list, and connect.
@@ -9,6 +13,10 @@ There is no commercial relationship with Bale.
 <div dir="rtl">
 
 ## دربارهٔ پروژه
+
+> 🟢 **ساده‌ترین شروع — دو گوشی اندرویدی.** یک VPN نقطه‌به‌نقطه روی پیام‌رسان بله: یک گوشی، اینترنت سالمش را با گوشی دیگر به اشتراک می‌گذارد؛ بدون سرور خارجی، بدون ثبت‌نام، بدون خط فرمان. APK را روی هر دو نصب کنید، با حساب بلهٔ خودتان در اپ وارد شوید، یکی را روی **سرور** و دیگری را روی **کلاینت** بگذارید.
+>
+> **← [راهنمای نصب اندروید](docs/android-fa.md)**
 
 این پروژه یک VPN نقطه‌به‌نقطه است که ترافیک IP را روی زیرساخت تماس صوتی [**بله**](https://bale.ai/)، پیام‌رسان ملی ایران، عبور می‌دهد. یک دستگاه نقش *سرور* را دارد (اینترنت می‌دهد) و دستگاه دیگر نقش *کلاینت* را (اینترنت می‌گیرد). برای سرورهای بله این ارتباط شبیه یک تماس صوتی طولانی بین دو مخاطب به نظر می‌رسد.
 
@@ -32,7 +40,21 @@ Treat this tunnel like a corporate VPN whose operator you don't fully trust — 
 
 ### 📌 Recommendation from the author
 
-Register the Bale account used with this tool on a **virtual phone number** rather than your primary one, so the call metadata above can't be tied back to your real identity. Bale accepts non-Iranian numbers — the typical path is: get a virtual number that can receive SMS (providers like [Sonetel](https://app.sonetel.com/) work), register a Telegram account on it (Telegram OTP arrives by SMS), then register Bale on the same number — Bale's OTP is delivered through your Telegram account.
+Register the Bale account used with this tool on a **virtual phone number** rather than your primary one, so the call metadata above can't be tied back to your real identity.
+
+**Bale accepts non-Iranian numbers** — and for those, **Bale's verification code is delivered through Telegram**, not by SMS. (Iranian SMS gateways often can't reliably deliver to international numbers, so Bale uses Telegram as the OTP channel for them.) Step-by-step:
+
+1. Get a virtual phone number that can receive SMS. [Sonetel](https://app.sonetel.com/) works well; other reliable options include [JMP.chat](https://jmp.chat/) (with XMPP), [MySudo](https://mysudo.com/), [Hushed](https://hushed.com/), or [Twilio](https://www.twilio.com/) if you're comfortable with their dashboard. Avoid free "throwaway" SMS sites — Telegram and Bale block most of them.
+2. **Register a Telegram account on that number first.** Telegram's OTP arrives via SMS, which works on real virtual numbers. Set a username so Bale's OTP message can find you.
+3. **Register Bale on the same number.** Bale detects it's a non-Iranian number, **doesn't send SMS**, and instead sends the verification code as a Telegram message to your account from there.
+4. Enter the code in the BaleVPN app → done.
+
+A few notes:
+
+- You only need Telegram during Bale sign-up. After that, the BaleVPN app talks to Bale directly; Telegram isn't in the loop.
+- Keep paying for the virtual number — losing it means losing the Bale account (recovery on a number you don't control is hard).
+- The Bale account is tied to that number forever. Pick a number you're willing to keep.
+- The same recipe also lets non-Iranian Telegram users sign up for Bale in general, not just for this project.
 
 <div dir="rtl">
 
@@ -48,7 +70,42 @@ Register the Bale account used with this tool on a **virtual phone number** rath
 
 ### 📌 توصیهٔ نویسنده
 
-برای حساب بله‌ای که با این ابزار استفاده می‌کنید، از یک **شمارهٔ تلفن مجازی** استفاده کنید نه شمارهٔ اصلی‌تان، تا متادیتای تماس بالا به هویت واقعی شما گره نخورد. بله شماره‌های غیرایرانی را هم می‌پذیرد — مسیر معمول این است: یک شمارهٔ مجازی که SMS دریافت می‌کند تهیه کنید (ارائه‌دهنده‌هایی مثل [Sonetel](https://app.sonetel.com/) کار می‌کنند)، اول با همان شماره روی تلگرام ثبت‌نام کنید (OTP تلگرام با SMS می‌آید)، سپس با همان شماره روی بله ثبت‌نام کنید — OTP بله از طریق حساب تلگرام شما می‌رسد.
+برای حساب بله‌ای که با این ابزار استفاده می‌کنید، از یک **شمارهٔ تلفن مجازی** استفاده کنید نه شمارهٔ اصلی‌تان، تا متادیتای تماس بالا به هویت واقعی شما گره نخورد.
+
+**بله شماره‌های غیرایرانی را هم می‌پذیرد** و برای این شماره‌ها **کد تأیید بله از طریق تلگرام تحویل داده می‌شود، نه SMS.** (سرویس‌های SMS ایرانی معمولاً نمی‌توانند به شماره‌های بین‌المللی پیامک ارسال کنند، پس بله از تلگرام به‌عنوان کانال OTP استفاده می‌کند.) مرحله‌به‌مرحله:
+
+۱. یک شمارهٔ تلفن مجازی تهیه کنید که SMS دریافت کند. [Sonetel](https://app.sonetel.com/) خوب کار می‌کند؛ گزینه‌های دیگر شامل [JMP.chat](https://jmp.chat/) (با XMPP)، [MySudo](https://mysudo.com/)، [Hushed](https://hushed.com/) یا [Twilio](https://www.twilio.com/) اگر با داشبورد آن راحت هستید. از سایت‌های "SMS رایگان یک‌بارمصرف" بپرهیزید — تلگرام و بله بیشترشان را مسدود می‌کنند.
+
+۲. **اول با همان شماره روی تلگرام ثبت‌نام کنید.** OTP تلگرام با SMS می‌آید و روی شماره‌های مجازی واقعی به‌خوبی کار می‌کند. حتماً یک نام کاربری (username) ست کنید تا پیام OTP بله بتواند شما را پیدا کند.
+
+۳. **با همان شماره روی بله ثبت‌نام کنید.** بله تشخیص می‌دهد شماره غیرایرانی است، **SMS نمی‌فرستد** و در عوض کد تأیید را به‌صورت پیام تلگرامی از حساب رسمی خودش روی تلگرام برای شما ارسال می‌کند.
+
+۴. کد را در اپ BaleVPN وارد کنید → تمام.
+
+نکات:
+
+- تلگرام را فقط برای ثبت‌نام بله لازم دارید. پس از آن، اپ BaleVPN مستقیماً با بله حرف می‌زند و تلگرام در مسیر نیست.
+- اشتراک شمارهٔ مجازی را تمدید کنید — از دست دادنش یعنی از دست دادن حساب بله (بازیابی روی شماره‌ای که در اختیار شما نیست، دشوار است).
+- حساب بله برای همیشه به آن شماره گره خورده است. شماره‌ای انتخاب کنید که حاضرید نگه دارید.
+- همین روش به کاربران تلگرام در خارج از ایران اجازه می‌دهد به‌طور کلی در بله ثبت‌نام کنند، نه فقط برای این پروژه.
+
+</div>
+
+---
+
+## ⚠️ Responsible use
+
+This tool is meant for **normal interactive internet use** — web browsing, messaging, email, light app usage. **Not** for video streaming, large downloads, torrents, or other sustained high-bandwidth workloads.
+
+The tunnel rides on Bale's LiveKit infrastructure. Heavy traffic from a "voice call" stands out on Bale's metrics, strains their servers, and makes the project easier to detect and shut down for everyone. **Use responsibly — don't ruin it for the next person.**
+
+<div dir="rtl">
+
+### ⚠️ استفادهٔ مسئولانه
+
+این ابزار برای **استفادهٔ معمولی و تعاملی از اینترنت** ساخته شده — مرور وب، پیام‌رسان‌ها، ایمیل، استفادهٔ سبک از اپ‌ها. **برای استریم ویدیو، دانلودهای حجیم، تورنت یا سایر بارهای پربازده پایدار طراحی نشده.**
+
+تونل روی زیرساخت LiveKit بله اجرا می‌شود. ترافیک سنگین از یک «تماس صوتی» در متریک‌های بله جلب توجه می‌کند، فشار روی سرورهایشان می‌گذارد، و تشخیص و خاموش کردن پروژه را برای همه آسان‌تر می‌کند. **مسئولانه استفاده کنید — حق نفر بعدی را پایمال نکنید.**
 
 </div>
 

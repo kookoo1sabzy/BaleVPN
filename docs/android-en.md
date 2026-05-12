@@ -4,14 +4,6 @@ The Android app is a Kotlin Multiplatform VPN app that runs in either **client m
 
 > Persian / فارسی: [راهنمای کاربری اپلیکیشن اندروید](android-fa.md)
 
-### Why no root?
-
-In **server** mode the app implements its **own TCP/IP stack inside the process** and does NAT entirely in userspace — incoming IP packets from a peer are terminated, routed, and forwarded to the open internet without touching the kernel's networking stack. That's why server mode runs from a plain APK on any phone, with no root and no special privileges.
-
-This was a deliberate design choice for **user convenience** — anyone can install and run the server. The trade-off is performance: a rooted device using the kernel's TCP/IP stack and a real TUN device would be measurably faster. If you have access to a Linux box, the [Linux Node TUN VPN server](node-en.md#linux-vpn-server-tun--full-ip-routing) is the high-throughput option (kernel-level NAT instead of userspace).
-
----
-
 ## What you need
 
 - **Two Android devices**, both signed in to Bale.
@@ -87,4 +79,10 @@ The Android client only routes its own traffic. To share the same internet with 
 - The app needs no root and no special privileges.
 - In server mode, the device must stay on with the app in the foreground or background — the foreground service keeps it alive.
 - Bale's servers see the connection as a long voice call. **They can see your destinations and any unencrypted payload** — see the [privacy note](../README.md#-privacy--encryption) in the main README.
+
+## Why no root?
+
+In **server** mode the app implements its **own TCP/IP stack inside the process** and does NAT entirely in userspace — incoming IP packets from a peer are terminated, routed, and forwarded to the open internet without touching the kernel's networking stack. That's why server mode runs from a plain APK on any phone, with no root and no special privileges.
+
+This was a deliberate design choice for **user convenience** — anyone can install and run the server. The trade-off is performance: a rooted device using the kernel's TCP/IP stack and a real TUN device would be measurably faster. If you have access to a Linux or macOS box, the [Linux/macOS Node TUN VPN server](node-en.md#linux-vpn-server-tun--full-ip-routing) is the high-throughput option (kernel-level NAT instead of userspace).
 
