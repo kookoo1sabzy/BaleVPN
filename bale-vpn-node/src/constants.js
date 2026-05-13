@@ -50,13 +50,13 @@ const LK_CHUNK      = 65000;  // bytes per WebRTC DataChannel message
 // Initial attempt: wait long enough for manual admission (server user has to tap "allow" in a notification).
 const CALL_ACCEPTED_TIMEOUT_MS = 90 * 1000;
 // Max wait for the peer to show up in the LK room after callAccepted.
-const PEER_TIMEOUT_MS          =  5 * 1000;
+const PEER_TIMEOUT_MS          =  30 * 1000;
 // Server: max wait for the caller to actually join our LK room after we acceptCall.
-const PEER_JOIN_TIMEOUT_MS     =  5 * 1000;
+const PEER_JOIN_TIMEOUT_MS     =  30 * 1000;
 
 // Server-mode admission control timeouts.
 const PENDING_TIMEOUT_MS = 60 * 1000;
-const PENDING_SWEEP_MS   = 15 * 1000;
+const PENDING_SWEEP_MS   = 60 * 1000;
 
 // Per-client TUN bandwidth caps (server mode) — match Android.
 // 500 kbps default, 1-second burst.
