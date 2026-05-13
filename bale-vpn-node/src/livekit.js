@@ -54,7 +54,13 @@ class LiveKitTransport {
         room.on(RoomEvent.ParticipantDisconnected, () => {
             if (room.remoteParticipants.size === 0) this._teardown();
         });
-        await room.connect(url, token, { autoSubscribe: true });
+        // autoSubscribe=false mirrors the Android `AndroidLiveKitTransport`
+        // ConnectOptions. Bale's peer publishes a silent audio track to keep
+        // the session looking like a real call; auto-subscribing to it (which
+        // we'd never play) appears to make the SFU evict us ~15 s into the
+        // call. We don't need any media — the data channel is independent
+        // of track subscriptions.
+        await room.connect(url, token, { autoSubscribe: false });
         this.room = room;
         // Some peers may already be in the room when we join (server case).
         if (room.remoteParticipants.size > 0) this.hasPeer = true;
