@@ -39,7 +39,12 @@ const EXPEERTYPE_GROUP   = 2;
 // to a UI option (WebRTC is the only active path).
 const TUNNEL_PREFIX = 'T:';
 const CHUNK_SIZE    = 3000;   // bytes of raw data per Bale text message
-const LK_CHUNK      = 65536;  // bytes per WebRTC DataChannel message
+// WebRTC DataChannel's default SCTP max-message-size is 65536. A `D` frame
+// is 7B header + payload, so we cap payload at 65536 − 7 − a small headroom
+// to keep the on-wire size strictly under the limit and avoid the
+// "engine: connection error: could not establish publisher connection:
+// timeout" the SDK throws on oversize sends.
+const LK_CHUNK      = 65000;  // bytes per WebRTC DataChannel message
 
 // Tunnel-manager state machine timeouts — match Android.
 // Initial attempt: wait long enough for manual admission (server user has to tap "allow" in a notification).
