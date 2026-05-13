@@ -986,18 +986,7 @@ class TunnelManager {
                             sess.lk._txPkts++; sess.lk._txBytes += frame.length;
                             sess.lk.send(frame);
                         }
-                        if (sess.lk.pressured && !socket.isPaused()) {
-                            socket.pause();
-                            if (!sess.lk._drainPending) {
-                                sess.lk._drainPending = true;
-                                sess.lk.onDrain = () => {
-                                    for (const s of this.sessions.values()) {
-                                        if (s.lk === sess.lk && !s.dead && s.socket?.isPaused())
-                                            s.socket.resume();
-                                    }
-                                };
-                            }
-                        }
+                        this._srvBackpressure(sess.lk);
                     });
                 } else {
                     socket.on('data', chunk => {
@@ -1100,6 +1089,28 @@ class TunnelManager {
                 .then(ws => ws?.sendText(sess.fromUid, PEERTYPE_PRIVATE, tunnelEncode(obj)))
                 .catch(err => console.error('[Tunnel] send:', err.message));
         }
+    }
+
+    // Pause every remote socket feeding this LK client when the queue is
+    // pressured; resume them all when it drains below LOW. Eagerly pauses
+    // every session (not just the one whose handler is firing) so a fast
+    // socket can't keep flooding while a slower-data socket is busy.
+    _srvBackpressure(lk) {
+        if (!lk.pressured) return;
+        for (const s of this.sessions.values()) {
+            if (s.lk === lk && !s.dead && s.socket && !s.socket.destroyed && !s.socket.isPaused()) {
+                s.socket.pause();
+            }
+        }
+        if (lk._drainPending) return;
+        lk._drainPending = true;
+        lk.onDrain = () => {
+            for (const s of this.sessions.values()) {
+                if (s.lk === lk && !s.dead && s.socket && !s.socket.destroyed && s.socket.isPaused()) {
+                    s.socket.resume();
+                }
+            }
+        };
     }
 
     // ── Client side ────────────────────────────────────────────────────────────

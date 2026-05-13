@@ -31,10 +31,9 @@ class LiveKitTransport {
         this.onDisconnected = null;
         this.onDrain        = null;
         this.hasPeer        = false;  // true once a remote participant joins (or is already present)
-        this._urgentQueue   = [];
-        this._normalQueue   = [];
-        this._sending       = false;
-        this._drainPending  = false;
+        this._urgentQueue    = [];
+        this._normalQueue    = [];
+        this._drainPending   = false;
     }
 
     get pressured() { return this._normalQueue.length >= NORMAL_QUEUE_HIGH; }
@@ -68,6 +67,7 @@ class LiveKitTransport {
     }
 
     _teardown() {
+        if (!this.room) return;
         const room = this.room;
         this.room = null;
         this._urgentQueue = [];
@@ -96,22 +96,20 @@ class LiveKitTransport {
     }
 
     _drain() {
-        if (this._sending || !this.room) return;
-        const data = this._urgentQueue.shift() || this._normalQueue.shift();
-        if (!data) return;
-        this._sending = true;
-        Promise.resolve(this.room.localParticipant.publishData(data, { reliable: true }))
-            .catch(e => {
-                this._teardown();
-            })
-            .finally(() => {
-                this._sending = false;
-                if (this._normalQueue.length <= NORMAL_QUEUE_LOW && this._drainPending) {
-                    this._drainPending = false;
-                    if (typeof this.onDrain === 'function') { this.onDrain(); this.onDrain = null; }
-                }
-                this._drain();
-            });
+        if (!this.room) return;
+        // Pull every queued frame and fire each as its own publishData,
+        // parallel and fire-and-forget — same shape as sendLossy. SCTP
+        // preserves order across publishes on the same data channel.
+        while (this._urgentQueue.length || this._normalQueue.length) {
+            const data = this._urgentQueue.shift() || this._normalQueue.shift();
+            Promise.resolve(this.room.localParticipant.publishData(data, { reliable: true }))
+                .catch(e => console.error('[LK] send failed:', e.message));
+        }
+        // Queues drained — fire onDrain so upstream sockets resume.
+        if (this._drainPending) {
+            this._drainPending = false;
+            if (typeof this.onDrain === 'function') { this.onDrain(); this.onDrain = null; }
+        }
     }
 
     disconnect() {
