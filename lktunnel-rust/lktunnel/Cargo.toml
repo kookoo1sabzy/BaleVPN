@@ -1,0 +1,44 @@
+# lktunnel — core LiveKit tunnel library.
+#
+# Pure Rust. No JNI, no extern "C", no Android-specific code. Wraps
+# the livekit crate with a session-keyed map of connect/disconnect
+# and a "tunnel" abstraction over LK's lossy DataChannel (the byte
+# pipeline that carries VPN data between peers).
+#
+# Consumers:
+#   - lktunnel-android : Android JNI shim (in this workspace).
+#   - Future: Node bindings via napi-rs, CLI test harness, etc.
+[package]
+name        = "lktunnel"
+version     = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "LiveKit-backed tunnel client: session-keyed connect/send/recv over lossy DataChannel."
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+# TLS via Mozilla's webpki-roots bundle — bakes the CA list into the
+# `.so` at compile time. The `rustls-tls-native-roots` alternative
+# uses `rustls-native-certs`, which scans for the OS trust store at
+# unix-y paths (e.g. /etc/ssl/certs/) that don't exist on Android —
+# system CAs live under /system/etc/security/cacerts/ as DER files
+# and require Android's TrustManager to read. webpki-roots side-steps
+# all that for the cost of an occasional crate version bump.
+livekit     = { version = "0.7", features = ["rustls-tls-webpki-roots"] }
+tokio       = { version = "1",   features = ["rt-multi-thread", "sync", "macros"] }
+parking_lot = "0.12"
+once_cell   = "1"
+log         = "0.4"
+# Cross-platform reactor: epoll on Linux/Android, kqueue on macOS,
+# IOCP on Windows. Sessions hold mio::net::* types directly; the
+# dispatcher just owns the central Poll + Waker.
+mio         = { version = "1", features = ["os-poll", "net"] }
+# Builder for low-level socket configuration that mio::net doesn't
+# expose: setsockopt for SO_MARK, TCP_NODELAY, dual-stack v4/v6,
+# IPV6_V6ONLY etc. Portable and small.
+socket2     = "0.5"
+# Errno + a handful of POSIX constants we still poke directly. Will
+# shrink further as the session ports land in steps 2-4.
+libc        = "0.2"

@@ -1,0 +1,33 @@
+# Headless CLI for joining a LiveKit room and acting as the server
+# half of an lktunnel session: incoming raw IP packets from the room
+# get NATted out the host's real interfaces and replies are written
+# back into the room. Useful for testing the tunnel from a Linux VPS
+# without involving a phone.
+[package]
+name        = "lktunnel-cli"
+version     = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Command-line LiveKit tunnel server using lktunnel."
+
+[[bin]]
+name = "lktunnel"
+path = "src/main.rs"
+
+[dependencies]
+lktunnel = { path = "../lktunnel" }
+# Tiny CLI parser; no derive, no fancy features.
+clap        = { version = "4", features = ["derive"] }
+env_logger  = "0.11"
+log         = "0.4"
+tokio       = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
+parking_lot = "0.12"
+# For `setrlimit(RLIMIT_NOFILE)` at startup — macOS ships a 256-fd soft
+# limit by default, which we burn through in seconds once a browser is
+# opening 50+ parallel connections through the NAT.
+libc        = "0.2"
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+# Used to discover the prebuilt libwebrtc.a path from build.rs — see
+# the script for why we need -force_load explicitly on macOS.
+webrtc-sys-build = "0.3.16"

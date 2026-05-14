@@ -10,7 +10,7 @@
 const http = require('http');
 const {
     TUNNEL_MODE, PEERTYPE_PRIVATE, PEERTYPE_GROUP,
-    MAX_LIMIT_KBPS, HTTP_PORT,
+    HTTP_PORT,
     MAX_CLIENTS_DEFAULT, MAX_CLIENTS_LIMIT,
 } = require('./constants');
 const { ConfigStore } = require('./config-store');
@@ -23,22 +23,12 @@ const {
 const { grpcCall, fetchAccessToken } = require('./grpc-web');
 const { AdmissionStore } = require('./admission');
 const { BlacklistStore } = require('./blacklist');
-const { HTML, csrfToken } = require('./ui-html');
+const { HTML } = require('./ui-html');
 
 function create(client, connection) {
     return http.createServer(async (req, res) => {
       try {
         const url = new URL(req.url, 'http://localhost');
-
-        // CSRF gate — any state-changing request must carry the per-process
-        // token that's embedded in our HTML. A cross-origin attacker can fire
-        // a fetch at us but can't read our HTML to learn the token, so the
-        // header check shuts the door on browser-driven CSRF.
-        if (req.method !== 'GET' && req.method !== 'HEAD' &&
-            req.headers['x-csrf-token'] !== csrfToken) {
-            res.writeHead(403, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ ok: false, error: 'CSRF token missing or invalid' }));
-        }
 
         if (req.method === 'GET' && url.pathname === '/') {
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -132,8 +122,14 @@ function create(client, connection) {
         if (req.method === 'GET' && url.pathname === '/state') {
             // Single endpoint that returns everything the UI needs. /messages
             // and /tunnel/status are kept for back-compat / debug only.
+            //
+            // Post-Rust-port (slice 2d): client mode + per-call SOCKS5
+            // session tracking are gone. `lkTransport` / `serverPeer` /
+            // `sessions` / `socks5Port` / `_rejected` are no longer
+            // populated on TunnelManager — we report fixed values to
+            // keep the JSON shape stable for the UI without trying to
+            // read fields that no longer exist.
             const t  = client.tunnel;
-            const lk = t.lkTransport;
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({
                 mode:            TUNNEL_MODE,
@@ -143,24 +139,24 @@ function create(client, connection) {
                 self:            client.self,
                 wsReady:         client.ready,
                 wsConnecting:    client.connecting,
-                clientActivated: !!(t.mode === 'client' && t.serverPeer),
-                clientRoomReady: !!(lk && lk.hasPeer),
-                clientRejected:  !!t._rejected,
-                cliRxBytes:      lk ? (lk._rxBytes || 0) : 0,
-                cliTxBytes:      lk ? (lk._txBytes || 0) : 0,
-                socks5Port:      t.socks5Port,
-                serverPeer:      t.serverPeer,
-                sessions:        t.sessions.size,
-                lkActive:        !!t.lkTransport,
+                clientActivated: false,            // client mode removed
+                clientRoomReady: false,
+                clientRejected:  false,
+                cliRxBytes:      0,
+                cliTxBytes:      0,
+                socks5Port:      null,
+                serverPeer:      null,
+                sessions:        0,
+                lkActive:        t.lkRooms.size > 0,
                 lkRooms:         t.lkRooms.size,
             }));
         }
 
         if (req.method === 'GET' && url.pathname === '/messages') {
             const since = parseInt(url.searchParams.get('since') || '0');
-            const tunnelActive    = !!(client.tunnel.lkTransport || client.tunnel.lkRooms.size > 0);
-            const clientActivated = !!(client.tunnel.mode === 'client' && client.tunnel.serverPeer);
-            const clientRoomReady = !!(client.tunnel.lkTransport && client.tunnel.lkTransport.hasPeer);
+            const tunnelActive    = client.tunnel.lkRooms.size > 0;
+            const clientActivated = false;
+            const clientRoomReady = false;
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({
                 ready:           client.ready,
@@ -375,27 +371,6 @@ function create(client, connection) {
             const ok = client.tunnel.disconnectClient(callKey);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ ok }));
-        }
-
-        if (req.method === 'POST' && url.pathname.startsWith('/tunnel/clients/') && url.pathname.endsWith('/limit')) {
-            const callKey = decodeURIComponent(url.pathname.slice('/tunnel/clients/'.length, -'/limit'.length));
-            let body = '';
-            req.on('data', c => body += c);
-            req.on('end', () => {
-                try {
-                    const { upKbps, downKbps } = JSON.parse(body || '{}');
-                    const clamp   = k => Math.max(1, Math.min(MAX_LIMIT_KBPS, Number(k) || 0));
-                    const upBps   = clamp(upKbps)   * 1000 / 8;
-                    const downBps = clamp(downKbps) * 1000 / 8;
-                    const ok = client.tunnel.setClientLimit(callKey, upBps, downBps);
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok }));
-                } catch (e) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: false, error: e.message }));
-                }
-            });
-            return;
         }
 
         // ── Server-mode admission control ─────────────────────────────────

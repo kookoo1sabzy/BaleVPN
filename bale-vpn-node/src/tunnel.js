@@ -1,192 +1,80 @@
 'use strict';
 
-// TunnelManager — server- and client-mode tunnel state machine. Handles:
-//   • SOCKS5 listener on the client side, dispatching frames to the server peer
-//   • Auto-answer (with admission control) on the server side
-//   • LiveKit data-channel orchestration
-//   • Linux TUN device for the server's full-VPN mode
-//   • Reconnect machinery with generation-counter cancellation and peer-join
-//     gate (matches Android's TunnelManager semantics)
+// TunnelManager — Bale call admission + lktunnel handle lifecycle.
 //
-// The class doesn't own the WebSocket — it asks for one via the `getBale`
-// callback every time it needs to signal. BaleConnection.resolveWs() brings
-// the WS up briefly during signaling, then `onTunnelReady` fires and the
-// caller's reconcile() drops the WS again once the LK channel is up.
+// Server-only since the napi-binding port: client SOCKS5 mode + all
+// proxy-frame multiplexing (`C/A/D/X/U`) are gone — they only made
+// sense on the old SCTP data-channel transport, which doesn't exist
+// any more on the RTP carrier. The TUN-side packet processing and
+// SNAT pool moved into Rust (`lktunnel::server::tun_gateway`); JS
+// no longer touches IP packets in either NAT mode.
+//
+// Two NAT shapes, selected via `--nat-mode` and the `NAT_MODE` const:
+//
+//   kernel    — one shared `bale0` TUN device, opened + configured
+//               here at server boot, handed to a `TunGateway`. Per
+//               call we `gw.register(t)` to allocate a `10.8.0.X`
+//               SNAT lease. Linux only — the napi binding's openTun
+//               is gated to Linux because Darwin's `utun` needs a
+//               different ioctl path we haven't ported yet.
+//   userspace — no TUN at all. Per call we `t.startServer()` and
+//               lktunnel's in-Rust userspace NAT bridges peer IP
+//               packets directly to host TCP/UDP sockets. Works on
+//               every platform; required on Windows.
+//
+// What this file still owns:
+//   - the pending / admission / blacklist gating flow on incoming
+//     calls (Bale-protocol level, identical to BaleServerService on
+//     Android)
+//   - the Bale-WS `acceptCall` → `discardCall` plumbing on success
+//     / capacity reject / timeout
+//   - the `lkRooms` map external consumers iterate (http-server.js
+//     scans it for the active-clients UI panel)
+//
+// What's gone:
+//   - `LiveKitTransport`, `lkEncode` / `lkDecode`
+//   - `_handleTunPacket`, `_tunReadLoop`, `_setupTun*`, `_teardownTun`
+//   - `_allocSnat`, `_freeSnat`, `_snatByLk`, `_lkBySnat`
+//   - `_srvMsg`, `_srvClose`, `_srvSend`, `_srvBackpressure`, `_cliMsg`
+//   - client mode (`startWebRtcTunnel`, SOCKS5 listener, `_callId`,
+//     `_callIds`, `_rejected`, `_gen`)
+//   - the legacy "tunnel over Bale text messages" framing
+//     (`tunnelEncode` / `tunnelDecode`)
 
-const fs    = require('fs');
-const net   = require('net');
-const dgram = require('dgram');
-const dns   = require('dns');
-const crypto = require('crypto');
 const { execSync } = require('child_process');
-// Hoist tun to module scope — _handleTunPacket / _tunReadLoop are on the
-// hot path. A per-packet `require('./tun')` is cached but still a hashmap
-// lookup that's worth avoiding at high packet rates.
-const tun   = require('./tun');
 
 const {
-    PEERTYPE_PRIVATE,
-    TUNNEL_PREFIX, CHUNK_SIZE, LK_CHUNK,
-    CALL_ACCEPTED_TIMEOUT_MS, PEER_TIMEOUT_MS, PEER_JOIN_TIMEOUT_MS,
-    PENDING_TIMEOUT_MS, PENDING_SWEEP_MS,
-    DEFAULT_LIMIT_KBPS, MAX_LIMIT_KBPS, THROTTLE_FLAG_MS,
+    NAT_MODE,
+    PEER_TIMEOUT_MS, PENDING_TIMEOUT_MS, PENDING_SWEEP_MS,
     MAX_CLIENTS_DEFAULT, MAX_CLIENTS_LIMIT,
+    TUN_MTU,
 } = require('./constants');
-
-// Read the persisted max-clients setting, clamped to the hard pool ceiling.
-function getMaxClients() {
-    const v = Number(ConfigStore.get('maxClients', MAX_CLIENTS_DEFAULT)) || MAX_CLIENTS_DEFAULT;
-    return Math.max(1, Math.min(MAX_CLIENTS_LIMIT, v));
-}
-const { LiveKitTransport, lkEncode, lkDecode } = require('./livekit');
 const { AdmissionStore } = require('./admission');
 const { BlacklistStore } = require('./blacklist');
 const { ConfigStore }    = require('./config-store');
 
-// Tunnel envelope helpers (legacy "T:" message-mode wire format — kept around
-// per the "leave unused code in place" preference; only the WebRTC path is
-// actually wired to a UI option these days).
-function tunnelEncode(obj) { return TUNNEL_PREFIX + JSON.stringify(obj); }
-function tunnelDecode(text) {
-    if (!text.startsWith(TUNNEL_PREFIX)) return null;
-    try { return JSON.parse(text.slice(TUNNEL_PREFIX.length)); } catch { return null; }
-}
-function makeSid() { return crypto.randomBytes(6).toString('hex'); }
-
-// Simple bytes/sec token bucket with 1-second burst, mirroring the Android
-// PacketProcessor's per-direction limiter. Drop semantics — when the bucket
-// is empty, take() returns false and the caller is expected to drop the
-// packet (TCP-in-tunnel will retransmit; UDP loss is acceptable).
-class TokenBucket {
-    constructor(rateBps) {
-        this._rate    = rateBps;
-        this._cap     = rateBps;
-        this._tokens  = rateBps;
-        this._last    = Date.now();
-        this.lastDrop = 0;
+// napi binding to lktunnel-rust. Built by `npm run build:native`;
+// the loader script (`rust/lktunnel-node/index.js`) picks the
+// right platform `.node` file. We require lazily so a missing
+// build produces a clear error at server-start time rather than
+// at module-import time on `bale-proxy.js`'s side.
+let _lk = null;
+function lk() {
+    if (_lk) return _lk;
+    try {
+        _lk = require('../rust/lktunnel-node');
+    } catch (e) {
+        const msg = (e && e.message) || String(e);
+        throw new Error(
+            `lktunnel-node native binding not loadable — run \`npm run build:native\` first. ${msg}`);
     }
-    setRate(rateBps) {
-        this._rate = rateBps;
-        this._cap  = rateBps;
-        if (this._tokens > this._cap) this._tokens = this._cap;
-    }
-    take(bytes) {
-        const now = Date.now();
-        this._tokens = Math.min(this._cap, this._tokens + (now - this._last) / 1000 * this._rate);
-        this._last   = now;
-        if (this._tokens < bytes) { this.lastDrop = now; return false; }
-        this._tokens -= bytes;
-        return true;
-    }
+    return _lk;
 }
 
-// ── IPv4 SNAT helpers (server-side multi-client TUN) ─────────────────────────
-//
-// Every Android client locally configures its TUN interface as 10.8.0.2/24
-// (BaleVpnService.kt). On a single-client server that's fine — the kernel's
-// MASQUERADE conntrack maps <10.8.0.2:sport, dst:dport> to the public NIC's
-// addr/port and demuxes return flows by that 4-tuple. With multiple clients
-// all claiming 10.8.0.2 the conntrack tuples collide and return packets get
-// misrouted, so the server applies a userspace SNAT: rewrite each client's
-// source IP to a distinct address in 10.8.0.0/24 *before* handing the packet
-// to bale0, and reverse the rewrite on return packets so the client still
-// sees its own configured 10.8.0.2.
-
-// Adjust a 16-bit Internet checksum at pkt[off] for a single IP-address change.
-// RFC 1624: HC' = ~(~HC + ~m + m')   in 16-bit one's complement arithmetic.
-// Used for the IPv4 header checksum and the L4 (TCP/UDP) checksum, both of
-// which depend on the IP addresses via the pseudo-header.
-function adjustCsum(pkt, off, oldHi, oldLo, newHi, newLo) {
-    let s = (~pkt.readUInt16BE(off) & 0xFFFF)
-          + (~oldHi & 0xFFFF) + (~oldLo & 0xFFFF)
-          + newHi + newLo;
-    while (s > 0xFFFF) s = (s & 0xFFFF) + (s >>> 16);
-    pkt.writeUInt16BE(~s & 0xFFFF, off);
-}
-
-// In-place rewrite of an IPv4 src (fieldOffset=12) or dst (fieldOffset=16)
-// address. Updates the IP header checksum and the L4 (TCP/UDP) checksum where
-// applicable. ICMP doesn't include addresses in its checksum, so no fixup
-// there. Non-first fragments (frag-offset != 0) don't carry the L4 header,
-// so the L4 checksum lives only in the first fragment.
-// Egress filter — reject traffic to private / loopback / link-local /
-// multicast destinations. Without this, a tunnelled client can reach the
-// *server's* local services (sshd on 127.0.0.1, admin UIs on 192.168.x.x,
-// databases bound to localhost) and — most dangerously — cloud metadata
-// endpoints (169.254.169.254 on AWS/GCP/Azure exposes IAM credentials).
-// Used by both the TUN packet path (raw IP header bytes) and the SOCKS5
-// path (host strings, possibly resolved via DNS).
-function isBlockedOctets(a, b) {
-    return (
-        a === 0                          ||  // 0.0.0.0/8         "this network"
-        a === 10                         ||  // 10.0.0.0/8        private (incl. tunnel subnet)
-        (a === 100 && (b & 0xC0) === 64) ||  // 100.64.0.0/10     CGNAT
-        a === 127                        ||  // 127.0.0.0/8       loopback
-        (a === 169 && b === 254)         ||  // 169.254.0.0/16    link-local + cloud metadata
-        (a === 172 && (b & 0xF0) === 16) ||  // 172.16.0.0/12     private
-        (a === 192 && b === 168)         ||  // 192.168.0.0/16    private
-        a >= 224                             // 224.0.0.0/4       multicast + reserved
-    );
-}
-function isBlockedDst(pkt) {
-    if (pkt.length < 20 || (pkt[0] >> 4) !== 4) return true;
-    return isBlockedOctets(pkt[16], pkt[17]);
-}
-function isBlockedIp4(ip) {
-    const parts = ip.split('.').map(Number);
-    if (parts.length !== 4 || parts.some(n => isNaN(n) || n < 0 || n > 255)) return true;
-    return isBlockedOctets(parts[0], parts[1]);
-}
-
-// Resolve a SOCKS5 destination host to an IPv4 address and gate it through
-// the egress filter. Always passes a resolved literal back so the caller
-// hands `net.connect` / `dgram.send` an IP — eliminates a TOCTOU where the
-// downstream socket could re-resolve the hostname to a different (or
-// IPv6) address we hadn't checked. cb(err, addr) — err on DNS failure,
-// IPv6 literal, or blocked address.
-function resolveAndCheck(host, cb) {
-    const v = net.isIP(host);
-    if (v === 4) {
-        if (isBlockedIp4(host)) return cb(new Error(`destination ${host} blocked by egress filter`));
-        return cb(null, host);
-    }
-    if (v === 6) return cb(new Error(`IPv6 destinations not supported: ${host}`));
-    dns.lookup(host, { family: 4 }, (err, addr) => {
-        if (err) return cb(err);
-        if (isBlockedIp4(addr)) return cb(new Error(`destination ${host} (${addr}) blocked by egress filter`));
-        cb(null, addr);
-    });
-}
-
-function rewriteIp(pkt, fieldOffset, newIp) {
-    if (pkt.length < 20 || (pkt[0] >> 4) !== 4) return;
-    const parts = newIp.split('.').map(Number);
-    // No-op short-circuit: when the address is already what we'd write (e.g.
-    // the first client is leased 10.8.0.2, which matches the address it
-    // already configured locally), skip the writes and the checksum update.
-    if (pkt[fieldOffset]     === parts[0] && pkt[fieldOffset + 1] === parts[1] &&
-        pkt[fieldOffset + 2] === parts[2] && pkt[fieldOffset + 3] === parts[3]) return;
-    const oldHi = pkt.readUInt16BE(fieldOffset);
-    const oldLo = pkt.readUInt16BE(fieldOffset + 2);
-    pkt[fieldOffset]     = parts[0]; pkt[fieldOffset + 1] = parts[1];
-    pkt[fieldOffset + 2] = parts[2]; pkt[fieldOffset + 3] = parts[3];
-    const newHi = (parts[0] << 8) | parts[1];
-    const newLo = (parts[2] << 8) | parts[3];
-
-    adjustCsum(pkt, 10, oldHi, oldLo, newHi, newLo);   // IP header checksum
-
-    const proto    = pkt[9];
-    const ihl      = (pkt[0] & 0x0F) * 4;
-    const fragInfo = pkt.readUInt16BE(6);
-    if ((fragInfo & 0x1FFF) !== 0) return;             // non-first fragment
-
-    if (proto === 6 && pkt.length >= ihl + 18) {       // TCP
-        adjustCsum(pkt, ihl + 16, oldHi, oldLo, newHi, newLo);
-    } else if (proto === 17 && pkt.length >= ihl + 8) {// UDP
-        if (pkt.readUInt16BE(ihl + 6) !== 0) {         // 0 = no checksum
-            adjustCsum(pkt, ihl + 6, oldHi, oldLo, newHi, newLo);
-        }
-    }
+function getMaxClients() {
+    const v = ConfigStore.get('maxClients');
+    if (typeof v === 'number') return Math.max(1, Math.min(MAX_CLIENTS_LIMIT, v));
+    return MAX_CLIENTS_DEFAULT;
 }
 
 class TunnelManager {
@@ -201,193 +89,139 @@ class TunnelManager {
         this.getBale               = getBale || (async () => null);
         this.onTunnelReady         = onTunnelReady         || (() => {});
         this.onPermanentDisconnect = onPermanentDisconnect || (() => {});
-        this.mode             = null;       // 'client' | 'server' | null
-        this.transport        = 'message';  // 'message' | 'webrtc'  (client mode only)
-        this.serverPeer       = null;       // { id, type } — set in client mode
-        this.socks5Port       = 1080;
-        this.socks5Srv        = null;
-        this.sessions         = new Map();
-        this.lkTransport      = null;       // client-mode LiveKit connection
-        this.lkRooms          = new Map();  // server-mode: callId string → LiveKitTransport
-        // Server-mode admission state — mirrors BaleServerService on Android.
-        this.pendingMap       = new Map();  // callKey string → PendingCall
-        this._pendingSweep    = null;       // setInterval handle
-        // TUN packet forwarding (server mode)
-        this._tunFd           = null;
-        this._tunName         = null;       // 'bale0' on Linux, 'utunN' on macOS
-        this._tunReadRunning  = false;
-        this._tunStatsTimer   = null;
-        this._tunRxPkts       = 0;  this._tunRxBytes = 0;
-        this._tunTxPkts       = 0;  this._tunTxBytes = 0;
-        // SNAT pool — lazily initialized on first allocation.
-        this._snatPool        = null;       // queue of free IPs (strings)
-        this._snatByLk        = new Map();  // lk → assigned IP
-        this._lkBySnat        = new Map();  // assigned IP → lk
-        // Per-caller bandwidth overrides. Hydrated from AdmissionStore (the
-        // merged allow-list-with-limits store) so a process restart still
-        // applies the same cap when an admitted caller reconnects. Filter out
-        // entries with zero limits — those mean "use default", same as not being
-        // in the override map at all.
-        this._callerLimits    = new Map();
-        for (const [callerId, lim] of AdmissionStore.getAllLimits()) {
-            if (lim.upBps > 0 || lim.downBps > 0) this._callerLimits.set(callerId, lim);
-        }
-        // Client tunnel state — single attempt, no auto-retry.
-        this._callId           = null;     // most recent callId of our outgoing client-mode call
-        this._callIds          = new Set();// callIds whose callEnded should still trip a permanent stop
-        this._callEndedRemover = null;     // deregister our addOnCallEnded subscription
-        this._rejected         = false;    // peer (server) ended one of our calls — surfaced to UI
-        // Generation counter — bumped on every new startWebRtcTunnel run and on
-        // _stopAll. Used as a cancellation token so concurrent runs (racing
-        // reconnect timer + fresh user Activate) abort cleanly.
-        this._gen              = 0;
+        this.mode = null;                     // 'server' | null  (client mode gone)
+        // Field-name preserved for http-server.js compatibility — the
+        // entries are now `ClientInfo` records, not `LiveKitTransport`
+        // instances, but the read-side code only touches `_callerId`,
+        // `_callerName`, `_connectedAt`, and the rxP/B/txP/B counters,
+        // all of which we preserve verbatim.
+        this.lkRooms        = new Map();
+        this.pendingMap     = new Map();
+        this._pendingSweep  = null;
+        // Kernel-NAT-mode shared TUN state.
+        this._gateway       = null;           // TunGateway handle (kernel mode only)
+        this._tunFd         = null;           // raw fd of bale0 (kernel mode only)
+        this._tunName       = null;           // 'bale0' (kernel mode only)
     }
 
-    configure(mode, { serverPeerId, serverPeerType, socks5Port, transport } = {}) {
+    configure(mode) {
         this._stopAll();
-        this._rejected = false;       // fresh Activate clears any prior rejection notice
-        this.mode      = mode || null;
-        this.transport = transport || 'webrtc';
-        if (mode === 'client') {
-            this.serverPeer = serverPeerId
-                ? { id: Number(serverPeerId), type: Number(serverPeerType) || PEERTYPE_PRIVATE }
-                : null;
-            this.socks5Port = Number(socks5Port) || 1080;
-            if (this.serverPeer) {
-                this._startSocks5();
-                if (this.transport === 'webrtc')
-                    this.startWebRtcTunnel().catch(e => console.error('[Tunnel/C] WebRTC start:', e.message));
+        this.mode = mode || null;
+        if (mode === 'server' && NAT_MODE === 'kernel') {
+            this._setupKernelTun();
+            // Don't silently fall back to userspace if kernel was
+            // requested — the operator explicitly asked for it
+            // (default on Linux/macOS, opt-in elsewhere), so the
+            // right move is to refuse to come up rather than
+            // accept calls that look like they're working but
+            // route via a different NAT shape. macOS hits this
+            // because the Darwin kernel-TUN path isn't wired yet;
+            // pass `--nat-mode=userspace` to override.
+            if (!this._gateway) {
+                console.error(
+                    `[Tunnel/S] kernel NAT requested (--nat-mode=kernel) but \
+unavailable on this platform/host. Refusing to start. Use \
+'--nat-mode=userspace' to switch.`);
+                process.exit(1);
             }
-        } else if (mode === 'server') {
-            this._setupTun();
         }
-        console.log(`[Tunnel] mode=${mode || 'none'} transport=${this.transport}`);
+        console.log(`[Tunnel] configure mode=${mode || 'none'} nat-mode=${NAT_MODE}`);
     }
 
-    onWsReady() {
-        if (this.mode === 'server') this._setupTun();
-    }
+    /** Bale WS landed handshake — for kernel mode we set the TUN up
+     *  eagerly at `configure` so there's nothing to do here, but the
+     *  hook stays in the API contract for symmetry with the old
+     *  flow / Android. */
+    onWsReady() {}
 
     status() {
-        const lk = this.lkTransport;
         return {
             mode:        this.mode || 'none',
-            transport:   this.transport,
-            socks5Port:  this.socks5Port,
-            serverPeer:  this.serverPeer,
-            running:     !!this.socks5Srv,
-            sessions:    this.sessions.size,
-            lkActive:    !!(this.lkTransport || this.lkRooms.size > 0),
+            natMode:     NAT_MODE,
+            transport:   'rtp',
+            lkActive:    this.lkRooms.size > 0,
             lkRooms:     this.lkRooms.size,
-            cliRxBytes:  lk ? (lk._rxBytes || 0) : 0,
-            cliTxBytes:  lk ? (lk._txBytes || 0) : 0,
-            clientRoomReady: !!(lk && lk.hasPeer),
         };
     }
 
     clients() {
         const list = [];
-        const now = Date.now();
-        for (const [callKey, lk] of this.lkRooms) {
-            const upBps   = lk._upBucket   ? lk._upBucket._rate   : 0;
-            const downBps = lk._downBucket ? lk._downBucket._rate : 0;
-            const throttled = !!(lk._upBucket   && (now - lk._upBucket.lastDrop)   < THROTTLE_FLAG_MS) ||
-                              !!(lk._downBucket && (now - lk._downBucket.lastDrop) < THROTTLE_FLAG_MS);
+        for (const [callKey, c] of this.lkRooms) {
+            const stats = (() => {
+                try { return c._tunnel.stats(); } catch (_) { return [0, 0, 0, 0]; }
+            })();
             list.push({
                 callKey,
-                callerId:     lk._callerId   || 0,
-                callerName:   lk._callerName || null,
-                snatIp:       this._snatByLk.get(lk) || null,
-                isTunClient:  this._snatByLk.has(lk),
-                connectedAt:  lk._connectedAt,
-                rxPkts:  lk._rxPkts,  rxBytes: lk._rxBytes,
-                txPkts:  lk._txPkts,  txBytes: lk._txBytes,
-                upBps, downBps, throttled,
+                callerId:     c._callerId   || 0,
+                callerName:   c._callerName || null,
+                snatIp:       c._lease ? `10.8.0.${c._lease}` : null,
+                isTunClient:  c._lease != null,
+                connectedAt:  c._connectedAt,
+                rxPkts:  stats[0],  rxBytes: stats[1],
+                txPkts:  stats[2],  txBytes: stats[3],
             });
         }
         return list;
     }
 
-    setClientLimit(callKey, upBps, downBps) {
-        const lk = this.lkRooms.get(callKey);
-        if (!lk) return false;
-        if (lk._upBucket)   lk._upBucket.setRate(upBps);
-        if (lk._downBucket) lk._downBucket.setRate(downBps);
-        if (lk._callerId) {
-            this._callerLimits.set(lk._callerId, { upBps, downBps });
-            // Persist only for admitted callers (AdmissionStore.setLimit returns false
-            // otherwise — that's a session-only override matching the user's mental
-            // model where limits "stick to admissions").
-            AdmissionStore.setLimit(lk._callerId, upBps, downBps);
-        }
-        return true;
-    }
-
     disconnectClient(callKey) {
-        const lk = this.lkRooms.get(callKey);
-        if (!lk) return false;
-        // lk.disconnect() fires onDisconnected synchronously, which removes
-        // the room from lkRooms and frees the SNAT lease.
-        lk.disconnect();
+        const c = this.lkRooms.get(callKey);
+        if (!c) return false;
+        // Disconnect fires a 'Disconnected' event back through onEvent
+        // which removes the entry + releases the SNAT lease. We DON'T
+        // delete from lkRooms here to keep all teardown in one path.
+        try { c._tunnel.disconnect(); } catch (_) {}
         return true;
     }
 
-    /** Server-mode mass-disconnect. Takes the WS handle directly because
-     *  resolveWs() would clear userInitiatedDisconnect as a side effect. */
+    /** Bulk teardown of all active + pending calls. Caller passes the
+     *  WS directly to avoid `resolveWs()`'s side effect of clearing
+     *  the user-initiated-disconnect flag. */
     async disconnectAllClients(ws) {
         if (this.mode !== 'server') return;
-        const sendDiscard = (id) => (ws && ws.ready)
-            ? ws.discardCall(id).catch(() => {})
-            : Promise.resolve();
+        const sendDiscard = (id) =>
+            (ws && ws.ready) ? ws.discardCall(id).catch(() => {}) : Promise.resolve();
         const promises = [];
         for (const [, p] of this.pendingMap) promises.push(sendDiscard(p.callId));
         this.pendingMap.clear();
         if (this._pendingSweep) { clearInterval(this._pendingSweep); this._pendingSweep = null; }
-        for (const [callKey, lk] of this.lkRooms) {
+        for (const [callKey, c] of this.lkRooms) {
             promises.push(sendDiscard(callKey));
-            lk.disconnect();   // synchronous onDisconnected → frees SNAT lease
+            try { c._tunnel.disconnect(); } catch (_) {}
         }
         this.lkRooms.clear();
-        if (this._tunStatsTimer) { clearInterval(this._tunStatsTimer); this._tunStatsTimer = null; }
         await Promise.all(promises);
     }
 
-    handleIncoming(text, fromUid) {
-        const msg = tunnelDecode(text);
-        if (!msg) return false;
-        if (this.mode === 'server') this._srvMsg(msg, fromUid, null);
-        else if (this.mode === 'client') this._cliMsg(msg);
-        return true;
+    /** Legacy Bale-text-message tunnel hook — kept as a no-op so
+     *  bale-ws.js's per-message gate still has something to call.
+     *  Old code multiplexed SOCKS5 here; new code never does. */
+    handleIncoming(_text, _fromUid) {
+        return false;
     }
 
-    // Server entrypoint for incoming-call updates. Mirrors Android
-    // BaleServerService.checkAndHandleCall: gates on AdmissionStore,
-    // deduplicates by callerId, throttles reconnect storms, queues unknown
-    // callers as pending.
+    // ── Admission / pending flow ────────────────────────────────────────
+
     async onCallReceived(callId, callEntity) {
         if (this.mode !== 'server') return;
         const callKey  = String(callId);
         const callerId = Number(callEntity?.callerId || 0);
 
         if (this.lkRooms.has(callKey)) {
-            console.log(`[Tunnel/S] Ignoring duplicate call notification for ${callId}`);
+            console.log(`[Tunnel/S] duplicate call notification for ${callId} — ignoring`);
             return;
         }
         if (!callerId) {
-            console.log(`[Tunnel/S] call ${callId} arrived without callerId — deferring`);
+            console.log(`[Tunnel/S] call ${callId} arrived without callerId — deferring (server pushes both 52810 + 52807; we wait for the one carrying adminUid)`);
             return;
         }
 
-        // Blocked callers are rejected silently — no pending entry, no UI prompt.
         if (BlacklistStore.isBlocked(callerId)) {
             console.log(`[Tunnel/S] rejecting blacklisted caller ${callerId} (call ${callId})`);
             this.getBale().then(ws => ws?.discardCall(callId)).catch(() => {});
             return;
         }
 
-        // Capacity gate. Applies to allowed and not-yet-allowed callers alike;
-        // pending entries above the cap would just stall waiting for a slot.
-        // Silent rejection (no blacklist) — caller can re-call once a slot frees.
         const maxClients = getMaxClients();
         if (this.lkRooms.size >= maxClients) {
             console.log(`[Tunnel/S] rejecting caller ${callerId} — at capacity ${this.lkRooms.size}/${maxClients}`);
@@ -396,49 +230,44 @@ class TunnelManager {
         }
 
         if (AdmissionStore.isAllowed(callerId)) {
-            // New call from the same caller always wins — _handleCall will
-            // tear down any existing room from the same caller (local cleanup
-            // only, see _handleCall's dedup loop). The previous "establish
-            // grace" guard is gone — the client only retries once and waits
-            // 2s for peer-join, so the worst case is a single extra ~2s hop.
             this.pendingMap.delete(callKey);
             await this._handleCall(callId, callerId, callEntity);
-        } else {
-            for (const [k, p] of this.pendingMap) {
-                if (p.callerId === callerId) {
-                    console.log(`[Tunnel/S] replacing duplicate pending call ${p.callId} from caller ${callerId}`);
-                    this.pendingMap.delete(k);
-                    this.getBale().then(ws => ws?.discardCall(p.callId)).catch(() => {});
-                    break;
-                }
-            }
-            // Resolve the caller name synchronously before logging so the log
-            // line names them ("Joe (12345) → PENDING") rather than just the
-            // bare uid. Cached after first hit; only the first new caller per
-            // session pays the LoadUsers RPC cost.
-            let callerName = null;
-            try {
-                const ws = await this.getBale();
-                callerName = await ws?.lookupContactName(callerId);
-            } catch (_) {}
-            this.pendingMap.set(callKey, {
-                callId:     callKey,
-                callerId,
-                callerName,
-                receivedAt: Date.now(),
-                _entity:    callEntity || null,
-            });
-            this._startPendingSweep();
-            const label = callerName ? `${callerName} (${callerId})` : `caller ${callerId}`;
-            console.log(`[Tunnel/S] call ${callId} from ${label} → PENDING (awaiting admission)`);
+            return;
         }
+
+        // Not allowed → queue as pending and wait for the user (or
+        // sweep timer). Dedupe duplicate pending entries from the same
+        // caller to keep the UI panel one-row-per-caller.
+        for (const [k, p] of this.pendingMap) {
+            if (p.callerId === callerId) {
+                console.log(`[Tunnel/S] replacing duplicate pending call ${p.callId} from caller ${callerId}`);
+                this.pendingMap.delete(k);
+                this.getBale().then(ws => ws?.discardCall(p.callId)).catch(() => {});
+                break;
+            }
+        }
+        let callerName = null;
+        try {
+            const ws = await this.getBale();
+            callerName = await ws?.lookupContactName(callerId);
+        } catch (_) {}
+        this.pendingMap.set(callKey, {
+            callId:     callKey,
+            callerId,
+            callerName,
+            receivedAt: Date.now(),
+            _entity:    callEntity || null,
+        });
+        this._startPendingSweep();
+        const label = callerName ? `${callerName} (${callerId})` : `caller ${callerId}`;
+        console.log(`[Tunnel/S] call ${callId} from ${label} → PENDING (awaiting admission)`);
     }
 
     _startPendingSweep() {
         if (this._pendingSweep) return;
         this._pendingSweep = setInterval(() => {
             const now = Date.now();
-            for (const [k, p] of this.pendingMap) {
+            for (const [, p] of this.pendingMap) {
                 if (now - p.receivedAt > PENDING_TIMEOUT_MS) {
                     console.log(`[Tunnel/S] pending call ${p.callId} timed out — auto-rejecting`);
                     this.rejectPending(p.callId).catch(() => {});
@@ -456,7 +285,6 @@ class TunnelManager {
         const pending = this.pendingMap.get(callKey);
         if (!pending) return false;
         this.pendingMap.delete(callKey);
-        // Re-check capacity at accept time — slots may have filled while pending.
         const maxClients = getMaxClients();
         if (this.lkRooms.size >= maxClients) {
             console.log(`[Tunnel/S] cannot accept pending ${callId} — at capacity ${this.lkRooms.size}/${maxClients}`);
@@ -477,9 +305,6 @@ class TunnelManager {
         console.log(`[Tunnel/S] rejecting call ${callId} from caller ${pending.callerId} block=${addToBlacklist}`);
         const ws = await this.getBale();
         try { await ws?.discardCall(callId); } catch (_) {}
-        // Only the user's explicit Reject from the pending UI flows in here
-        // with addToBlacklist=true. Sweep timeout calls without — that's a
-        // caller who gave up, not a user choice.
         if (addToBlacklist && pending.callerId) BlacklistStore.add(pending.callerId);
         return true;
     }
@@ -497,796 +322,233 @@ class TunnelManager {
         return AdmissionStore.getAll().map(callerId => ({ callerId }));
     }
 
+    // ── Call handling ──────────────────────────────────────────────────
+
+    /** Accept the call via WS, create the Rust Tunnel, install the
+     *  NAT path (kernel-gateway register OR userspace startServer),
+     *  store in `lkRooms`. The Disconnected event handler removes
+     *  the entry and (kernel mode only) releases the SNAT lease. */
     async _handleCall(callId, callerId, callEntity) {
         const callKey = String(callId);
-
         const ws = await this.getBale();
         if (!ws) { console.error('[Tunnel/S] AcceptCall: no WS available'); return; }
 
-        // Resolve the caller name up front so connect/disconnect logs read
-        // "Joe (12345)" instead of just "12345". Cached after first hit.
-        let callerName = null;
-        try { callerName = await ws.lookupContactName(callerId); } catch (_) {}
-        const callerLabel = callerName ? `${callerName} (${callerId})` : `caller ${callerId}`;
-        console.log(`[Tunnel/S] Auto-answering call ${callId} from ${callerLabel}`);
-
-        let resp;
-        try { resp = await ws.acceptCall(callId); }
+        let accepted;
+        try { accepted = await ws.acceptCall(callId); }
         catch (e) { console.error('[Tunnel/S] AcceptCall failed:', e.message); return; }
 
-        const isLivekit = callEntity?.isLivekit || resp.call?.isLivekit;
-        const call = resp.call;
-        if (!isLivekit || !call?.token) {
-            console.log('[Tunnel/S] Call answered — no LiveKit credentials');
+        // AcceptCall returns the wrapped `{ call: CallEntity, seq }`
+        // envelope — unwrap to the inner entity. We treat the call as
+        // LiveKit whenever it carries both an LK-style url + a JWT,
+        // not based on the `isLivekit` bool: Bale sometimes returns
+        // the bool as false on the wire even when everything else
+        // about the response is unmistakably LK-shaped.
+        const call = accepted?.call || {};
+        const tokenLooksValid = !!call.token && call.token.split('.').length === 3;
+        const urlLooksLikeLk  = !!call.url && /^wss?:\/\//.test(call.url);
+        if (!(tokenLooksValid && urlLooksLikeLk)) {
+            console.warn(`[Tunnel/S] no LK creds for ${callId} (token=${!!call.token} url=${call.url || ''})`);
             return;
         }
 
+        // Dedup: new call from same caller wins. Tear down any existing
+        // room from this callerId locally (no `discardCall` — Bale's
+        // discardCall scopes at the caller↔callee session level and
+        // would also kill the new call).
         if (callerId) {
-            for (const [k, lk] of this.lkRooms) {
-                if (lk._callerId === callerId) {
+            for (const [k, info] of this.lkRooms) {
+                if (info._callerId === callerId) {
                     console.log(`[Tunnel/S] replacing existing client ${k} from caller ${callerId} with ${callKey}`);
-                    lk.disconnect();   // onDisconnected → frees SNAT lease + removes from lkRooms
+                    try { info._tunnel.disconnect(); } catch (_) {}
+                    this.lkRooms.delete(k);
                 }
             }
         }
 
-        console.log(`[Tunnel/S] LiveKit url=${call.url} room=${call.room} token=${call.token.slice(0, 40)}…`);
-        const lk = new LiveKitTransport();
-        lk._callKey     = callKey;
-        lk._callerId    = callerId;
-        lk._callerName  = callerName;
-        lk._connectedAt = Date.now();
-        lk._rxPkts = 0; lk._rxBytes = 0;
-        lk._txPkts = 0; lk._txBytes = 0;
-        this.lkRooms.set(callKey, lk);
-        const snat = this._allocSnat(lk);
-        if (!snat) {
-            console.error(`[Tunnel/S] SNAT pool exhausted — rejecting call ${callId}`);
-            this.lkRooms.delete(callKey);
-            ws.discardCall(callId).catch(() => {});
-            return;
-        }
-        console.log(`[Tunnel/S] SNAT lease ${snat} for callKey=${callKey} caller=${callerId}`);
+        // Resolve caller name once. Cached by BaleWsClient so subsequent
+        // calls from the same uid are free.
+        let callerName = null;
+        try { callerName = await ws.lookupContactName(callerId); } catch (_) {}
 
-        // Per-direction token buckets. Default to DEFAULT_LIMIT_KBPS, override
-        // from any per-caller cap remembered from a previous session.
-        // `||` (not `??`) so a 0 in either direction falls back to the default
-        // — matches Android's per-direction default semantics. Without this,
-        // a mixed-zero override like {upBps: 62500, downBps: 0} would create
-        // a rate-0 download bucket, which Node's TokenBucket treats as
-        // "block everything" rather than "unlimited".
-        const defaultBps = DEFAULT_LIMIT_KBPS * 1000 / 8;
-        const override   = callerId ? this._callerLimits.get(callerId) : null;
-        lk._upBucket   = new TokenBucket(override?.upBps   || defaultBps);
-        lk._downBucket = new TokenBucket(override?.downBps || defaultBps);
-        lk.onData = (data) => {
-            lk._rxPkts++;
-            lk._rxBytes += data.length;
-            const msg = lkDecode(data);
-            if (msg?.t === 'I')  this._handleTunPacket(msg.data, lk);
-            else if (msg)        this._srvMsg(msg, callKey, lk);
-        };
-        lk.onDisconnected = () => {
-            this.lkRooms.delete(callKey);
-            this._freeSnat(lk);
-            let closed = 0;
-            for (const [key, sess] of this.sessions) {
-                if (sess.lk === lk) {
-                    sess.dead = true;
-                    sess.socket?.destroy();
-                    this.sessions.delete(key);
-                    closed++;
+        console.log(`[Tunnel/S] LiveKit call ${callId} caller=${callerId} (${callerName || 'unknown'}) room=${call.room || ''} url=${call.url}`);
+
+        // The Rust `start_server` / `gateway.register` checks the
+        // `connected` flag and errors with `not connected` if called
+        // before the LK room handshake completes. `Tunnel.connect` is
+        // non-blocking, so we *can't* call activate inline — defer it
+        // to the first `Connected`/`PeerJoined` event.
+        let hasPeer  = false;
+        let activated = false;
+        const activate = () => {
+            if (activated) return;
+            activated = true;
+            const entry = this.lkRooms.get(callKey);
+            // Guard against the entry being torn down by a racing
+            // disconnect before activation fired.
+            if (!entry || entry._tunnel !== t) return;
+            try {
+                if (NAT_MODE === 'kernel' && this._gateway) {
+                    entry._lease = this._gateway.register(t);
+                    console.log(`[Tunnel/S] kernel-mode lease 10.8.0.${entry._lease} for ${callKey} caller=${callerId}`);
+                } else {
+                    t.startServer();
+                    console.log(`[Tunnel/S] userspace NAT for ${callKey} caller=${callerId}`);
                 }
-            }
-            const who = lk._callerName ? `${lk._callerName} (${lk._callerId})` : `caller ${lk._callerId}`;
-            console.log(`[Tunnel/S] ${who} disconnected callKey=${callKey} closed=${closed} session(s)`);
-        };
-        try {
-            await lk.connect(call.url, call.token);
-        } catch (e) {
-            console.error('[Tunnel/S] LiveKit connect failed:', e.message);
-            this.lkRooms.delete(callKey);
-            this._freeSnat(lk);
-            return;
-        }
-
-        // Watchdog: PEER_JOIN_TIMEOUT_MS after our LK connects, if the caller
-        // hasn't joined the room, tear the call down. The LK session token
-        // would otherwise keep us connected for hours with no peer. Identity
-        // check on the entry guards against reaping a fresh client that
-        // replaced this one in the meantime.
-        setTimeout(() => {
-            const cur = this.lkRooms.get(callKey);
-            if (cur === lk && !lk.hasPeer) {
-                console.log(`[Tunnel/S] peer never joined call ${callId} — disconnecting`);
-                lk.disconnect();
+            } catch (e) {
+                console.error(`[Tunnel/S] NAT activation failed: ${e.message}`);
+                try { t.disconnect(); } catch (_) {}
                 this.getBale().then(w => w?.discardCall(callId)).catch(() => {});
             }
-        }, PEER_JOIN_TIMEOUT_MS);
-    }
-
-    // Single connect attempt — no auto-retry. On any failure (callAccepted
-     // timeout, peer didn't join, server rejected, LK transport drops mid-
-     // session) we fire onPermanentDisconnect and let the user retry manually.
-    async startWebRtcTunnel() {
-        if (this.mode !== 'client' || !this.serverPeer) return;
-        const fail = (reason) => {
-            console.warn(`[Tunnel/C] connect failed — ${reason}`);
-            this._stopAll();
-            try { this.onPermanentDisconnect(); } catch (_) {}
         };
 
-        const gen = ++this._gen;
-        const cancelled = () => gen !== this._gen;
-
-        if (this.lkTransport) { const prev = this.lkTransport; this.lkTransport = null; prev.disconnect(); }
-
-        const ws = await this.getBale();
-        if (cancelled()) return;
-        if (!ws) { fail('WS unavailable'); return; }
-
-        console.log('[Tunnel/C] Starting call for WebRTC tunnel…');
-        let resp;
-        try { resp = await ws.startCall(this.serverPeer.id, this.serverPeer.type); }
-        catch (e) { fail(`StartCall: ${e.message}`); return; }
-        if (cancelled()) return;
-
-        const call = resp.call;
-        if (!call?.isLivekit || !call?.token) {
-            fail('StartCall: no LiveKit info in response');
-            return;
-        }
-
-        // callEnded for the current call → permanent stop with rejected=true.
-        this._callId = call.id;
-        this._callIds.clear();
-        this._callIds.add(String(call.id));
-        this._callEndedRemover?.(); this._callEndedRemover = null;
-        this._callEndedRemover = ws.addOnCallEnded((endedId) => {
-            if (this._callIds.has(String(endedId))) {
-                console.log(`[Tunnel/C] Peer ended call ${endedId} — server rejected; permanent disconnect`);
-                this._rejected = true;
-                this._stopAll();
-                try { this.onPermanentDisconnect(); } catch (_) {}
+        const onEvent = (kind, info) => {
+            switch (kind) {
+                case 'Connected':
+                case 'PeerJoined':
+                    hasPeer = true;
+                    activate();
+                    break;
+                case 'PeerLeft':
+                    // Single-peer tunnel — any peer leaving means the
+                    // counterparty is gone. Rust core will follow up
+                    // with Disconnected when its empty-room probe fires.
+                    break;
+                case 'Disconnected':
+                case 'Error':
+                    this._cleanupCall(callKey, t, info);
+                    break;
             }
+        };
+
+        const t = lk().Tunnel.connect(call.url, call.token, onEvent);
+
+        // Stash the entry immediately so the UI sees an in-flight
+        // client and the dedup loop on subsequent calls can find it.
+        // `_lease` is populated when `activate()` runs.
+        this.lkRooms.set(callKey, {
+            _tunnel:      t,
+            _callKey:     callKey,
+            _callerId:    callerId,
+            _callerName:  callerName,
+            _connectedAt: Date.now(),
+            _lease:       null,
         });
 
-        // Wait for callAccepted before joining the LK room. Joining
-        // speculatively when the server's offline burns us into an empty
-        // room until the peer-join timeout. The CALL_ACCEPTED_TIMEOUT_MS
-        // budget covers manual admission ("allow" notification on server).
-        console.log('[Tunnel/C] Waiting for callAccepted…');
-        let acceptedResolve;
-        const acceptedP = new Promise((res) => { acceptedResolve = res; });
-        const acceptedRemover = ws.addOnCallAccepted((acceptedId) => {
-            if (String(acceptedId) === String(call.id)) acceptedResolve(true);
-        });
-        let accepted = false;
-        try {
-            accepted = await Promise.race([
-                acceptedP,
-                new Promise(r => setTimeout(() => r(false), CALL_ACCEPTED_TIMEOUT_MS)),
-            ]);
-        } finally { acceptedRemover(); }
-        if (cancelled()) return;
-        if (!accepted) { fail(`callAccepted timeout after ${CALL_ACCEPTED_TIMEOUT_MS / 1000}s`); return; }
-
-        console.log(`[Tunnel/C] callAccepted — joining LiveKit room ${call.room}`);
-        const lk = new LiveKitTransport();
-        lk._rxPkts = 0; lk._rxBytes = 0;
-        lk._txPkts = 0; lk._txBytes = 0;
-        lk.onData = (data) => {
-            lk._rxPkts++;
-            lk._rxBytes += data.length;
-            const msg = lkDecode(data);
-            if (msg && msg.t !== 'I') this._cliMsg(msg);
-        };
-        // No auto-reconnect on disconnect — fire permanent disconnect and let
-        // the user retry. The LiveKit data channel and the Bale WS are
-        // independent; losing the data channel means the tunnel is dead.
-        lk.onDisconnected = () => {
-            if (this.lkTransport === lk) {
-                this.lkTransport = null;
-                console.log('[Tunnel/C] LiveKit disconnected — permanent disconnect');
-                this._closeCliSessions();
-                this._stopAll();
-                try { this.onPermanentDisconnect(); } catch (_) {}
+        // Peer-join watchdog. The Rust core also has a 30 s peer-wait
+        // internally; ours fires earlier (PEER_TIMEOUT_MS = 10 s by
+        // default) so the call doesn't sit half-connected for the full
+        // SFU timeout when the peer just disappears.
+        setTimeout(() => {
+            const cur = this.lkRooms.get(callKey);
+            if (cur && cur._tunnel === t && !hasPeer) {
+                console.log(`[Tunnel/S] peer never joined ${callId} within ${PEER_TIMEOUT_MS / 1000}s — disconnecting`);
+                try { t.disconnect(); } catch (_) {}
+                this.getBale().then(w => w?.discardCall(callId)).catch(() => {});
             }
-        };
-        try { await lk.connect(call.url, call.token); }
-        catch (e) { fail(`LiveKit connect: ${e.message}`); return; }
-        if (cancelled()) { lk.disconnect(); return; }
+        }, PEER_TIMEOUT_MS);
+    }
 
-        // Wait up to PEER_TIMEOUT_MS for the server to appear in the room.
-        // callAccepted just confirmed the server is racing in — sub-second
-        // on a healthy network.
-        const peerDeadline = Date.now() + PEER_TIMEOUT_MS;
-        while (!lk.hasPeer && lk.room && Date.now() < peerDeadline) {
-            await new Promise(r => setTimeout(r, 200));
-            if (cancelled()) { lk.disconnect(); return; }
+    /** Common cleanup path: drop from lkRooms, release SNAT lease.
+     *  Safe to call multiple times — the `cur._tunnel === t` identity
+     *  check avoids removing an entry that's been replaced by a fresh
+     *  call from the same caller. */
+    _cleanupCall(callKey, tunnel, reason) {
+        const cur = this.lkRooms.get(callKey);
+        if (!cur || cur._tunnel !== tunnel) return;   // stale event
+        this.lkRooms.delete(callKey);
+        if (cur._lease != null && this._gateway) {
+            try { this._gateway.unregister(tunnel); } catch (_) {}
         }
-        if (!lk.hasPeer) {
-            if (lk.room) lk.disconnect();
-            fail(`peer never joined after ${PEER_TIMEOUT_MS / 1000}s`);
+        const who = cur._callerName ? `${cur._callerName} (${cur._callerId})` : `caller ${cur._callerId}`;
+        console.log(`[Tunnel/S] ${who} disconnected callKey=${callKey}${reason ? ` reason=${reason}` : ''}`);
+    }
+
+    // ── Kernel-mode TUN bring-up / tear-down ───────────────────────────
+
+    _setupKernelTun() {
+        if (this._gateway) return;
+        if (process.platform !== 'linux') {
+            console.warn(`[Tunnel/S] kernel TUN unsupported on ${process.platform}; per-call traffic will fall through to userspace NAT`);
             return;
         }
-
-        this.lkTransport = lk;
-        console.log('[Tunnel/C] WebRTC tunnel ready');
-        try { this.onTunnelReady(); } catch (e) { console.error('[Tunnel/C] onTunnelReady threw:', e.message); }
-    }
-
-    _closeCliSessions() {
-        let closed = 0;
-        for (const [key, sess] of this.sessions) {
-            sess.dead = true;
-            sess.sock?.destroy();
-            this.sessions.delete(key);
-            closed++;
-        }
-        if (closed) console.log(`[Tunnel/C] Closed ${closed} SOCKS5 session(s)`);
-    }
-
-    // ── TUN packet forwarding (server mode) ────────────────────────────────────
-
-    _initSnatPool() {
-        if (this._snatPool) return;
-        this._snatPool = [];
-        // Server's bale0 holds 10.8.0.1 — skip it. Reserve 10.8.0.255 for
-        // broadcast. Each client gets a unique address from .2..254 so the
-        // kernel's MASQUERADE conntrack can disambiguate concurrent flows.
-        for (let i = 2; i < 255; i++) this._snatPool.push(`10.8.0.${i}`);
-    }
-
-    _allocSnat(lk) {
-        this._initSnatPool();
-        const ip = this._snatPool.shift();
-        if (!ip) return null;
-        this._snatByLk.set(lk, ip);
-        this._lkBySnat.set(ip, lk);
-        return ip;
-    }
-
-    _freeSnat(lk) {
-        const ip = this._snatByLk.get(lk);
-        if (!ip) return;
-        this._snatByLk.delete(lk);
-        this._lkBySnat.delete(ip);
-        // Push back to the END of the queue so a recently freed IP doesn't
-        // get re-leased immediately — gives kernel conntrack time to age out
-        // stale entries before the same IP is handed to a new client.
-        this._snatPool.push(ip);
-    }
-
-    _handleTunPacket(data, lk) {
-        if (!this._tunFd) this._setupTun();
-        // Egress filter — drop traffic to private / loopback / link-local /
-        // multicast destinations so a tunnelled client can't reach the
-        // server's localhost, LAN, or cloud-metadata endpoints. Public
-        // destinations (the actual point of the VPN) pass through.
-        if (isBlockedDst(data)) return;
-        // Upload rate limit (client → internet). Drop on empty bucket; TCP-in-
-        // tunnel will retransmit.
-        if (lk._upBucket && !lk._upBucket.take(data.length)) return;
-        // SNAT inbound: every client locally configures src=10.8.0.2, so
-        // rewrite to its allocated unique IP before handing off to the kernel.
-        const snat = this._snatByLk.get(lk);
-        if (!snat) return;   // no lease — should not normally happen
-        rewriteIp(data, 12, snat);
-        if (this._tunFd !== null) {
-            this._tunRxPkts++; this._tunRxBytes += data.length;
-            tun.write(this._tunFd, data, (err) => {
-                if (err) console.error('[TUN] Write error:', err.message);
-            });
-        }
-    }
-
-    _setupTun() {
-        if (this._tunFd !== null) return;
         try {
-            if (process.platform === 'darwin') this._setupTunDarwin(tun);
-            else                                this._setupTunLinux(tun);
-            if (!this._tunReadRunning) {
-                this._tunReadRunning = true;
-                this._tunReadLoop();
-            }
+            const binding = lk();
+            this._tunName = 'bale0';
+            this._tunFd   = binding.openTun(this._tunName);
+            binding.configureIf(this._tunName, '10.8.0.1', 24, TUN_MTU);
+            this._gateway = binding.TunGateway.attach(this._tunFd);
+            this._installLinuxRouting();
+            console.log(`[Tunnel/S] kernel TUN gateway up: ${this._tunName} 10.8.0.1/24 MTU=${TUN_MTU}`);
         } catch (e) {
-            console.error('[TUN] Setup failed:', e.message);
-            this._tunFd = null;
+            console.error(`[Tunnel/S] kernel TUN setup failed: ${e.message}`);
+            // Leave _gateway null — per-call code path falls through to
+            // userspace NAT, which still works.
+            this._gateway = null;
+            this._tunFd   = null;
+            this._tunName = null;
         }
     }
 
-    _setupTunLinux(tun) {
-        // Clean up any leftover bale0 from a prior crash.
-        try { execSync('ip tuntap del dev bale0 mode tun', { stdio: 'pipe' }); } catch (_) {}
-        const t = tun.open('bale0');
-        this._tunFd = t.fd; this._tunName = t.name;
-        console.log(`[TUN] Opened ${this._tunName}`);
-        tun.configure(this._tunName, '10.8.0.1', 24);
-        console.log(`[TUN] ${this._tunName} up  10.8.0.1/24`);
-        try {
-            fs.writeFileSync('/proc/sys/net/ipv4/ip_forward', '1');
-            console.log('[TUN] ip_forward enabled');
-        } catch (e) {
-            console.warn('[TUN] Could not enable ip_forward:', e.message);
-        }
-        try {
-            execSync(
-                'iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null' +
-                ' || iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE',
-                { stdio: 'pipe' }
-            );
-            console.log('[TUN] NAT rule ready');
-        } catch (_) {
-            console.warn('[TUN] Could not add iptables NAT rule — run manually:');
-            console.warn('      sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE');
-        }
-    }
+    _installLinuxRouting() {
+        // Both ip_forward and iptables -t nat require root, but the
+        // Node process runs as the unprivileged user with just
+        // `cap_net_admin` on the binary (enough for the TUN ioctls
+        // we do in-process; not inherited by `execSync` subprocesses).
+        // So we treat these as best-effort: try, and if they fail,
+        // verify whether the host has them set already from a prior
+        // one-time operator setup. Refuse to keep going if forwarding
+        // isn't on — packets would otherwise vanish silently.
+        const sh = (cmd) => execSync(cmd, { stdio: 'pipe', shell: '/bin/sh' });
 
-    // Clean up everything _setupTun installed: TUN device, kernel route,
-    // pf anchor (macOS), iptables rule isn't removed because it's idempotent
-    // and other tools may rely on it. Idempotent — safe to call repeatedly.
-    _teardownTun() {
-        if (this._tunFd === null) return;
-        const fd = this._tunFd;
-        const name = this._tunName;
-        this._tunFd = null;             // make _tunReadLoop bail on next tick
-        this._tunReadRunning = false;
-        if (process.platform === 'darwin') {
-            // Flush our pf NAT rule. The anchor itself stays (empty) which is
-            // fine — empty anchors are a no-op.
-            try { execSync('pfctl -a com.apple/balevpn -F nat', { stdio: 'pipe' }); } catch (_) {}
-            try { execSync('route -q -n delete -inet 10.8.0.0/24',  { stdio: 'pipe' }); } catch (_) {}
-        } else {
-            try { execSync(`ip tuntap del dev ${name || 'bale0'} mode tun`, { stdio: 'pipe' }); } catch (_) {}
-        }
-        try { tun.close(fd); } catch (_) {}
-        console.log(`[TUN] Cleaned up ${name || 'TUN device'}`);
-    }
-
-    _setupTunDarwin(tun) {
-        if (process.getuid && process.getuid() !== 0) {
-            throw new Error('macOS server mode requires root: re-run with sudo');
-        }
-        // Discover the WAN interface so the pf NAT rule can target it.
-        let wanIf = '';
+        try { sh('sysctl -w net.ipv4.ip_forward=1'); } catch (_) {}
+        let forwardOn = false;
         try {
-            const out = execSync('route -n get default 2>/dev/null', { encoding: 'utf8' });
-            const m = out.match(/interface:\s*(\S+)/);
-            wanIf = m ? m[1] : '';
+            forwardOn = require('fs')
+                .readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim() === '1';
         } catch (_) {}
-        if (!wanIf) console.warn('[TUN] Could not detect WAN interface — pf NAT rule may need manual edit');
-
-        const t = tun.open();   // kernel picks utunN
-        this._tunFd = t.fd; this._tunName = t.name;
-        console.log(`[TUN] Opened ${this._tunName}`);
-        tun.configure(this._tunName, '10.8.0.1', 24);
-        console.log(`[TUN] ${this._tunName} up  10.8.0.1/24`);
-        try { execSync('sysctl -w net.inet.ip.forwarding=1', { stdio: 'pipe' }); }
-        catch (e) { console.warn('[TUN] Could not enable forwarding:', e.message); }
-
-        // pf NAT: load into the `com.apple/balevpn` sub-anchor. macOS's default
-        // /etc/pf.conf has `nat-anchor "com.apple/*"` and `anchor "com.apple/*"`
-        // references — anchors loaded under `com.apple/...` get auto-evaluated.
-        // A custom top-level anchor (`balevpn` alone) would load successfully
-        // but never fire because nothing in the main ruleset references it.
-        if (wanIf) {
-            const rule = `nat on ${wanIf} from 10.8.0.0/24 to any -> (${wanIf})\n`;
-            try {
-                execSync(`pfctl -a com.apple/balevpn -f -`, { stdio: 'pipe', input: rule });
-            } catch (e) {
-                console.warn('[TUN] pf rule load failed:', e.stderr?.toString().trim() || e.message);
-            }
-            // Enable pf — `pfctl -e` returns non-zero if already enabled, but
-            // prints "pf already enabled" to stderr; we treat both as success.
-            try { execSync('pfctl -e', { stdio: 'pipe' }); }
-            catch (e) {
-                const msg = (e.stderr?.toString() || '').toLowerCase();
-                if (!msg.includes('already enabled')) console.warn('[TUN] pfctl -e:', msg.trim() || e.message);
-            }
+        if (!forwardOn) {
+            console.error(
+                "[Tunnel/S] net.ipv4.ip_forward is OFF and we can't enable it " +
+                "(non-root). Run once as root:\n" +
+                "    sudo sysctl -w net.ipv4.ip_forward=1\n" +
+                "    echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-bale-vpn.conf");
+            process.exit(1);
         }
 
-        this._verifyTunDarwin(wanIf);
+        try {
+            sh('iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -j MASQUERADE');
+            return;  // rule already present
+        } catch (_) {}
+        try {
+            sh('iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE');
+            return;  // we managed to install it
+        } catch (_) {}
+        console.error(
+            "[Tunnel/S] iptables MASQUERADE rule missing and we can't " +
+            "install it (non-root). Run once as root:\n" +
+            "    sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE\n" +
+            "Then restart this process.");
+        process.exit(1);
     }
 
-    // Print observed system state so a silent-failure setup is visible. Anything
-    // that's WRONG here points at the actual problem (missing route, pf not
-    // enabled, anchor empty, ip_forward=0).
-    _verifyTunDarwin(wanIf) {
-        const probe = (label, cmd) => {
-            try {
-                const out = execSync(cmd, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' }).trim();
-                console.log(`[TUN] ${label}: ${out.replace(/\s+/g, ' ').slice(0, 200)}`);
-            } catch (e) {
-                console.warn(`[TUN] ${label}: FAILED — ${(e.stderr || e.message).toString().trim()}`);
-            }
-        };
-        probe('ip_forward',     "sysctl -n net.inet.ip.forwarding");
-        probe('route 10.8.0.2', "route -n get 10.8.0.2 | grep -E 'interface|gateway'");
-        probe('pf status',      "pfctl -s info 2>&1 | head -1");
-        probe('pf NAT rule',    `pfctl -a com.apple/balevpn -s nat 2>&1`);
-        if (wanIf) console.log(`[TUN] NAT WAN interface: ${wanIf}`);
-    }
-
-    _tunReadLoop() {
-        const buf = Buffer.alloc(65536);
-        const read = () => {
-            if (this._tunFd === null) { this._tunReadRunning = false; return; }
-            tun.read(this._tunFd, buf, (err, pkt) => {
-                if (err) {
-                    console.error('[TUN] Read error:', err.message);
-                    this._tunReadRunning = false;
-                    return;
-                }
-                if (pkt && pkt.length >= 20 && (pkt[0] >> 4) === 4) {
-                    // Route by destination IP — return packets for SNAT'd flows
-                    // arrive with dst = the client's leased IP. Rewrite back to
-                    // the address the client expects (10.8.0.2) before shipping.
-                    const dst = `${pkt[16]}.${pkt[17]}.${pkt[18]}.${pkt[19]}`;
-                    const lk  = this._lkBySnat.get(dst);
-                    // Download rate limit (internet → client). Drop on empty bucket.
-                    if (lk && (!lk._downBucket || lk._downBucket.take(pkt.length))) {
-                        rewriteIp(pkt, 16, '10.8.0.2');
-                        this._tunTxPkts++; this._tunTxBytes += pkt.length;
-                        lk._txPkts++; lk._txBytes += pkt.length;
-                        // Fuse the TUN-read copy with the lk-frame build —
-                        // one alloc, one copy directly from the (reused) TUN
-                        // buffer into the lk frame. Saves a Buffer.from(pkt)
-                        // and the Buffer.concat inside lkEncode.
-                        const out = Buffer.allocUnsafe(pkt.length + 1);
-                        out[0] = 0x49;
-                        pkt.copy(out, 1);
-                        lk.sendLossy(out);
-                    }
-                    // Packets to addresses with no lease (or non-IPv4) are dropped silently.
-                }
-                read();
-            });
-        };
-        read();
-    }
-
-    // ── Server side ────────────────────────────────────────────────────────────
-
-    _srvMsg(msg, fromKey, lk) {
-        const { t, s: sid } = msg;
-        const key = `${fromKey}:${sid}`;
-
-        if (t === 'C') {
-            const { h: host, p: port } = msg;
-            console.log(`[Tunnel/S] ${key} TCP → ${host}:${port}`);
-            const fromUid = lk ? null : Number(fromKey);
-            // Insert the session before DNS so a 'D'/'X' frame arriving in the
-            // tiny window before the lookup callback finds it. socket stays
-            // null until the resolved address passes the egress filter; the
-            // 'D' handler null-guards on sess.socket below.
-            const sess = { key, host, port, socket: null, fromUid, lk: lk || null, txSeq: 0, rxBuf: new Map(), rxNext: 0, dead: false, txBytes: 0, rxBytes: 0 };
-            this.sessions.set(key, sess);
-
-            resolveAndCheck(host, (err, addr) => {
-                if (sess.dead) return;                       // 'X' raced ahead
-                if (err) {
-                    console.error(`[Tunnel/S] ${key} TCP ✗ ${host}:${port} — ${err.message}`);
-                    this._srvSend(sess, { t: 'A', s: sid, ok: false });
-                    this.sessions.delete(key);
-                    return;
-                }
-                const socket = net.connect({ host: addr, port });
-                sess.socket = socket;
-                socket.setNoDelay(true);
-                socket.once('connect', () => {
-                console.log(`[Tunnel/S] ${key} TCP ✓ ${host}:${port}`);
-                this._srvSend(sess, { t: 'A', s: sid, ok: true });
-
-                if (sess.lk) {
-                    socket.on('data', chunk => {
-                        sess.rxBytes += chunk.length;
-                        for (let i = 0; i < chunk.length; i += LK_CHUNK) {
-                            const frame = lkEncode({ t: 'D', s: sid, data: chunk.slice(i, i + LK_CHUNK) });
-                            sess.lk._txPkts++; sess.lk._txBytes += frame.length;
-                            sess.lk.send(frame);
-                        }
-                        this._srvBackpressure(sess.lk);
-                    });
-                } else {
-                    socket.on('data', chunk => {
-                        sess.rxBytes += chunk.length;
-                        for (let i = 0; i < chunk.length; i += CHUNK_SIZE) {
-                            const slice = chunk.slice(i, i + CHUNK_SIZE);
-                            this._srvSend(sess, { t: 'D', s: sid, q: sess.txSeq++, d: slice.toString('base64') });
-                        }
-                    });
-                }
-
-                socket.on('end',   () => this._srvClose(key, sid, 'remote end'));
-                socket.on('error', e  => this._srvClose(key, sid, e.message));
-                socket.on('close', () => this._srvClose(key, sid, 'closed'));
-            });
-            socket.once('error', err => {
-                if (!this.sessions.has(key)) return;
-                console.error(`[Tunnel/S] ${key} TCP ✗ ${host}:${port} — ${err.message}`);
-                this._srvSend(sess, { t: 'A', s: sid, ok: false });
-                this.sessions.delete(key);
-            });
-            });   // resolveAndCheck callback
-
-        } else if (t === 'D') {
-            const sess = this.sessions.get(key);
-            if (!sess || sess.dead) return;
-            // sess.socket is null between session creation and DNS resolution.
-            // A well-behaved client waits for 'A' before sending 'D'; defensively
-            // we just drop here if the socket isn't ready.
-            const ready = sess.socket && !sess.socket.destroyed;
-            if (msg.data) {
-                sess.txBytes += msg.data.length;
-                if (ready) sess.socket.write(msg.data);
-            } else {
-                sess.rxBuf.set(msg.q, Buffer.from(msg.d, 'base64'));
-                while (sess.rxBuf.has(sess.rxNext)) {
-                    const buf = sess.rxBuf.get(sess.rxNext);
-                    sess.txBytes += buf.length;
-                    sess.rxBuf.delete(sess.rxNext++);
-                    if (ready) sess.socket.write(buf);
-                }
-            }
-
-        } else if (t === 'U') {
-            console.log(`[Tunnel/S] ${key} UDP → ${msg.h}:${msg.p} ${msg.data?.length ?? 0}B`);
-            resolveAndCheck(msg.h, (err, addr) => {
-                if (err) {
-                    console.warn(`[Tunnel/S] ${key} UDP ✗ ${msg.h}:${msg.p} — ${err.message}`);
-                    return;
-                }
-                const sock = dgram.createSocket('udp4');
-                sock.send(msg.data, msg.p, addr, () => {});
-                sock.once('message', resp => {
-                    this._srvSend({ lk: lk || null, fromUid: lk ? null : Number(fromKey) },
-                        { t: 'U', s: sid, h: msg.h, p: msg.p, data: resp });
-                    sock.close();
-                });
-                setTimeout(() => { try { sock.close(); } catch {} }, 5000);
-            });
-
-        } else if (t === 'X') {
-            const sess = this.sessions.get(key);
-            if (sess) {
-                sess.dead = true;
-                sess.socket?.destroy();   // null when DNS hasn't resolved yet
-                this.sessions.delete(key);
-                console.log(`[Tunnel/S] ${key} TCP ✕ ${sess.host}:${sess.port} (client)  ↑${sess.txBytes}B ↓${sess.rxBytes}B`);
-            } else {
-                console.log(`[Tunnel/S] ${key} TCP ✕ (already closed)`);
-            }
+    _teardownTun() {
+        if (this._gateway) {
+            try { this._gateway.close(); } catch (_) {}
+            this._gateway = null;
         }
-    }
-
-    _srvClose(key, sid, reason = 'unknown') {
-        const sess = this.sessions.get(key);
-        if (!sess || sess.dead) return;
-        sess.flush?.();
-        sess.dead = true;
-        if (sess.lk) {
-            const xframe = lkEncode({ t: 'X', s: sid });
-            sess.lk._txPkts++; sess.lk._txBytes += xframe.length;
-            sess.lk.send(xframe);
-        } else {
-            this.getBale()
-                .then(ws => ws?.sendText(sess.fromUid, PEERTYPE_PRIVATE, tunnelEncode({ t: 'X', s: sid })))
-                .catch(err => console.error('[Tunnel] send:', err.message));
-        }
-        this.sessions.delete(key);
-        console.log(`[Tunnel/S] ${key} TCP ✕ ${sess.host}:${sess.port} (${reason})  ↑${sess.txBytes}B ↓${sess.rxBytes}B`);
-    }
-
-    _srvSend(sess, obj) {
-        if (sess.lk) {
-            const encoded = lkEncode(obj);
-            sess.lk._txPkts++; sess.lk._txBytes += encoded.length;
-            if (obj.t === 'A' || obj.t === 'U') sess.lk.sendUrgent(encoded);
-            else sess.lk.send(encoded);
-        } else {
-            this.getBale()
-                .then(ws => ws?.sendText(sess.fromUid, PEERTYPE_PRIVATE, tunnelEncode(obj)))
-                .catch(err => console.error('[Tunnel] send:', err.message));
-        }
-    }
-
-    // Pause every remote socket feeding this LK client when the queue is
-    // pressured; resume them all when it drains below LOW. Eagerly pauses
-    // every session (not just the one whose handler is firing) so a fast
-    // socket can't keep flooding while a slower-data socket is busy.
-    _srvBackpressure(lk) {
-        if (!lk.pressured) return;
-        for (const s of this.sessions.values()) {
-            if (s.lk === lk && !s.dead && s.socket && !s.socket.destroyed && !s.socket.isPaused()) {
-                s.socket.pause();
-            }
-        }
-        if (lk._drainPending) return;
-        lk._drainPending = true;
-        lk.onDrain = () => {
-            for (const s of this.sessions.values()) {
-                if (s.lk === lk && !s.dead && s.socket && !s.socket.destroyed && s.socket.isPaused()) {
-                    s.socket.resume();
-                }
-            }
-        };
-    }
-
-    // ── Client side ────────────────────────────────────────────────────────────
-
-    _startSocks5() {
-        this.socks5Srv = net.createServer(sock => this._handleSocks5(sock));
-        this.socks5Srv.listen(this.socks5Port, '127.0.0.1', () =>
-            console.log(`[SOCKS5] 127.0.0.1:${this.socks5Port}`)
-        );
-        this.socks5Srv.on('error', err => console.error('[SOCKS5]', err.message));
-    }
-
-    _handleSocks5(sock) {
-        sock.once('data', buf => {
-            if (buf[0] !== 0x05) { sock.destroy(); return; }
-            sock.write(Buffer.from([0x05, 0x00]));
-
-            sock.once('data', req => {
-                if (req[0] !== 0x05 || req[1] !== 0x01) {
-                    sock.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0]));
-                    sock.destroy(); return;
-                }
-                let host, port;
-                try {
-                    const atyp = req[3];
-                    if (atyp === 0x01) {
-                        host = `${req[4]}.${req[5]}.${req[6]}.${req[7]}`;
-                        port = req.readUInt16BE(8);
-                    } else if (atyp === 0x03) {
-                        const len = req[4];
-                        host = req.slice(5, 5 + len).toString();
-                        port = req.readUInt16BE(5 + len);
-                    } else if (atyp === 0x04) {
-                        const parts = [];
-                        for (let i = 4; i < 20; i += 2) parts.push(req.readUInt16BE(i).toString(16));
-                        host = parts.join(':');
-                        port = req.readUInt16BE(20);
-                    } else {
-                        sock.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0,0,0,0, 0,0]));
-                        sock.destroy(); return;
-                    }
-                } catch { sock.destroy(); return; }
-
-                if (!this.serverPeer) {
-                    sock.write(Buffer.from([0x05, 0x01, 0x00, 0x01, 0,0,0,0, 0,0]));
-                    sock.destroy(); return;
-                }
-
-                const sid  = makeSid();
-                const sess = { sid, sock, txSeq: 0, rxBuf: new Map(), rxNext: 0, ready: false, queue: [], dead: false };
-                this.sessions.set(sid, sess);
-                console.log(`[Tunnel/C] ${sid} CONNECT ${host}:${port}`);
-
-                sock.pause();
-                this._cliSend({ t: 'C', s: sid, h: host, p: port });
-
-                sock.on('data', chunk => {
-                    if (!sess.ready) { sess.queue.push(chunk); return; }
-                    const chunkSize = this.transport === 'webrtc' ? LK_CHUNK : CHUNK_SIZE;
-                    for (let i = 0; i < chunk.length; i += chunkSize) {
-                        const slice = chunk.slice(i, i + chunkSize);
-                        this._cliSend(this.transport === 'webrtc'
-                            ? { t: 'D', s: sid, data: slice }
-                            : { t: 'D', s: sid, q: sess.txSeq++, d: slice.toString('base64') });
-                    }
-                });
-                sock.on('end',   () => this._cliClose(sid));
-                sock.on('error', () => this._cliClose(sid));
-            });
-        });
-    }
-
-    _cliMsg(msg) {
-        const { t, s: sid } = msg;
-        const sess = this.sessions.get(sid);
-        if (!sess) return;
-
-        if (t === 'A') {
-            if (msg.ok) {
-                sess.sock.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]));
-                sess.ready = true;
-                const chunkSize = this.transport === 'webrtc' ? LK_CHUNK : CHUNK_SIZE;
-                for (const chunk of sess.queue)
-                    for (let i = 0; i < chunk.length; i += chunkSize) {
-                        const slice = chunk.slice(i, i + chunkSize);
-                        this._cliSend(this.transport === 'webrtc'
-                            ? { t: 'D', s: sid, data: slice }
-                            : { t: 'D', s: sid, q: sess.txSeq++, d: slice.toString('base64') });
-                    }
-                sess.queue = [];
-                sess.sock.resume();
-            } else {
-                sess.sock.write(Buffer.from([0x05, 0x05, 0x00, 0x01, 0,0,0,0, 0,0]));
-                sess.dead = true; sess.sock.destroy(); this.sessions.delete(sid);
-            }
-
-        } else if (t === 'D') {
-            if (msg.data) {
-                if (!sess.sock.destroyed) sess.sock.write(msg.data);
-            } else {
-                sess.rxBuf.set(msg.q, Buffer.from(msg.d, 'base64'));
-                while (sess.rxBuf.has(sess.rxNext)) {
-                    const buf = sess.rxBuf.get(sess.rxNext);
-                    sess.rxBuf.delete(sess.rxNext++);
-                    if (!sess.sock.destroyed) sess.sock.write(buf);
-                }
-            }
-
-        } else if (t === 'X') {
-            sess.dead = true; sess.sock.end(); this.sessions.delete(sid);
-        }
-    }
-
-    _cliClose(sid) {
-        const sess = this.sessions.get(sid);
-        if (!sess || sess.dead) return;
-        sess.dead = true;
-        this._cliSend({ t: 'X', s: sid });
-        this.sessions.delete(sid);
-    }
-
-    _cliSend(obj) {
-        if (this.transport === 'webrtc') {
-            if (this.lkTransport) {
-                const encoded = lkEncode(obj);
-                this.lkTransport._txPkts++;
-                this.lkTransport._txBytes += encoded.length;
-                this.lkTransport.send(encoded);
-            }
-        } else if (this.serverPeer) {
-            this.getBale()
-                .then(ws => ws?.sendText(this.serverPeer.id, this.serverPeer.type, tunnelEncode(obj)))
-                .catch(err => console.error('[Tunnel] send:', err.message));
-        }
-    }
-
-    hangUpAll() {
-        if (this._tunStatsTimer) { clearInterval(this._tunStatsTimer); this._tunStatsTimer = null; }
-        if (this.lkRooms.size) {
-            console.log(`[Tunnel/S] Hanging up ${this.lkRooms.size} LiveKit room(s)`);
-            for (const lk of this.lkRooms.values()) lk.disconnect();   // → frees SNAT
-            this.lkRooms.clear();
-        }
-        // Defensive: any leases that somehow survived (e.g. from a crashed
-        // teardown) are reclaimed here. _freeSnat is idempotent.
-        for (const lk of [...this._snatByLk.keys()]) this._freeSnat(lk);
-        if (this.sessions.size) {
-            console.log(`[Tunnel/S] Closing ${this.sessions.size} session(s)`);
-            for (const sess of this.sessions.values()) {
-                sess.dead = true;
-                sess.socket?.destroy();
-                sess.sock?.destroy();
-            }
-            this.sessions.clear();
-        }
+        // close() inside the gateway already closed the fd.
+        this._tunFd   = null;
+        this._tunName = null;
     }
 
     _stopAll() {
-        // Bump _gen so any in-flight startWebRtcTunnel sees cancelled() === true
-        // on its next await and bails before mutating state.
-        this._gen++;
-        this._callIds.clear();
-        this._callEndedRemover?.(); this._callEndedRemover = null;
-        this._callId = null;
-        // Clear mode/serverPeer/lkTransport BEFORE the LK teardown — the LK's
-        // synchronous onDisconnected reads them when deciding whether to fire
-        // a permanent disconnect; leaving them set would surface a stale event.
-        this.mode       = null;
-        this.serverPeer = null;
-        if (this.socks5Srv) { this.socks5Srv.close(); this.socks5Srv = null; }
-        if (this.lkTransport) {
-            const lk = this.lkTransport;
-            this.lkTransport = null;
-            lk.disconnect();
+        for (const [, c] of this.lkRooms) {
+            try { c._tunnel.disconnect(); } catch (_) {}
         }
-        this.hangUpAll();
+        this.lkRooms.clear();
+        this.pendingMap.clear();
+        if (this._pendingSweep) { clearInterval(this._pendingSweep); this._pendingSweep = null; }
+        this._teardownTun();
     }
 }
 

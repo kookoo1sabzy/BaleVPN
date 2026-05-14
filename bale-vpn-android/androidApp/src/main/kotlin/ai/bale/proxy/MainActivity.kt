@@ -41,6 +41,9 @@ class MainActivity : BaseActivity() {
     private lateinit var btnVpn:        MaterialButton
     private lateinit var tvStats:       TextView
 
+    // (SOCKS5-from-UI option removed; BaleSocks5Service is kept in
+    // the codebase but is no longer started or surfaced.)
+
     // Server section
     private lateinit var layoutServer:      LinearLayout
     private lateinit var tvServerStatus:    TextView
@@ -221,7 +224,9 @@ class MainActivity : BaseActivity() {
         }
     }
 
-    override fun onPause() { pollJob?.cancel(); super.onPause() }
+    override fun onPause() {
+        pollJob?.cancel(); super.onPause()
+    }
     override fun onDestroy() { uiScope.cancel(); super.onDestroy() }
 
     private fun tick() {
@@ -286,7 +291,9 @@ class MainActivity : BaseActivity() {
         btnModeClient.isEnabled = !lockToggle
         btnModeServer.isEnabled = !lockToggle
 
-        if (mode == "client") tickClient(wsReady) else tickServer(wsReady)
+        if (mode == "client") {
+            tickClient(wsReady)
+        } else tickServer(wsReady)
 
         // Disable logout only while the VPN *client* is actively routing traffic —
         // an accidental tap there would dump the user into the login screen with the

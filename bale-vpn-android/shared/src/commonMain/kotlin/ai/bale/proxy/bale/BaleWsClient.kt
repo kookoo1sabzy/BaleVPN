@@ -55,7 +55,7 @@ class BaleWsClient(
     private val log:        (String) -> Unit = ::println,
     private val onCallReceived: (callId: Long, call: CallEntity?) -> Unit = { _, _ -> },
 ) {
-    // Multi-subscriber: client-mode TunnelManager and server-mode BaleServerService each
+    // Multi-subscriber: client-mode BaleClientSignaling and server-mode BaleServerService each
     // subscribe independently via addOnCallEnded(); a single var would let them overwrite
     // each other. Copy-on-write with @Volatile keeps fire reads lock-free; subscribe/
     // unsubscribe happen at service lifecycle boundaries so the rare add/remove race is fine.
@@ -64,7 +64,7 @@ class BaleWsClient(
 
     /** Multi-subscriber listener for callAccepted — Bale's notification to the
      *  caller that the callee ran AcceptCall and is on its way to the LK room.
-     *  Used by TunnelManager to gate "join LK room" on the actual server
+     *  Used by BaleClientSignaling to gate "join LK room" on the actual server
      *  acceptance instead of joining an empty room speculatively. */
     @kotlin.concurrent.Volatile
     private var callAcceptedListeners: List<(Long) -> Unit> = emptyList()
@@ -157,6 +157,14 @@ class BaleWsClient(
     // re-subscribing every 30 s adds nothing — it's just an extra RPC.
     @kotlin.concurrent.Volatile
     private var subscribeIdx = -1
+    // Exponential backoff for the *non-routine* subscribe-end path
+    // (anything that isn't the 30-s code=4 rotation). Real failures
+    // — `code=14 "no children to pick from"`, `code=13 cardinality
+    // violation` storms — caused a tight hot loop here, hammering
+    // an already-unhealthy backend at ~7 req/s. Reset to 0 every
+    // time we get a real push payload (proof the subscribe is
+    // working).
+    private var subscribeBackoffMs = 0L
     // Set by handleFrame's case=5 when the server reports an incompatible
     // proto/api version. Read by the WS body's read loop (close + break) and
     // by runLoop (fire callback + break the outer retry loop).
@@ -415,20 +423,37 @@ class BaleWsClient(
             if (err) entry.deferred.completeExceptionally(Exception("RPC error: $errMsg"))
             else     entry.deferred.complete(payload ?: ByteArray(0))
         } else if (idx == subscribeIdx && (err || payload == null)) {
-            // SubscribeToUpdates RPC ended. Routine — Bale's server hits its
-            // 30 s deadline waiting for our (impossible-over-WS) request-side
-            // EOF and closes with `code=4 DEADLINE_EXCEEDED`. We don't
-            // re-subscribe: events flow on WS field 2 (Push update channel)
-            // independently of this RPC, so a fresh subscribe wouldn't add
-            // anything. Loud only if the close reason is *not* the expected
-            // `code=4`, in case Bale ever changes the end-of-stream
-            // semantics or the failure is genuine (auth, malformed, etc).
+            // SubscribeToUpdates RPC ended. Routine close (`code=4
+            // DEADLINE_EXCEEDED` — Bale's server hits its 30 s deadline
+            // waiting for our (impossible-over-WS) request-side EOF) is
+            // silent and *not* re-subscribed. Non-routine closes (commonly
+            // `code=13 cardinality violation` when DiscardCall is processed
+            // mid-stream) DO stop real-time updates from arriving, so
+            // re-subscribe defensively.
             val rotation = isExpectedSubscribeRotation(errBytes, payload)
-            if (!rotation) {
+            if (rotation) {
+                // Routine 30 s rotation. Re-subscribe immediately — no
+                // backoff, no log.
+                scope.launch { subscribeUpdates() }
+            } else {
                 val errMsg = errBytes?.let { decodeRpcError(it) } ?: "complete"
-                log("[BaleProxy] WS subscribe stream ended unexpectedly (idx=$idx $errMsg)")
+                // First failure: 1 s. Then double up to 30 s. Without
+                // this, `code=14 "no children to pick from"` (server-
+                // side LB has no healthy backend) caused ~7 re-subs/s.
+                subscribeBackoffMs = if (subscribeBackoffMs == 0L) 1_000L
+                                     else (subscribeBackoffMs * 2).coerceAtMost(30_000L)
+                val wait = subscribeBackoffMs
+                log("[BaleProxy] WS subscribe stream ended unexpectedly (idx=$idx $errMsg) — re-subscribing in ${wait}ms")
+                scope.launch {
+                    delay(wait)
+                    subscribeUpdates()
+                }
             }
         } else if (payload != null && !err) {
+            // A real push payload arrived — the subscribe is healthy.
+            // Clear the backoff so the next genuine failure starts
+            // from 1 s again rather than wherever we last climbed to.
+            subscribeBackoffMs = 0L
             handleUpdate(payload)
         } else {
             val errMsg = errBytes?.let { decodeRpcError(it) }
@@ -539,7 +564,7 @@ class BaleWsClient(
                 }
                 52808 -> {
                     // Caller-side notification that the callee ran AcceptCall.
-                    // Fired to subscribers (TunnelManager) so they can gate
+                    // Fired to subscribers (BaleClientSignaling) so they can gate
                     // joining the LK room on this signal rather than joining
                     // an empty room and waiting hopefully.
                     val raw = r.bytes()

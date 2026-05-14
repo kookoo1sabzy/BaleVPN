@@ -4,10 +4,9 @@
   "description": "Bale messenger protobuf message codecs",
   "main": "src/index.js",
   "bin": "src/bale-proxy.js",
-  "gypfile": false,
   "scripts": {
     "build": "npx pbjs -t static-module -w commonjs -o src/messages.js proto/*.proto && npx pbts -o src/messages.d.ts src/messages.js",
-    "build-tun": "node-gyp configure build",
+    "build:native": "../lktunnel-rust/patches/apply.sh && cd rust/lktunnel-node && npm run build",
     "ui": "node src/bale-proxy.js",
     "package": "pkg . --out-path dist"
   },
@@ -20,18 +19,16 @@
     ],
     "outputPath": "dist",
     "assets": [
-      "node_modules/@livekit/rtc-node/dist/**",
-      "node_modules/@livekit/rtc-ffi-bindings/**",
-      "node_modules/@livekit/rtc-ffi-bindings-*/**"
+      "rust/lktunnel-node/*.node",
+      "rust/lktunnel-node/index.js"
     ]
   },
   "dependencies": {
-    "@livekit/rtc-node": "^0.13.27",
-    "node-addon-api": "^8.0.0",
     "protobufjs": "^7.4.0",
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
     "pkg": "^5.8.1"
   }
 }

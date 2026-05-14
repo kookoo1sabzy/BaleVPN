@@ -58,16 +58,31 @@ class ServerClientsActivity : BaseActivity() {
     override fun onSupportNavigateUp(): Boolean { finish(); return true }
     override fun onDestroy() { uiScope.cancel(); super.onDestroy() }
 
-    // Overflow menu — base items live in BaseActivity; we extend with a
-    // "Max clients..." entry that lets the user cap simultaneous sessions.
+    // Overflow menu — base items live in BaseActivity; we extend with the
+    // "Max clients..." entry and the "Debug logs" toggle that flips
+    // BaleServerService.debug (which propagates to the native NAT layer
+    // and unlocks per-flow retransmit / window / fragment diagnostics).
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menu.add(0, MENU_MAX_CLIENTS, 0, "Max clients…")
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+        menu.add(0, MENU_DEBUG, 0,
+                 if (BaleServerService.debug) "Debug logs ON" else "Debug logs OFF")
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
         return super.onCreateOptionsMenu(menu)
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean = when (item.itemId) {
         MENU_MAX_CLIENTS -> { showMaxClientsDialog(); true }
+        MENU_DEBUG       -> {
+            BaleServerService.debug = !BaleServerService.debug
+            invalidateOptionsMenu()
+            Toast.makeText(
+                this,
+                if (BaleServerService.debug) "Debug logs ON" else "Debug logs OFF",
+                Toast.LENGTH_SHORT
+            ).show()
+            true
+        }
         else             -> super.onOptionsItemSelected(item)
     }
 
@@ -100,11 +115,8 @@ class ServerClientsActivity : BaseActivity() {
     }
 
     companion object {
-        // Hard ceiling for per-client bandwidth caps. Derived from the shared
-        // BaleServerService.MAX_LIMIT_BPS so the dialog and AdmissionStore agree
-        // on the cap. 125_000 B/s × 8 / 1000 = 1000 kbps = 1 Mbps.
-        private val MAX_LIMIT_KBPS: Long = BaleServerService.MAX_LIMIT_BPS * 8L / 1_000L
         private const val MENU_MAX_CLIENTS = 2001  // disjoint from BaseActivity's 1000-range ids
+        private const val MENU_DEBUG       = 2002
     }
 
     // ── Unified list ──────────────────────────────────────────────────────────
@@ -277,9 +289,6 @@ class ServerClientsActivity : BaseActivity() {
             val uptime   = (now - entry.info.connectedAt) / 1000
             val rxKB     = "%.1f".format(entry.info.rxBytes / 1024f)
             val txKB     = "%.1f".format(entry.info.txBytes / 1024f)
-            val upLimit  = if (entry.info.limitUpBps   > 0) " cap:${fmtRate(entry.info.limitUpBps)}"   else ""
-            val dnLimit  = if (entry.info.limitDownBps > 0) " cap:${fmtRate(entry.info.limitDownBps)}" else ""
-            val throttled = entry.info.isThrottled
 
             // Compute instantaneous rate from the previous sample (≈ 500 ms window).
             val prev = sampleCache[entry.rowKey]
@@ -293,10 +302,10 @@ class ServerClientsActivity : BaseActivity() {
             sampleCache[entry.rowKey] = Sample(entry.info.rxBytes, entry.info.txBytes, now)
 
             infoTv.text      = labelWithStatus
-            infoTv.setTextColor(if (throttled) Color.parseColor("#C62828") else Color.parseColor("#2E7D32"))
-            statsTv.text     = "connected ${uptime}s  ↑ ${fmtRate(rxRate)} (${rxKB}KB)$upLimit  ↓ ${fmtRate(txRate)} (${txKB}KB)$dnLimit"
+            infoTv.setTextColor(Color.parseColor("#2E7D32"))
+            statsTv.text     = "connected ${uptime}s  ↑ ${fmtRate(rxRate)} (${rxKB}KB)  ↓ ${fmtRate(txRate)} (${txKB}KB)"
             statsTv.visibility = View.VISIBLE
-            row.setBackgroundColor(if (throttled) Color.argb(20, 200, 0, 0) else Color.argb(20, 0, 180, 0))
+            row.setBackgroundColor(Color.argb(20, 0, 180, 0))
         } else if (entry.isBlocked) {
             // Greyed-out for blocked rows — strikethrough effect via reduced alpha.
             infoTv.text      = labelWithStatus
@@ -345,7 +354,6 @@ class ServerClientsActivity : BaseActivity() {
                 Toast.makeText(this, "Removed $who from allow list", Toast.LENGTH_SHORT).show()
             }
             if (entry.info != null) {
-                actions += "Limit" to { showLimitDialog(entry.info) }
                 actions += "Stats" to {
                     startActivity(android.content.Intent(this, ClientStatsActivity::class.java)
                         .putExtra(ClientStatsActivity.EXTRA_CALL_ID, entry.info.callId))
@@ -387,47 +395,6 @@ class ServerClientsActivity : BaseActivity() {
             else              -> "${bps}bps"
         }
     }
-
-    private fun showLimitDialog(info: BaleServerService.ClientInfo) {
-        val dp = resources.displayMetrics.density
-        fun makeLimitField(hint: String, currentBytesPerSec: Long): EditText {
-            // Pre-fill always shows a value: stored limit if set, otherwise the default cap.
-            val effectiveBps = if (currentBytesPerSec > 0L) currentBytesPerSec else BaleServerService.DEFAULT_LIMIT_BPS
-            val currentKbps  = bytesPerSecToKbps(effectiveBps).coerceIn(1L, MAX_LIMIT_KBPS).toString()
-            return EditText(this).apply {
-                this.hint      = hint
-                inputType      = android.text.InputType.TYPE_CLASS_NUMBER
-                setText(currentKbps)
-                layoutParams   = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-                    .also { it.bottomMargin = (8 * dp).toInt() }
-            }
-        }
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding((24 * dp).toInt(), (12 * dp).toInt(), (24 * dp).toInt(), 0)
-        }
-        val etUp   = makeLimitField("Upload limit kbps (1–$MAX_LIMIT_KBPS)",   info.limitUpBps)
-        val etDown = makeLimitField("Download limit kbps (1–$MAX_LIMIT_KBPS)", info.limitDownBps)
-        layout.addView(etUp)
-        layout.addView(etDown)
-
-        AlertDialog.Builder(this)
-            .setTitle("Bandwidth Limit (max ${MAX_LIMIT_KBPS}kbps)")
-            .setView(layout)
-            .setPositiveButton("Apply") { _, _ ->
-                // Always-on cap: clamp to [1, MAX]. There is no "unlimited" sentinel.
-                val upKbps   = (etUp.text.toString().toLongOrNull()   ?: MAX_LIMIT_KBPS).coerceIn(1L, MAX_LIMIT_KBPS)
-                val downKbps = (etDown.text.toString().toLongOrNull() ?: MAX_LIMIT_KBPS).coerceIn(1L, MAX_LIMIT_KBPS)
-                BaleServerService.setClientLimit(info.callId, kbpsToBytesPerSec(upKbps), kbpsToBytesPerSec(downKbps))
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    // kbps ↔ bytes/sec helpers. 1 kbps = 1000 bits/sec = 125 bytes/sec.
-    private fun kbpsToBytesPerSec(kbps: Long): Long = kbps * 1_000L / 8L
-    private fun bytesPerSecToKbps(bytesPerSec: Long): Long = bytesPerSec * 8L / 1_000L
 
     private fun resolveDefaultTextColor(): Int {
         val a = theme.obtainStyledAttributes(intArrayOf(android.R.attr.textColorPrimary))

@@ -1,0 +1,32 @@
+# Android-only workspace. The core `lktunnel` crate lives at the
+# repo top-level under `../../lktunnel-rust/lktunnel/` so it can be
+# shared with the CLI (and any future host-side consumers). Only the
+# JNI shim — which actually links to `libandroid.so` and ships as the
+# `liblktunnel.so` artefact loaded by Kotlin — lives here.
+[workspace]
+resolver = "2"
+members = ["lktunnel-android"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level     = "z"
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
+
+# Mirrors the patches in ../../lktunnel-rust/Cargo.toml so this
+# workspace picks up the same vendored crates — webrtc-sys with the
+# RawBytesFrameTransformer C++ + cxx bridge, libwebrtc with the safe
+# Rust wrapper, and livekit with the publicly-exposed
+# `transceiver()` accessors. Without this, cargo here would pull the
+# unmodified crates.io versions and the lktunnel crate's
+# `livekit::webrtc::native::raw_bytes_transformer` import would fail.
+[patch.crates-io]
+webrtc-sys  = { path = "../../lktunnel-rust/vendor/webrtc-sys" }
+libwebrtc   = { path = "../../lktunnel-rust/vendor/libwebrtc" }
+livekit     = { path = "../../lktunnel-rust/vendor/livekit" }
+livekit-api = { path = "../../lktunnel-rust/vendor/livekit-api" }

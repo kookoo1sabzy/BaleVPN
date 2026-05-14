@@ -1,0 +1,61 @@
+diff -urN a/src/signal_client/mod.rs b/src/signal_client/mod.rs
+--- a/src/signal_client/mod.rs	2006-07-24 03:21:28
++++ b/src/signal_client/mod.rs	2026-05-19 12:42:14
+@@ -763,37 +763,40 @@
+         }
+     }
+ 
+-    let os_info = os_info::get();
+-    let device_model = device_info::device_info().map(|info| info.model).unwrap_or_default();
++    // Impersonate the LiveKit JS web SDK on the wire so the request
++    // shape matches what Bale's web client produces. Skip the host OS
++    // / device-model fields entirely — browsers don't ship those, so
++    // sending them flags us as a non-web client. `sdk` is forced to
++    // "js" and `version` to a current livekit-client npm release; the
++    // Rust SDK's own values (sdk="rust", version="0.7.40") are
++    // deliberately discarded. Mirrored in both the v0 (query-pair) and
++    // v1 (protobuf join_request) paths.
++    const IMPERSONATED_SDK: &str = "js";
++    const IMPERSONATED_VERSION: &str = "2.13.6";
+ 
+     if use_v1_path {
+-        // For v1 path (single PC mode): only join_request param
+-        // All other info (sdk, protocol, auto_subscribe, etc.) is inside the JoinRequest protobuf
++        // For v1 path (single PC mode): only join_request param. Pass
++        // empty strings for OS / device fields so the protobuf ends up
++        // with the same "no host info" shape the browser sends.
+         let join_request_param = create_join_request_param(
+             options,
+             reconnect,
+             reconnect_reason,
+             participant_sid,
+-            os_info.os_type().to_string(),
+-            os_info.version().to_string(),
+-            device_model.to_string(),
++            String::new(),
++            String::new(),
++            String::new(),
+         );
+         lk_url.query_pairs_mut().append_pair("join_request", &join_request_param);
+     } else {
+-        // For v0 path (dual PC mode): use URL query parameters
++        // For v0 path (dual PC mode): use URL query parameters.
+         lk_url
+             .query_pairs_mut()
+-            .append_pair("sdk", options.sdk_options.sdk.as_str())
+-            .append_pair("os", os_info.os_type().to_string().as_str())
+-            .append_pair("os_version", os_info.version().to_string().as_str())
+-            .append_pair("device_model", device_model.to_string().as_str())
++            .append_pair("sdk", IMPERSONATED_SDK)
+             .append_pair("protocol", PROTOCOL_VERSION.to_string().as_str())
+             .append_pair("auto_subscribe", if options.auto_subscribe { "1" } else { "0" })
+-            .append_pair("adaptive_stream", if options.adaptive_stream { "1" } else { "0" });
+-
+-        if let Some(sdk_version) = &options.sdk_options.sdk_version {
+-            lk_url.query_pairs_mut().append_pair("version", sdk_version.as_str());
+-        }
++            .append_pair("adaptive_stream", if options.adaptive_stream { "1" } else { "0" })
++            .append_pair("version", IMPERSONATED_VERSION);
+ 
+         // parse client capabilities
+         if !CLIENT_CAPABILITIES.is_empty() {

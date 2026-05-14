@@ -2,6 +2,7 @@ package ai.bale.proxy
 
 import ai.bale.proxy.bale.ContactRepository
 import ai.bale.proxy.bale.UserEntity
+import ai.bale.proxy.net.AppHttp
 import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
@@ -23,9 +24,6 @@ import androidx.core.content.edit
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.floatingactionbutton.FloatingActionButton
-import io.ktor.client.*
-import io.ktor.client.engine.okhttp.*
-import io.ktor.client.plugins.websocket.*
 import kotlinx.coroutines.*
 
 class ContactsActivity : BaseActivity() {
@@ -54,7 +52,6 @@ class ContactsActivity : BaseActivity() {
 
     private val prefs  by lazy { getSharedPreferences("config", MODE_PRIVATE) }
     private val scope  = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val http   = HttpClient(OkHttp) { install(WebSockets) }
     private lateinit var repo: ContactRepository
 
     private var allContacts  = listOf<UserEntity>()
@@ -72,7 +69,7 @@ class ContactsActivity : BaseActivity() {
         setContentView(R.layout.activity_contacts)
 
         val token = prefs.getString("token", "") ?: ""
-        repo      = ContactRepository(http, token)
+        repo      = ContactRepository(AppHttp.client, token)
         manageMode = intent.getStringExtra(EXTRA_MODE) == MODE_MANAGE
         if (manageMode) supportActionBar?.title = "Contacts"
 
@@ -351,7 +348,7 @@ class ContactsActivity : BaseActivity() {
         finishAffinity()
     }
 
-    override fun onDestroy() { super.onDestroy(); scope.cancel(); http.close() }
+    override fun onDestroy() { super.onDestroy(); scope.cancel() }
 }
 
 // ── Adapter ───────────────────────────────────────────────────────────────────

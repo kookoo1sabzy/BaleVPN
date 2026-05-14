@@ -1,25 +1,25 @@
-# Node.js application — Linux / macOS / Windows
+# Node.js application — Linux / macOS
 
 > Persian / فارسی: [راهنمای نسخهٔ Node](node-fa.md)
 
-The Node.js package (`bale-vpn-node/`) is a single-binary tool that combines:
+The Node application (`bale-vpn-node/`) is a single-binary **VPN server**. It listens for incoming Bale calls from allow-listed contacts and bridges each caller's IP traffic to the open internet.
 
-- a Bale WebSocket signaling client,
-- a local **web UI** on `http://localhost:3001` — **auto-opened in your default browser** on launch in client mode. All configuration (signing in, picking a peer, activating the tunnel) is done from that page; there is no terminal-based config flow.
-- a **SOCKS5 proxy** mode for both client and server,
-- a **kernel TUN VPN server** mode (Linux + macOS) that lets Android clients connect with full IP routing.
+- Binary builds for Linux and macOS.
+- Two forwarding strategies, chosen at startup:
+  - **kernel TUN** — the kernel handles IP forwarding and NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS). Highest throughput. Requires a one-time root step.
+  - **userspace NAT** — runs unprivileged. Per-flow Rust TCP / UDP state machine inside the process.
+- A local **web UI** at `http://localhost:3001` is the only configuration surface — sign-in, allow-list management, pending requests, connected-client view.
 
-The same binary runs on Linux, macOS, and Windows. The VPN-server mode is Linux-only because it relies on a kernel TUN device and `iptables` MASQUERADE. Set `BALE_NO_BROWSER=1` if you want to suppress the auto-open (e.g., headless dev).
+> The Node application currently runs as **server only**. For the client side, use the [Android app](android-en.md).
 
 ## Modes at a glance
 
-| Mode | Platform | What it does |
+| Mode | Privileges | Throughput |
 |---|---|---|
-| **SOCKS5 client** | Linux / macOS / Windows | Listens on `127.0.0.1:1080`, tunnels TCP through the chosen Bale contact (the contact must be running a server). |
-| **SOCKS5 server** | Linux / macOS / Windows | Accepts Bale calls from allow-listed contacts and relays the caller's TCP traffic. No kernel TUN, no `iptables`/`pf`, no root needed. |
-| **VPN server (TUN)** | **Linux / macOS** | Accepts Bale calls from allow-listed contacts and terminates raw IP traffic on a kernel TUN device (`bale0` on Linux, `utunN` on macOS), using kernel NAT (iptables MASQUERADE on Linux, pf on macOS) to forward everything to the open internet. |
+| `--nat-mode kernel` | One-time root (`setcap` + `iptables` on Linux, runs as root on macOS) | Highest — kernel-managed TUN device + native NAT |
+| `--nat-mode userspace` | None | Lower than kernel mode but fully featured (SACK, RACK, TLP, PRR, Window Scaling, Timestamps) |
 
-One binary picks its role at startup: `server` argument runs as server, no argument runs as client. In server mode on Linux/macOS the binary runs **hybrid** — accepting both SOCKS5 and TUN-mode clients in parallel; on Windows it serves SOCKS5 only.
+The default is `kernel`.
 
 ---
 
@@ -30,169 +30,118 @@ One binary picks its role at startup: `server` argument runs as server, no argum
 Download a prebuilt `balevpn-<version>-<platform>` binary from the repository's [Releases](../../../releases) page.
 
 ```bash
-# Linux / macOS:
-chmod +x balevpn-*-{linux,macos}-*
-./balevpn-...                # client mode (default), web UI at http://localhost:3001
-./balevpn-... server         # server mode
-./balevpn-... 3001           # client mode, explicit port (any bare number works)
-./balevpn-... server 3001    # server mode, explicit port
-
-# Windows (PowerShell):
-.\balevpn-...-win-x64.exe
-.\balevpn-...-win-x64.exe server
-.\balevpn-...-win-x64.exe 3001
+chmod +x balevpn-<version>-{linux,macos}-*
+./balevpn-...                             # default port 3001, default mode
+./balevpn-... 8080                        # custom UI port
+./balevpn-... --nat-mode=userspace        # force userspace NAT
 ```
 
-Arguments are positional and order-insensitive: any bare number is taken as the web-UI port (default `3001`); the literal word `server` flips role to server. Anything else is ignored.
+### Command-line arguments
 
-In **client mode** the binary auto-opens `http://localhost:<port>` in your default browser — that's the entire configuration surface (sign in, pick a Bale contact, click Activate). Server mode does not auto-open since servers commonly run on headless hosts.
+| Argument | Default | Meaning |
+|---|---|---|
+| `<integer>` (positional) | `3001` | HTTP port for the management UI. Any bare number is taken as the port. |
+| `--nat-mode kernel\|userspace` | `kernel` | Selects how server-side forwarding works. `kernel` requires the one-time setup linked below; `userspace` runs with no privilege. The mode is fixed at startup. |
 
-> The web UI binds to **`127.0.0.1` only** — it's never reachable from another machine over the network. For a headless server, use SSH local port forwarding to reach it from your laptop:
->
-> ```bash
-> ssh -L 3001:127.0.0.1:3001 user@your-server
-> ```
->
-> then open `http://localhost:3001` in your local browser. The forwarding tunnel must stay open while you're using the UI.
+If `--nat-mode=kernel` is selected but the required kernel privileges or `iptables` MASQUERADE rule are missing, the process exits with an actionable error rather than silently degrading.
 
----
-
-## Web UI
-
-When you launch in client mode, the binary opens `http://localhost:3001` in your default browser. The UI flow:
-
-1. **Sign in** — phone number → SMS code, or paste an `access_token` JWT cookie from `web.bale.ai` directly. The token is persisted server-side in `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600); the browser only ever sees a `tokenSet` boolean, never the JWT itself.
-
-   <p align="center"><img src="screens/07-node-login.png" alt="Sign-in screen" width="640"></p>
-
-2. **Tunnel proxy** — pick a Bale contact from the list (or search by phone number to pull in a new one), choose a SOCKS5 port (default 1080), and click **Activate**.
-
-   <p align="center"><img src="screens/10-client-peer-selection.png" alt="Client peer selection" width="640"></p>
-
-3. The status row turns green when the WebRTC tunnel is up. From this point your apps can use `127.0.0.1:1080` as a SOCKS5 proxy and the traffic flows through the chosen contact.
-
-   <p align="center"><img src="screens/11-client-connected.png" alt="Tunnel activated" width="640"></p>
-
-In server mode the UI also shows live **Connected clients**, a **Pending requests** queue with Accept/Reject buttons, and an **Allowed callers** allow-list — see [Server admission control](#server-admission-control) below.
-
----
-
-## SOCKS5 client mode
-
-### What SOCKS5 is and isn't
-
-SOCKS5 is a per-application TCP relay protocol — your application opens a connection to `127.0.0.1:1080` and the proxy forwards it through the tunnel. This is **not** a system-wide VPN: only apps you configure to use the proxy go through the tunnel; everything else uses your real internet directly. This is intentional and useful — you can browse one site through the tunnel and everything else locally — but it also means **a misconfigured app will silently bypass the tunnel**.
-
-Other limitations of SOCKS5 vs. a real VPN:
-
-- **TCP only.** UDP (including QUIC, some video calls, multicast, etc.) is not relayed. If a site requires QUIC and the browser doesn't fall back to TCP/HTTPS, that site won't work. (The Node tunnel's wire format does carry a UDP-relay frame, but most browsers will not emit UDP through SOCKS5.)
-- **No ICMP**, so `ping` from your machine still uses your real internet.
-- **No raw IP**, so things like WireGuard or other VPN clients running on top will not be tunneled.
-
-If you want full IP routing instead, use the Android app or run the [Linux TUN VPN server](#linux-vpn-server-tun--full-ip-routing) and connect with the Android client.
-
-### Activating the tunnel
-
-The client picks any Bale contact (who must be running a server — Node or Android) and routes TCP via that peer. Steady-state traffic flows on the LiveKit data channel; the Bale WebSocket is only used briefly for signaling and is dropped once the LK channel is up (and brought back up automatically when reconnect signaling is needed).
-
-Once activated, point any SOCKS5-aware app at `127.0.0.1:1080`.
-
-### Configuring a browser as a client
-
-> ⚠️ **Use a separate browser (or browser profile) for the tunnel.** The local web UI lives at `http://localhost:3001`. If you set `127.0.0.1:1080` as the SOCKS5 proxy in the same browser you used to manage the tunnel, every page in that browser — including the UI itself — will try to go through the proxy. As soon as anything goes wrong with the tunnel, you can no longer reach the UI to fix it. Keep one browser/profile for managing the tunnel and a different one for tunneled traffic.
-
-> ⚠️ **Make sure DNS goes through the proxy too.** By default many browsers resolve hostnames locally and only send the IP to the SOCKS5 server — so even though your TCP traffic is tunneled, your DNS lookups still leak to your local resolver, defeating the point of the tunnel for blocked-domain access.
->
-> The Node SOCKS5 server *does* support remote name resolution (it accepts SOCKS5 ATYP=0x03 hostnames), so the only thing required is that **the client send the hostname instead of resolving it first**:
->
-> - **Firefox** — Settings → Network Settings → Manual proxy → SOCKS v5 host `127.0.0.1`, port `1080`, and tick **Proxy DNS when using SOCKS v5** (or set `network.proxy.socks_remote_dns = true` in `about:config`).
-> - **Chrome / Chromium / Edge** — launch with `--proxy-server="socks5://127.0.0.1:1080"`. Chrome resolves DNS through the SOCKS5 server when started this way. Browser extensions like *FoxyProxy* / *SwitchyOmega* expose the same setting in their UI; make sure "remote DNS" is on.
-> - **`curl`** — use `--socks5-hostname 127.0.0.1:1080` (NOT `--socks5`, which resolves locally first).
-> - **Other tools** — look for an option named "remote DNS", "SOCKS5h", or "tunnel DNS lookups". The `socks5h://` URL scheme is the canonical way to ask for hostname-passthrough.
-
-### The Node SOCKS5 client (this app)
-
-When you set up *another* Node instance as the **client side** (i.e., running this app and connecting to a remote Node/Android server), the built-in SOCKS5 listener follows the same rule: it accepts ATYP=0x03 (hostname), ATYP=0x01 (IPv4), and ATYP=0x04 (IPv6). The hostname is forwarded verbatim to the server, which performs the DNS lookup. **The app never resolves DNS locally before tunneling**, so there is no DNS leak from the Node client itself. DNS leakage on your machine therefore comes only from the *application* configuration (your browser settings above).
-
-### Privacy
-
-Application-layer encryption (HTTPS / TLS) is what actually keeps your payload private from the server peer and from Bale's LiveKit infrastructure. See the [privacy note](../README.md#-privacy--encryption) in the main README.
-
----
-
-## SOCKS5 server mode (any OS)
-
-Run the binary with the `server` argument. It listens for incoming Bale calls, auto-answers (subject to the allow-list — see below), and acts as a TCP relay for the caller. No system privileges needed.
+The web UI binds to **`127.0.0.1` only** — it's never reachable from another machine over the network. For a headless server, use SSH local port forwarding to reach it from your laptop:
 
 ```bash
-./balevpn-... server
+ssh -L 3001:127.0.0.1:3001 user@your-server
 ```
 
-This is the easiest way to give a friend a relay if you don't want to set up a VPN. The caller uses Node SOCKS5 client mode (or any SOCKS5 client) and gets transparent TCP forwarding.
+then open `http://localhost:3001` in your local browser. The forwarding tunnel must stay open while you're using the UI.
 
 ---
 
-## VPN server (TUN) — full IP routing
+## Kernel-TUN one-time setup
 
-This is the **highest-throughput** server option, available on Linux and macOS. The Node process attaches to a kernel TUN device (`bale0` on Linux, `utunN` on macOS) and the kernel handles forwarding + NAT, which is substantially faster than the userspace TCP/IP stack used by the Android server.
-
-Recommended pairing: **Node TUN server + Android client** for the best connection on the client side (Android `VpnService` ships every IP packet from the device into the tunnel).
-
-### Linux — one-time setup
+### Linux
 
 ```bash
-# 1. Allow the released binary to manage TUN interfaces without running as root.
+# 1. Allow the binary to manage TUN interfaces without running as root.
 #    Apply setcap to the actual file you'll execute — NOT to /usr/bin/node.
 sudo setcap cap_net_admin+eip ./balevpn-<version>-linux-x64
 
-# 2. Tell the kernel to NAT traffic from the tunnel subnet out the host's
-#    real interface (run once; survives reboots only if added to your
-#    distro's iptables-save / firewalld config)
+# 2. Enable IPv4 forwarding (and make it survive reboots).
+sudo sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-bale-vpn.conf
+
+# 3. NAT the tunnel subnet out the host's real interface.
 sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
 ```
 
 Then run:
 
 ```bash
-./balevpn-<version>-linux-x64 server
+./balevpn-<version>-linux-x64
 ```
 
-### macOS — run with sudo
+### macOS
 
-macOS has no `setcap` analog, so server mode runs as root. NAT (pf anchor `balevpn`) and IP forwarding are loaded automatically on startup; the WAN interface is auto-detected via `route -n get default`.
+macOS has no `setcap` analog, so kernel-TUN mode runs as root. NAT (pf anchor `balevpn`) and IP forwarding are loaded automatically on startup; the WAN interface is auto-detected via `route -n get default`.
 
 ```bash
-sudo ./balevpn-<version>-macos-arm64 server
+sudo ./balevpn-<version>-macos-arm64
+```
+
+### Userspace NAT
+
+No privileged setup needed. Just run the binary with `--nat-mode=userspace`.
+
+```bash
+./balevpn-<version>-linux-x64 --nat-mode=userspace
 ```
 
 ### What the server does on startup
 
-1. Removes any stale TUN interface from a prior run.
-2. Creates the TUN device and assigns `10.8.0.1/24`.
-3. Enables IPv4 forwarding (`/proc/sys/net/ipv4/ip_forward` on Linux, `net.inet.ip.forwarding` on macOS).
-4. Loads the platform-specific NAT rule (iptables MASQUERADE on Linux, pf anchor on macOS).
-5. Starts receiving incoming Bale calls — allow-listed callers connect automatically; everyone else lands in a pending queue (see [Server admission control](#server-admission-control)).
+1. Loads the saved Bale `access_token` (if any) from `${RUNTIME_DIR}/.bale-vpn_config.json`.
+2. If kernel-TUN mode: removes any stale TUN interface, creates a new one, assigns `10.8.0.1/24`, enables IPv4 forwarding, and loads the platform-specific NAT rule (iptables MASQUERADE on Linux, pf anchor on macOS).
+3. Starts the local web UI on the chosen port.
+4. Connects to the Bale signaling WebSocket and waits for incoming calls.
 
-When an Android client connects, it gets `10.8.0.2/24` and routes all of its traffic into the tunnel. Up to 253 clients can connect simultaneously — the server transparently rewrites each client's source address to a distinct IP in `10.8.0.0/24` so the kernel can disambiguate concurrent flows.
+When an Android client connects, it gets `10.8.0.2/24` and routes all of its traffic into the tunnel. Up to 253 clients can connect simultaneously — the server transparently rewrites each client's source address to a distinct IP in `10.8.0.0/24` so the kernel (or the userspace NAT) can disambiguate concurrent flows.
 
 ### Limitations
 
 - IPv4 only. IPv6 packets from the client are explicitly dropped (the Android client falls back to IPv4 fast via ICMPv6 Destination Unreachable).
+- The mode (`kernel` vs `userspace`) is fixed at startup. Restart to change it.
+
+---
+
+## Web UI
+
+The UI lives at `http://localhost:<port>`. It is the only configuration surface — there is no terminal config flow.
+
+1. **Sign in** — phone number → SMS code, or paste an `access_token` JWT cookie from `web.bale.ai` directly. The token is persisted server-side in `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600); the browser only ever sees a `tokenSet` boolean, never the JWT itself.
+
+   <p align="center"><img src="screens/07-node-login.png" alt="Sign-in screen" width="640"></p>
+
+2. **Connected clients** — live throughput, byte counters, per-client uptime, and a Disconnect button.
+
+3. **Pending requests** — yellow rows for incoming calls from contacts who aren't on the allow-list. Each row has **Accept once / Allow always / Reject** buttons.
+
+   <p align="center"><img src="screens/08-server-client-pending.png" alt="Server: pending request" width="640"></p>
+
+4. **Allowed callers** and **Blocked callers** lists, with per-row Remove / Unblock buttons.
+
+   <p align="center"><img src="screens/09-server-client-connected.png" alt="Server: connected client" width="640"></p>
 
 ---
 
 ## Server admission control
 
-Whether running as SOCKS5 server or TUN VPN server, every incoming call from a contact who isn't on the allow-list lands in a **pending** queue. The web UI surfaces it as a yellow row with **Accept once / Allow always / Reject** buttons.
-
-<p align="center"><img src="screens/08-server-client-pending.png" alt="Server: pending request" width="640"></p>
+Every incoming call from a contact who isn't on the allow-list lands in a **pending** queue.
 
 - **Accept once** handles this single call but doesn't persist the caller. Future calls land in pending again.
-- **Allow always** adds the caller to the allow-list (persisted server-side in `${RUNTIME_DIR}/.bale-vpn_config.json` under the `admission` key, mode 0600). Future calls from the same caller auto-accept.
-- **Reject** sends a `DiscardCall` so the caller's tunnel tears down immediately **and** adds the caller's id to the **block-list** — future calls from this id are silently rejected (no notification, no pending entry). Undo via the **Blocked callers** list shown below the pending queue (per-row Unblock button).
+- **Allow always** adds the caller to the allow-list (persisted in `${RUNTIME_DIR}/.bale-vpn_config.json` under the `admission` key, mode 0600). Future calls from the same caller auto-accept.
+- **Reject** sends a `DiscardCall` so the caller's tunnel tears down immediately **and** adds the caller's id to the **block-list** — future calls from this id are silently rejected (no notification, no pending entry). Undo via the **Blocked callers** list (per-row Unblock button).
 - Pending entries auto-reject after 60 s. The 60-second timeout does NOT blacklist — only an explicit Reject does.
 
-<p align="center"><img src="screens/09-server-client-connected.png" alt="Server: connected client" width="640"></p>
+The allow-list and block-list are mutually exclusive — an explicit Allow / Reject moves a caller between them.
+
+A **Max clients** setting (1–253, default 5) caps the number of simultaneously-connected callers. New calls beyond the cap are silently dropped without blacklisting; the caller can try again later when a slot frees.
 
 ---
 
@@ -200,7 +149,7 @@ Whether running as SOCKS5 server or TUN VPN server, every incoming call from a c
 
 Two ways to get an `access_token` JWT into the app:
 
-1. **Phone OTP via the UI** — enter your phone, type the SMS code, the binary fetches the cookie via the standard `web.bale.ai/set-cookie/?jwt=…` flow and persists it in `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600). This is the recommended path.
+1. **Phone OTP via the UI** — enter your phone, type the SMS code; the binary fetches the cookie via the standard `web.bale.ai/set-cookie/?jwt=…` flow and persists it in `${RUNTIME_DIR}/.bale-vpn_config.json` (mode 0600). This is the recommended path.
 2. **Paste a token** — copy the `access_token` cookie from a logged-in `web.bale.ai` Chrome session (DevTools → Application → Cookies) and paste it into the textarea on the UI.
 
 WebSocket close code `4401` means the token expired; sign in again.
@@ -209,6 +158,6 @@ WebSocket close code `4401` means the token expired; sign in again.
 
 ## Privacy & encryption
 
-The LiveKit data channel is encrypted with DTLS, so traffic is opaque to passive observers on the network. **However**, Bale's LiveKit servers act as the SFU/TURN node and have access to the plaintext media — they can see your destinations and any unencrypted application payload. Use TLS at the application layer (HTTPS, encrypted DNS, etc.) and treat this tunnel like a VPN whose operator you don't fully trust.
+The data link between client and server is encrypted with DTLS, so traffic is opaque to passive observers on the network. **However**, Bale's LiveKit servers act as the SFU and have access to the plaintext data flowing through the call — they can see your destinations and any unencrypted application payload. Use TLS at the application layer (HTTPS, encrypted DNS, etc.) and treat this tunnel like a VPN whose operator you don't fully trust.
 
 See the [main README](../README.md#-privacy--encryption) for a fuller note.

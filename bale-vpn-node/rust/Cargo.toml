@@ -1,0 +1,27 @@
+# Node-side workspace. Mirrors `bale-vpn-android/rust/`: a single
+# napi-rs shim crate that imports the portable `lktunnel` core from
+# `../../lktunnel-rust/lktunnel/` and exposes a small JS-callable
+# surface for the server. The `[patch.crates-io]` block points back
+# at the same vendored crates as the rest of the project — keep this
+# list in sync with `lktunnel-rust/Cargo.toml` and
+# `bale-vpn-android/rust/Cargo.toml`.
+[workspace]
+resolver = "2"
+members  = ["lktunnel-node"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
+
+[patch.crates-io]
+webrtc-sys  = { path = "../../lktunnel-rust/vendor/webrtc-sys" }
+libwebrtc   = { path = "../../lktunnel-rust/vendor/libwebrtc" }
+livekit     = { path = "../../lktunnel-rust/vendor/livekit" }
+livekit-api = { path = "../../lktunnel-rust/vendor/livekit-api" }

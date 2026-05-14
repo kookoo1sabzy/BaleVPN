@@ -1,0 +1,41 @@
+# Android-specific shim over the `lktunnel` core. Produces the .so
+# loaded by Kotlin via System.loadLibrary("lktunnel"); exposes the
+# Java_ai_bale_proxy_{LkNative,NativeJni}_* JNI symbols and owns the
+# per-session NAT dispatcher table.
+[package]
+name        = "lktunnel-android"
+version     = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Android JNI bridge for the lktunnel core library."
+
+[lib]
+# Override the artefact name so cargo-ndk produces `liblktunnel.so`
+# directly. The Kotlin loader is `System.loadLibrary("lktunnel")`,
+# matching that filename.
+name       = "lktunnel"
+crate-type = ["cdylib"]
+# Entry file is `libjni.rs` (not the default `lib.rs`) — the crate
+# is purely JNI exports, so the filename reflects that.
+path       = "src/libjni.rs"
+
+[dependencies]
+lktunnel       = { path = "../../../lktunnel-rust/lktunnel" }
+# Direct dep purely to call `livekit::webrtc::android::initialize_android`
+# from JNI_OnLoad. Without that hook, webrtc-sys's PeerConnectionFactory
+# constructor SIGSEGVs the moment Room::connect starts — its AdmProxy
+# unconditionally creates the Android Java audio device manager, which
+# dereferences the null JavaVM pointer (true even though we never add
+# an audio track). The ADM then sits idle.
+livekit        = { version = "0.7", features = ["rustls-tls-webpki-roots"] }
+jni            = "0.21"
+android_logger = "0.13"
+log            = "0.4"
+once_cell      = "1"
+parking_lot    = "0.12"
+# write(2) syscall for the TUN drain path, errno lookup, etc.
+libc           = "0.2"
+# mio is the cross-platform reactor used by `lktunnel`'s dispatcher.
+# The Android TUN fd registers via `mio::unix::SourceFd` so it joins
+# the same event loop as the rest of the lib's sockets.
+mio            = { version = "1", features = ["os-poll", "os-ext"] }

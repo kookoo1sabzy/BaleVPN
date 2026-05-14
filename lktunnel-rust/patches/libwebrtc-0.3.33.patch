@@ -1,0 +1,109 @@
+diff -urN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2006-07-24 03:21:28
++++ b/src/lib.rs	2026-05-19 12:42:13
+@@ -71,7 +71,8 @@
+     pub use webrtc_sys::webrtc::ffi::create_random_uuid;
+ 
+     pub use crate::imp::{
+-        apm, audio_mixer, audio_resampler, frame_cryptor, packet_trailer, yuv_helper,
++        apm, audio_mixer, audio_resampler, frame_cryptor, packet_trailer,
++        raw_bytes_transformer, yuv_helper,
+     };
+ }
+ 
+diff -urN a/src/native/mod.rs b/src/native/mod.rs
+--- a/src/native/mod.rs	2006-07-24 03:21:28
++++ b/src/native/mod.rs	2026-05-19 12:42:13
+@@ -29,6 +29,7 @@
+ pub mod media_stream_track;
+ pub mod packet_trailer;
+ pub mod peer_connection;
++pub mod raw_bytes_transformer;
+ pub mod peer_connection_factory;
+ pub mod rtp_parameters;
+ pub mod rtp_receiver;
+diff -urN a/src/native/raw_bytes_transformer.rs b/src/native/raw_bytes_transformer.rs
+--- a/src/native/raw_bytes_transformer.rs	1970-01-01 01:00:00
++++ b/src/native/raw_bytes_transformer.rs	2026-05-19 12:42:13
+@@ -0,0 +1,81 @@
++// Safe Rust wrapper around webrtc-sys::raw_bytes_transformer.
++//
++// See vendor/webrtc-sys/include/livekit/raw_bytes_transformer.h for the
++// design — the C++ class installs a webrtc::FrameTransformerInterface
++// on an RtpSender / RtpReceiver to ride RTP instead of SCTP data
++// channels.
++
++use std::sync::Arc;
++
++use cxx::SharedPtr;
++use webrtc_sys::raw_bytes_transformer::{self as sys_rbt};
++
++use crate::{rtp_receiver::RtpReceiver, rtp_sender::RtpSender};
++
++/// Trait implemented by callers that want to receive raw bytes from the
++/// remote side. `on_data` fires on whichever libwebrtc worker thread is
++/// delivering the frame — implementors should not block.
++pub trait RawBytesObserver: Send + Sync {
++    fn on_data(&self, data: &[u8]);
++}
++
++/// Bridges the libwebrtc-level trait to the webrtc-sys-level trait so
++/// callers only ever depend on the libwebrtc surface.
++struct ObserverBridge(Arc<dyn RawBytesObserver>);
++
++impl sys_rbt::RawBytesObserver for ObserverBridge {
++    fn on_data(&self, data: &[u8]) {
++        self.0.on_data(data);
++    }
++}
++
++/// Handle to an installed FrameTransformer. Dropping this does NOT
++/// uninstall the transformer from the sender/receiver — libwebrtc
++/// retains its own scoped_refptr. The handle is for ongoing send / depth
++/// queries.
++#[derive(Clone)]
++pub struct RawBytesFrameTransformer {
++    sys_handle: SharedPtr<sys_rbt::ffi::RawBytesFrameTransformer>,
++}
++
++impl RawBytesFrameTransformer {
++    /// Install on an RtpSender. Subsequent `send(bytes)` calls queue
++    /// outgoing tunnel packets; the next encoder Transform() pulls one
++    /// off and forwards it to the packetizer.
++    pub fn new_for_rtp_sender(sender: RtpSender) -> Self {
++        let sys_handle = sys_rbt::ffi::new_raw_bytes_transformer_for_rtp_sender(
++            sender.handle.sys_handle.clone(),
++        );
++        Self { sys_handle }
++    }
++
++    /// Install on an RtpReceiver. Every incoming frame fires
++    /// `observer.on_data(bytes)` with the frame payload; the decoder is
++    /// bypassed (we don't care what the encoded "video" decodes to —
++    /// we only care about the bytes).
++    pub fn new_for_rtp_receiver(
++        receiver: RtpReceiver,
++        observer: Arc<dyn RawBytesObserver>,
++    ) -> Self {
++        let bridged: Arc<dyn sys_rbt::RawBytesObserver> =
++            Arc::new(ObserverBridge(observer));
++        let sys_handle = sys_rbt::ffi::new_raw_bytes_transformer_for_rtp_receiver(
++            receiver.handle.sys_handle.clone(),
++            Box::new(sys_rbt::RawBytesObserverWrapper::new(bridged)),
++        );
++        Self { sys_handle }
++    }
++
++    /// Sender-only: queue a packet to substitute for the next encoder
++    /// output. Returns false if the internal queue is full (caller's
++    /// responsibility to drop / retry).
++    pub fn send(&self, data: &[u8]) -> bool {
++        self.sys_handle.send(data)
++    }
++
++    /// Sender-only: number of queued packets awaiting an encoder
++    /// Transform() call. Useful for backpressure / pacing.
++    pub fn queue_depth(&self) -> usize {
++        self.sys_handle.queue_depth()
++    }
++}

@@ -33,7 +33,7 @@ There is no commercial relationship with Bale.
 The LiveKit data channel is encrypted with **DTLS**, so traffic is opaque to passive observers on the network and to ISP middleboxes. **However, Bale's LiveKit server is the SFU/TURN node and has access to the plaintext of the data flowing through the call.** That means:
 
 - Bale can see **who relays for whom** — every tunnel session is a Bale voice call between two accounts, so Bale's call records reveal the social graph (which account uses which relay, when, for how long).
-- Bale can see **which destinations you connect to** (IP and port, or hostname if your client sends one — see the [Node SOCKS5 doc](docs/node-en.md#configuring-a-browser-as-a-client) for DNS-leak avoidance).
+- Bale can see **which destinations you connect to** (IP and port, plus the hostname embedded in the TLS SNI of any HTTPS request).
 - Bale can read the **contents of any traffic that isn't itself end-to-end encrypted**. If you only browse `https://` sites, the payload is opaque to them; if you access plaintext HTTP / DNS / FTP / etc. through the tunnel, they can read it.
 
 Treat this tunnel like a corporate VPN whose operator you don't fully trust — fine for IP-level reachability (uncensoring), **not adequate as an anonymity or end-to-end privacy layer**. Use TLS at the application level (HTTPS, encrypted DNS, etc.).
@@ -63,7 +63,7 @@ A few notes:
 کانال دادهٔ LiveKit با **DTLS** رمزنگاری می‌شود؛ بنابراین ترافیک از دید ناظرهای مسیر و میدلباکس‌های ISP پنهان است. **اما سرور LiveKit بله نقش SFU/TURN را بازی می‌کند و به دادهٔ رمزگشایی‌شدهٔ تماس دسترسی دارد.** یعنی:
 
 - بله می‌تواند ببیند **چه کسی برای چه کسی رله می‌کند** — هر جلسهٔ تونل یک تماس صوتی بله بین دو حساب است، پس سوابق تماس بله گرافِ اجتماعی را افشا می‌کند (چه حسابی از چه رله‌ای، چه زمانی، چقدر استفاده کرده).
-- بله می‌تواند ببیند **شما به چه مقصدی وصل می‌شوید** (IP و پورت، یا نام میزبان اگر کلاینت شما نام بفرستد — برای جلوگیری از نشت DNS به [راهنمای SOCKS5 در نسخهٔ Node](docs/node-fa.md#تنظیم-مرورگر-بهعنوان-کلاینت) مراجعه کنید).
+- بله می‌تواند ببیند **شما به چه مقصدی وصل می‌شوید** (IP و پورت، به‌علاوهٔ نام میزبانی که در فیلد SNI درخواست‌های HTTPS قرار می‌گیرد).
 - بله می‌تواند **محتوای هر ترافیکی را که خودش رمزنگاری انتها به انتها نشده** بخواند. اگر فقط روی `https://` بگردید، محتوا برایشان مبهم است؛ اما اگر از پروتکل‌های متنی (HTTP/DNS/FTP/…) استفاده کنید، قابل خواندن خواهد بود.
 
 این تونل را مثل VPN شرکتی‌ای ببینید که گرداننده‌اش را کاملاً نمی‌شناسید — برای دسترسی IP (دور زدن مسدودی) خوب است، **اما برای ناشناسی یا حریم خصوصی انتها به انتها کافی نیست**. در سطح برنامه از TLS (HTTPS، DNS رمزنگاری‌شده و…) استفاده کنید.
@@ -113,28 +113,30 @@ The tunnel rides on Bale's LiveKit infrastructure. Heavy traffic from a "voice c
 
 ## Supported features
 
-| Role | Platform | SOCKS5 proxy | VPN (IP routing via TUN) | Notes |
-|---|---|:---:|:---:|---|
-| Client | Node.js — Linux / macOS / Windows | ✓ | — | local SOCKS5 listener |
-| Client | Android | — | ✓ | system `VpnService` (kernel TUN) |
-| Server | Node.js — Windows | ✓ | — | |
-| Server | Node.js — Linux | ✓ | ✓ | **hybrid — both modes simultaneously on one instance.** Needs `setcap cap_net_admin` + `iptables` MASQUERADE for TUN |
-| Server | Node.js — macOS | ✓ | ✓ | **hybrid — both modes simultaneously on one instance.** Runs as root; `pf` anchor + IP forwarding auto-set |
-| Server | Android | — | ✓ | in-process userspace TCP/IP NAT; no root, no kernel TUN, no iptables |
+| Role | Platform | Notes |
+|---|---|---|
+| Client | Android | System `VpnService` (kernel TUN). Optional LAN-facing SOCKS5 listener in **Advanced** settings lets other devices on the local network share the tunnel. |
+| Server | Android | In-process userspace TCP/IP NAT; no root, no kernel TUN, no `iptables`. |
+| Server | Node.js — Linux | **Kernel TUN** mode (best throughput) needs `setcap cap_net_admin` + `iptables` MASQUERADE — one-time setup. **Userspace NAT** mode runs unprivileged. |
+| Server | Node.js — macOS | **Kernel TUN** mode (best throughput) runs as root; `pf` anchor + IP forwarding auto-set. **Userspace NAT** mode runs unprivileged. |
+
+The Node application currently runs as **server only** — for the client side, use the Android app.
 
 > **Easiest start: Android server + Android client.** Two phones, install the APK on both, sign in with your Bale account in the BaleVPN app, flip the toggle. No root, no command line, no firewall rules.
 >
-> **Most efficient: Linux or macOS Node TUN server + Android client.** The kernel does the IP forwarding (TUN device) and the NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS) — both substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
+> **Most efficient: Linux or macOS Node kernel-TUN server + Android client.** The kernel does the IP forwarding (TUN device) and the NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS) — substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
 
-The Node.js side is platform-agnostic for **SOCKS5** in both directions — pick any OS for either end. **TUN VPN** routing on the Node side works on Linux and macOS (each uses its native kernel TUN device plus the platform's NAT mechanism — `iptables` on Linux, `pf` on macOS); a Linux/macOS Node server runs **hybrid**, accepting both SOCKS5 clients and IP-mode (TUN) clients on the same instance over their own LiveKit calls. The Android app does not expose a SOCKS5 mode; it always uses the system VPN, in either role.
+The Node server's forwarding mode is selectable at startup via `--nat-mode kernel|userspace`. `kernel` requires the one-time setup linked above; `userspace` runs with no privilege. See the [Node guide](docs/node-en.md) for details.
 
 <div dir="rtl">
 
+نسخهٔ Node در حال حاضر فقط **حالت سرور** را پشتیبانی می‌کند — برای سمت کلاینت از اپلیکیشن اندرویدی استفاده کنید.
+
 > **شروع آسان: سرور اندرویدی + کلاینت اندرویدی.** فقط دو گوشی؛ APK را روی هر دو نصب کنید، با حساب بلهٔ خود در اپ BaleVPN وارد شوید، و کلید حالت را جابه‌جا کنید. نه روت، نه خط فرمان، نه قواعد دیوارهٔ آتش.
 >
-> **پربازده‌ترین: سرور TUN روی Node لینوکسی یا macOS + کلاینت اندرویدی.** هستهٔ سیستم‌عامل فوروارد IP را انجام می‌دهد (دستگاه TUN) و NAT را هم (روی لینوکس با قاعدهٔ `iptables` MASQUERADE، روی macOS با اَنکر `pf`) اعمال می‌کند — هر دو مسیر به‌مراتب سریع‌تر از جایگزین‌های فضای کاربری هستند. کلاینت اندرویدی هم از طریق `VpnService` استاندارد به یک VPN کاملاً یکپارچهٔ سیستمی وصل می‌شود.
+> **پربازده‌ترین: سرور TUN-هسته روی Node لینوکسی یا macOS + کلاینت اندرویدی.** هستهٔ سیستم‌عامل فوروارد IP را انجام می‌دهد (دستگاه TUN) و NAT را هم (روی لینوکس با قاعدهٔ `iptables` MASQUERADE، روی macOS با اَنکر `pf`) اعمال می‌کند — به‌مراتب سریع‌تر از جایگزین‌های فضای کاربری. کلاینت اندرویدی هم از طریق `VpnService` استاندارد به یک VPN کاملاً یکپارچهٔ سیستمی وصل می‌شود.
 
-نسخهٔ Node برای **SOCKS5** در هر دو جهت مستقل از سیستم‌عامل است — می‌توانید برای هر طرف هر OS را انتخاب کنید. **مسیریابی TUN VPN** در سمت Node روی لینوکس و macOS کار می‌کند (هر کدام از دستگاه TUN بومی هسته و سازوکار NAT پلتفرم استفاده می‌کنند — `iptables` روی لینوکس، `pf` روی macOS)؛ یک سرور Node روی لینوکس/macOS به‌صورت **ترکیبی** اجرا می‌شود و در یک نمونه، هم کلاینت‌های SOCKS5 و هم کلاینت‌های حالت IP (TUN) را روی تماس‌های جداگانهٔ LiveKit‌شان می‌پذیرد. اپلیکیشن اندروید حالت SOCKS5 ندارد و در هر نقشی همیشه از VPN سیستمی استفاده می‌کند.
+حالت فوروارد سرور Node در زمان اجرا با آرگومان `--nat-mode kernel|userspace` انتخاب می‌شود. حالت `kernel` به همان تنظیمات یک‌بارهٔ بالا نیاز دارد؛ حالت `userspace` بدون دسترسی ویژه کار می‌کند. جزئیات در [راهنمای Node](docs/node-fa.md).
 
 </div>
 
@@ -147,7 +149,7 @@ Per-platform setup, manuals, and screenshots:
 | Platform | English | فارسی |
 |---|---|---|
 | **Android** (client and userspace-TCP/IP server) | [Android user guide](docs/android-en.md) | [راهنمای کاربری اپلیکیشن اندروید](docs/android-fa.md) |
-| **Node.js** — Linux / macOS / Windows (SOCKS5 client + server, Linux TUN VPN server) | [Node.js application guide](docs/node-en.md) | [راهنمای نسخهٔ Node](docs/node-fa.md) |
+| **Node.js** — Linux / macOS (server only — kernel TUN or userspace NAT) | [Node.js application guide](docs/node-en.md) | [راهنمای نسخهٔ Node](docs/node-fa.md) |
 
 For protocol internals, wire formats, and architecture details: [CLAUDE.md](CLAUDE.md).
 
@@ -164,8 +166,8 @@ For protocol internals, wire formats, and architecture details: [CLAUDE.md](CLAU
         ▼                                                 ▼
  ┌─────────────────┐                            ┌─────────────────┐               ┌──────────┐
  │     client      │                            │     server      │ ── egress ───►│   open   │
- │  (Android, or   │                            │  (Android, or   │      NAT      │ internet │
- │   Node SOCKS5)  │                            │   Node any-OS)  │               └──────────┘
+ │    (Android)    │                            │  (Android, or   │      NAT      │ internet │
+ │                 │                            │   Node any-OS)  │               └──────────┘
  └────────┬────────┘                            └────────┬────────┘
           │                                              │
           │     ── DTLS-encrypted WebRTC data channel ── │
@@ -178,7 +180,7 @@ For protocol internals, wire formats, and architecture details: [CLAUDE.md](CLAU
 ```
 
 - **Bale signaling WS** — call setup and Bale-side push events. Dropped once the call is up; brought back automatically when needed.
-- **LiveKit SFU** — Bale-operated WebRTC server that relays the DTLS-encrypted data channel between client and server. Carries either raw IP packets (TUN pairings) or multiplexed SOCKS5 frames (proxy pairings) — see [Supported features](#supported-features).
+- **LiveKit SFU** — Bale-operated WebRTC server that relays the DTLS-encrypted data channel between client and server. Carries raw IP packets between the two ends.
 - **Server** owns the egress NAT to the open internet. The SFU just relays; it doesn't route to the internet itself.
 - Bale operates both the signaling WS and the SFU, so they can see traffic metadata and any payload that isn't itself end-to-end encrypted (see the [privacy note](#%EF%B8%8F-privacy--encryption) above).
 

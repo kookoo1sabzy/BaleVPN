@@ -1,0 +1,492 @@
+diff -urN a/build.rs b/build.rs
+--- a/build.rs	2006-07-24 03:21:28
++++ b/build.rs	2026-05-19 12:46:04
+@@ -56,6 +56,7 @@
+         "src/apm.rs",
+         "src/audio_mixer.rs",
+         "src/packet_trailer.rs",
++        "src/raw_bytes_transformer.rs",
+     ];
+ 
+     if is_desktop {
+@@ -94,6 +95,7 @@
+         "src/apm.cpp",
+         "src/audio_mixer.cpp",
+         "src/packet_trailer.cpp",
++        "src/raw_bytes_transformer.cpp",
+     ]);
+ 
+     if is_desktop {
+@@ -275,6 +277,13 @@
+             builder
+                 .file("src/objc_video_factory.mm")
+                 .file("src/objc_video_frame_buffer.mm")
++                // Polyfill for NSString (AbslStringView). The
++                // category is declared in libwebrtc but its .o
++                // doesn't reach the final link, so first-log-line
++                // hits `unrecognized selector`. The cdylib consumer
++                // also needs to pass `-ObjC` at link time — see
++                // `bale-vpn-node/rust/lktunnel-node/build.rs`.
++                .file("src/objc_abseil_strings.mm")
+                 .flag("-stdlib=libc++")
+                 .flag("-std=c++20")
+                 .flag("-Wno-nullability-completeness");
+diff -urN a/include/livekit/raw_bytes_transformer.h b/include/livekit/raw_bytes_transformer.h
+--- a/include/livekit/raw_bytes_transformer.h	1970-01-01 01:00:00
++++ b/include/livekit/raw_bytes_transformer.h	2026-05-19 12:42:13
+@@ -0,0 +1,87 @@
++/*
++ * raw_bytes_transformer.h — install a webrtc::FrameTransformerInterface
++ * on an RtpSender / RtpReceiver that *replaces* the encoded video payload
++ * with arbitrary bytes from Rust (sender), or extracts bytes from arriving
++ * frames and pushes them to a Rust callback (receiver).
++ *
++ * The transform sits between the encoder and the RTP packetizer on send,
++ * and between the depacketizer and the decoder on receive — same hook
++ * point LiveKit's E2EE uses (frame_cryptor.cpp:142,164). libwebrtc still
++ * handles SSRC/seq/timestamp/SRTP/MTU-chunking, so we ride RTP without
++ * having to reimplement any of that machinery.
++ *
++ * Why we need this: SCTP-over-DTLS (the data-channel transport) appears
++ * to be DPI-fingerprinted on some networks. RTP (Opus/VP8 over SRTP) is
++ * structurally indistinguishable from media calls and survives.
++ *
++ * Usage:
++ *   sender: new_raw_bytes_transformer_for_rtp_sender(sender)
++ *             → call .send(bytes) to enqueue. The next Transform() call
++ *               from the encoder pulls one packet and forwards it.
++ *   receiver: new_raw_bytes_transformer_for_rtp_receiver(receiver, obs)
++ *             → on each arriving frame, obs->on_data(bytes) fires. The
++ *               frame is dropped (decoder never runs on the garbage).
++ */
++#pragma once
++
++#include <atomic>
++#include <deque>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <vector>
++
++#include "api/frame_transformer_interface.h"
++#include "api/scoped_refptr.h"
++#include "livekit/rtp_receiver.h"
++#include "livekit/rtp_sender.h"
++#include "rust/cxx.h"
++
++namespace livekit_ffi {
++
++class RawBytesObserverWrapper;
++
++class RawBytesFrameTransformerImpl;
++
++// Thin std::shared_ptr-friendly handle around the underlying
++// webrtc::scoped_refptr<FrameTransformerInterface> so cxx can hold it.
++class RawBytesFrameTransformer {
++ public:
++  RawBytesFrameTransformer(
++      webrtc::scoped_refptr<RawBytesFrameTransformerImpl> impl);
++  ~RawBytesFrameTransformer();
++
++  // Sender-side only: enqueue a packet. Returns false if the queue is
++  // full (caller's responsibility to drop / retry). On the receiver side
++  // this always returns false.
++  bool send(rust::Slice<const uint8_t> data) const;
++
++  // Sender-side: current queue depth. Useful for backpressure.
++  size_t queue_depth() const;
++
++ private:
++  webrtc::scoped_refptr<RawBytesFrameTransformerImpl> impl_;
++};
++
++// Allocate a sender-side transformer and install it on `sender` via
++// SetEncoderToPacketizerFrameTransformer. The encoder still runs (which
++// is required to drive Transform() calls); the encoded video output is
++// discarded and replaced with whatever bytes the caller has enqueued.
++std::shared_ptr<RawBytesFrameTransformer>
++new_raw_bytes_transformer_for_rtp_sender(std::shared_ptr<RtpSender> sender);
++
++// Allocate a receiver-side transformer and install it on `receiver` via
++// SetDepacketizerToDecoderFrameTransformer. Each arriving frame fires
++// observer->on_data with the raw bytes (no decode pass).
++std::shared_ptr<RawBytesFrameTransformer>
++new_raw_bytes_transformer_for_rtp_receiver(
++    std::shared_ptr<RtpReceiver> receiver,
++    rust::Box<RawBytesObserverWrapper> observer);
++
++static std::shared_ptr<RawBytesFrameTransformer> _shared_raw_bytes_transformer() {
++  return nullptr;  // Ignore — cxx shared_ptr helper, same pattern as
++                   // _shared_rtp_sender in rtp_sender.h.
++}
++
++}  // namespace livekit_ffi
+diff -urN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2006-07-24 03:21:28
++++ b/src/lib.rs	2026-05-19 12:42:13
+@@ -32,6 +32,7 @@
+ pub mod peer_connection;
+ pub mod peer_connection_factory;
+ pub mod prohibit_libsrtp_initialization;
++pub mod raw_bytes_transformer;
+ pub mod rtc_error;
+ pub mod rtp_parameters;
+ pub mod rtp_receiver;
+diff -urN a/src/objc_abseil_strings.mm b/src/objc_abseil_strings.mm
+--- a/src/objc_abseil_strings.mm	1970-01-01 01:00:00
++++ b/src/objc_abseil_strings.mm	2026-05-19 12:54:35
+@@ -0,0 +1,43 @@
++/*
++ * Polyfill for NSString (AbslStringView) — declared in libwebrtc's
++ * `sdk/objc/helpers/NSString+StdString.h` but its implementation .o
++ * doesn't make it into the prefixed-libwebrtc macOS archive (or
++ * isn't pulled into the final link). Without this category, libwebrtc's
++ * macOS log path crashes with `unrecognized selector` on
++ * `+[NSString stringForAbslStringView:]` at the very first log
++ * message after `Tunnel.connect`.
++ *
++ * For this .o to actually end up in the final binary, the consumer
++ * (cli binary, napi cdylib) must pass `-ObjC` at link time so the
++ * linker force-loads Objective-C metadata from static archives.
++ * `webrtc-sys`'s build.rs sets it via `cargo:rustc-link-arg=-ObjC`,
++ * which only applies to its own package; downstream consumers
++ * (especially the napi cdylib in a different workspace) need to
++ * restate it in their own build.rs. See
++ * `bale-vpn-node/rust/lktunnel-node/build.rs`.
++ */
++#import <Foundation/Foundation.h>
++
++#include "absl/strings/string_view.h"
++
++@interface NSString (AbslStringView)
+++ (NSString *)stringForAbslStringView:(const absl::string_view)abslStringView;
++@end
++
++@implementation NSString (AbslStringView)
++
+++ (NSString *)stringForAbslStringView:(const absl::string_view)abslStringView {
++    return [[NSString alloc] initWithBytes:abslStringView.data()
++                                    length:abslStringView.length()
++                                  encoding:NSUTF8StringEncoding];
++}
++
++@end
++
++// Force-link anchor — referenced from `raw_bytes_transformer.cpp`
++// (one of our own translation units, always linked). The reference
++// pulls this .o into the final link; the Objective-C runtime then
++// auto-registers the category above. We can't rely on `-ObjC` alone
++// because rust's `cargo:rustc-link-arg` doesn't always propagate the
++// flag into napi-cli's final linker invocation.
++extern "C" int lk_force_link_objc_abseil_strings(void) { return 0; }
+diff -urN a/src/raw_bytes_transformer.cpp b/src/raw_bytes_transformer.cpp
+--- a/src/raw_bytes_transformer.cpp	1970-01-01 01:00:00
++++ b/src/raw_bytes_transformer.cpp	2026-05-19 12:54:54
+@@ -0,0 +1,233 @@
++/*
++ * raw_bytes_transformer.cpp — see raw_bytes_transformer.h for the why.
++ */
++#include "livekit/raw_bytes_transformer.h"
++
++#include <atomic>
++#include <cstdio>
++
++#if defined(__ANDROID__)
++#include <android/log.h>
++#endif
++
++#include "api/make_ref_counted.h"
++#include "webrtc-sys/src/raw_bytes_transformer.rs.h"
++
++// macOS: force-link anchor for `objc_abseil_strings.mm`. The .o
++// containing the `+[NSString stringForAbslStringView:]` polyfill
++// would otherwise be dead-stripped from the final cdylib —
++// `cargo:rustc-link-arg=-ObjC` doesn't reliably propagate from
++// either webrtc-sys's build script or the napi crate's. By taking
++// the symbol's address from inside this always-linked TU we make
++// the linker pull the polyfill .o in unconditionally.
++#if defined(__APPLE__)
++extern "C" int lk_force_link_objc_abseil_strings(void);
++__attribute__((used))
++static int (*const _lk_force_link_anchor)(void) =
++    &lk_force_link_objc_abseil_strings;
++#endif
++
++namespace livekit_ffi {
++
++namespace {
++
++// Emit a one-line diagnostic both to logcat (Android) and stderr (host
++// builds). Used at every power-of-two count of Transform() invocations
++// so the line frequency stays bounded regardless of packet rate.
++// `status` describes which outcome path the call took — useful when
++// debugging silent drops (e.g. "no_sink" means libwebrtc hasn't called
++// RegisterTransformedFrameSinkCallback yet, so we'd pop the queue and
++// discard the payload).
++void log_transform(const char* tag,
++                   uint64_t    count,
++                   size_t      payload_len,
++                   const char* status) {
++#if defined(__ANDROID__)
++  __android_log_print(ANDROID_LOG_INFO, "lktunnel",
++                      "raw_bytes_transformer: %s Transform() count=%llu len=%zu status=%s",
++                      tag, static_cast<unsigned long long>(count),
++                      payload_len, status);
++#else
++  std::fprintf(stderr,
++               "raw_bytes_transformer: %s Transform() count=%llu len=%zu status=%s\n",
++               tag, static_cast<unsigned long long>(count),
++               payload_len, status);
++#endif
++}
++
++inline bool is_pow2(uint64_t n) {
++  return n != 0 && (n & (n - 1)) == 0;
++}
++
++}  // namespace
++
++// Backing FrameTransformer implementation. Subclasses webrtc::Frame-
++// TransformerInterface so libwebrtc's RtpSender / RtpReceiver can store
++// it via SetEncoderToPacketizerFrameTransformer /
++// SetDepacketizerToDecoderFrameTransformer.
++class RawBytesFrameTransformerImpl : public webrtc::FrameTransformerInterface {
++ public:
++  enum class Direction { kSender, kReceiver };
++
++  explicit RawBytesFrameTransformerImpl(Direction direction)
++      : direction_(direction) {}
++
++  void set_observer(rust::Box<RawBytesObserverWrapper> observer) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    observer_.emplace(std::move(observer));
++  }
++
++  bool send(rust::Slice<const uint8_t> data) {
++    if (direction_ != Direction::kSender) {
++      return false;
++    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (outgoing_.size() >= kMaxQueueDepth) {
++      return false;
++    }
++    outgoing_.emplace_back(data.data(), data.data() + data.size());
++    return true;
++  }
++
++  size_t queue_depth() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return outgoing_.size();
++  }
++
++  // webrtc::FrameTransformerInterface
++  void Transform(
++      std::unique_ptr<webrtc::TransformableFrameInterface> frame) override {
++    if (direction_ == Direction::kReceiver) {
++      // Pull bytes, push to Rust, drop the frame. We don't forward to
++      // the decoder — its job is to render audio, ours is to extract
++      // tunnel payload, and the encoded "Opus" bytes wouldn't decode
++      // anyway.
++      auto data = frame->GetData();
++      recv_count_.fetch_add(1, std::memory_order_relaxed);
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (observer_) {
++        (*observer_)->on_data(
++            rust::Slice<const uint8_t>(data.data(), data.size()));
++      }
++      return;
++    }
++
++    // Sender side. Substitute the encoder's bytes with the next queued
++    // tunnel packet, then forward. If we have nothing queued, drop the
++    // frame so we don't waste bandwidth on the dummy keep-alive audio.
++    send_count_.fetch_add(1, std::memory_order_relaxed);
++    std::vector<uint8_t> payload;
++    webrtc::scoped_refptr<webrtc::TransformedFrameCallback> sink;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (outgoing_.empty()) {
++        return;
++      }
++      payload = std::move(outgoing_.front());
++      outgoing_.pop_front();
++      // libwebrtc registers the send-side sink in one of two ways:
++      // video uses the SSRC-keyed variant
++      // (RegisterTransformedFrameSinkCallback) and audio uses the
++      // SSRC-less RegisterTransformedFrameCallback. Try SSRC first
++      // and fall back to the singleton — covers both without
++      // splitting the implementation.
++      auto it = ssrc_sinks_.find(frame->GetSsrc());
++      if (it != ssrc_sinks_.end()) {
++        sink = it->second;
++      } else if (singleton_sink_) {
++        sink = singleton_sink_;
++      }
++    }
++    if (!sink) {
++      return;
++    }
++    frame->SetData(
++        webrtc::ArrayView<const uint8_t>(payload.data(), payload.size()));
++    sink->OnTransformedFrame(std::move(frame));
++  }
++
++
++
++  void RegisterTransformedFrameCallback(
++      webrtc::scoped_refptr<webrtc::TransformedFrameCallback> callback) override {
++    // SSRC-less registration — used by libwebrtc's audio RTPSender and
++    // by every receive path. We stash it as the "singleton" fallback
++    // sink; the send path consults this when ssrc_sinks_ has no
++    // matching entry, and the receive path doesn't actually need it
++    // (the receive transform emits to the Rust observer and drops the
++    // frame instead of forwarding).
++    std::lock_guard<std::mutex> lock(mutex_);
++    singleton_sink_ = callback;
++  }
++
++  void RegisterTransformedFrameSinkCallback(
++      webrtc::scoped_refptr<webrtc::TransformedFrameCallback> callback,
++      uint32_t ssrc) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    ssrc_sinks_[ssrc] = callback;
++  }
++
++  void UnregisterTransformedFrameCallback() override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    singleton_sink_ = nullptr;
++  }
++
++  void UnregisterTransformedFrameSinkCallback(uint32_t ssrc) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    ssrc_sinks_.erase(ssrc);
++  }
++
++ private:
++  // Caps the outgoing queue so a stalled WebRTC encoder doesn't let the
++  // tunnel ingress balloon memory. 256 packets at ~1.5KB each ≈ 384 KB
++  // headroom — plenty for normal scheduling jitter, far short of OOM.
++  static constexpr size_t kMaxQueueDepth = 256;
++
++  const Direction direction_;
++  std::mutex mutex_;
++  std::deque<std::vector<uint8_t>> outgoing_;
++  std::optional<rust::Box<RawBytesObserverWrapper>> observer_;
++  webrtc::scoped_refptr<webrtc::TransformedFrameCallback> singleton_sink_;
++  std::map<uint32_t, webrtc::scoped_refptr<webrtc::TransformedFrameCallback>>
++      ssrc_sinks_;
++  // Diagnostic counters — log a line every power-of-two invocation so
++  // we can tell from logs whether Transform() is actually being driven
++  // by libwebrtc on each side.
++  std::atomic<uint64_t> send_count_{0};
++  std::atomic<uint64_t> recv_count_{0};
++};
++
++RawBytesFrameTransformer::RawBytesFrameTransformer(
++    webrtc::scoped_refptr<RawBytesFrameTransformerImpl> impl)
++    : impl_(std::move(impl)) {}
++
++RawBytesFrameTransformer::~RawBytesFrameTransformer() = default;
++
++bool RawBytesFrameTransformer::send(rust::Slice<const uint8_t> data) const {
++  return impl_->send(data);
++}
++
++size_t RawBytesFrameTransformer::queue_depth() const {
++  return impl_->queue_depth();
++}
++
++std::shared_ptr<RawBytesFrameTransformer>
++new_raw_bytes_transformer_for_rtp_sender(std::shared_ptr<RtpSender> sender) {
++  auto impl = webrtc::make_ref_counted<RawBytesFrameTransformerImpl>(
++      RawBytesFrameTransformerImpl::Direction::kSender);
++  sender->rtc_sender()->SetEncoderToPacketizerFrameTransformer(impl);
++  return std::make_shared<RawBytesFrameTransformer>(std::move(impl));
++}
++
++std::shared_ptr<RawBytesFrameTransformer>
++new_raw_bytes_transformer_for_rtp_receiver(
++    std::shared_ptr<RtpReceiver> receiver,
++    rust::Box<RawBytesObserverWrapper> observer) {
++  auto impl = webrtc::make_ref_counted<RawBytesFrameTransformerImpl>(
++      RawBytesFrameTransformerImpl::Direction::kReceiver);
++  impl->set_observer(std::move(observer));
++  receiver->rtc_receiver()->SetDepacketizerToDecoderFrameTransformer(impl);
++  return std::make_shared<RawBytesFrameTransformer>(std::move(impl));
++}
++
++}  // namespace livekit_ffi
+diff -urN a/src/raw_bytes_transformer.rs b/src/raw_bytes_transformer.rs
+--- a/src/raw_bytes_transformer.rs	1970-01-01 01:00:00
++++ b/src/raw_bytes_transformer.rs	2026-05-19 12:42:13
+@@ -0,0 +1,69 @@
++// raw_bytes_transformer — cxx bridge for the FrameTransformer that
++// substitutes encoder output with arbitrary tunnel bytes (sender) and
++// extracts them on the receive side. See include/livekit/raw_bytes_-
++// transformer.h for the design.
++//
++// The Rust caller installs this on an RtpSender / RtpReceiver and then:
++//   - sender: invokes send(bytes) per outgoing tunnel packet.
++//   - receiver: provides an Observer that fires on each arriving frame.
++
++use std::sync::Arc;
++
++use crate::impl_thread_safety;
++
++#[cxx::bridge(namespace = "livekit_ffi")]
++pub mod ffi {
++    unsafe extern "C++" {
++        include!("livekit/raw_bytes_transformer.h");
++        include!("livekit/rtp_sender.h");
++        include!("livekit/rtp_receiver.h");
++
++        type RtpSender = crate::rtp_sender::ffi::RtpSender;
++        type RtpReceiver = crate::rtp_receiver::ffi::RtpReceiver;
++
++        pub type RawBytesFrameTransformer;
++
++        pub fn new_raw_bytes_transformer_for_rtp_sender(
++            sender: SharedPtr<RtpSender>,
++        ) -> SharedPtr<RawBytesFrameTransformer>;
++
++        pub fn new_raw_bytes_transformer_for_rtp_receiver(
++            receiver: SharedPtr<RtpReceiver>,
++            observer: Box<RawBytesObserverWrapper>,
++        ) -> SharedPtr<RawBytesFrameTransformer>;
++
++        pub fn send(self: &RawBytesFrameTransformer, data: &[u8]) -> bool;
++
++        pub fn queue_depth(self: &RawBytesFrameTransformer) -> usize;
++    }
++
++    extern "Rust" {
++        type RawBytesObserverWrapper;
++
++        fn on_data(self: &RawBytesObserverWrapper, data: &[u8]);
++    }
++} // namespace livekit_ffi
++
++impl_thread_safety!(ffi::RawBytesFrameTransformer, Send + Sync);
++
++/// Trait implemented by the application's receive-side handler. Fires on
++/// every incoming raw-bytes frame, on whichever libwebrtc worker thread
++/// is delivering the frame — the implementor is responsible for moving
++/// to its own runtime if it needs to.
++pub trait RawBytesObserver: Send + Sync {
++    fn on_data(&self, data: &[u8]);
++}
++
++pub struct RawBytesObserverWrapper {
++    observer: Arc<dyn RawBytesObserver>,
++}
++
++impl RawBytesObserverWrapper {
++    pub fn new(observer: Arc<dyn RawBytesObserver>) -> Self {
++        Self { observer }
++    }
++
++    fn on_data(&self, data: &[u8]) {
++        self.observer.on_data(data);
++    }
++}

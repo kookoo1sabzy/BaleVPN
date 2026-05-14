@@ -1,0 +1,20 @@
+{
+  "_comment": "Local-only manifest, never published. Drives @napi-rs/cli's `napi build` which compiles the Rust cdylib and emits a platform-named .node alongside this file. The outer bale-vpn-node app's scripts invoke it via `npm run build:native`.",
+  "name": "lktunnel-node",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "napi": {
+    "binaryName": "lktunnel-node",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release --js index.js --dts index.d.ts",
+    "build:debug": "napi build --platform --js index.js --dts index.d.ts"
+  }
+}
