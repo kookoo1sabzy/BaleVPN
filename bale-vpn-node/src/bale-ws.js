@@ -325,28 +325,21 @@ class BaleWsClient {
                     cb.resolve(rpc.response || new Uint8Array(0));
                 }
             } else if (rpc.index === this.subscribeIdx && (rpc.error || !rpc.response)) {
-                // SubscribeToUpdates RPC ended. Routine — Bale's server hits
-                // its 30 s deadline waiting for our request-side EOF (which
-                // our WS-multiplexed transport can't send, unlike gRPC-web)
-                // and closes with `code=4 DEADLINE_EXCEEDED`. We do NOT
-                // re-subscribe: realtime events flow on WS field 2 (the
-                // standalone Push update channel) independently of this RPC,
-                // so a fresh subscribe wouldn't add anything. Loud only if
-                // the close reason is something other than `code=4`, so a
-                // genuine failure (auth, malformed, protocol change) still
-                // surfaces.
+                // SubscribeToUpdates RPC ended. Routine close (`code=4
+                // DEADLINE_EXCEEDED`, or `code=2` + "want <EOF>" — same root
+                // cause: server's 30 s deadline waiting for our impossible-
+                // over-WS request-side EOF) is silent and *not* re-subscribed.
+                // Non-routine closes (commonly `code=13 cardinality violation`
+                // when DiscardCall is processed mid-stream) DO stop real-time
+                // updates from arriving, so re-subscribe defensively.
                 const errInfo = rpc.error ? decodeRpcError(Buffer.from(rpc.error)) : { code: 0, message: 'complete' };
-                // code 4 (DEADLINE_EXCEEDED) — server's deadline timer fired
-                //   waiting for our (impossible-over-WS) request-side EOF.
-                // code 2 (UNKNOWN) with the gRPC "want <EOF>" string — same
-                //   root cause, server gave up earlier instead of timing out.
-                // Both are transport-level artefacts, not real failures.
                 const isRotation = !rpc.response && (
                     errInfo.code === 4 ||
                     (errInfo.code === 2 && errInfo.message.includes('want <EOF>'))
                 );
                 if (!isRotation) {
-                    console.log(`[WS] subscribe stream ended unexpectedly (idx=${rpc.index} code=${errInfo.code} message="${errInfo.message}")`);
+                    console.log(`[WS] subscribe stream ended unexpectedly (idx=${rpc.index} code=${errInfo.code} message="${errInfo.message}") — re-subscribing`);
+                    this._subscribe();
                 }
             } else if (rpc.response) {
                 this._processUpdate(rpc.response);

@@ -1,12 +1,8 @@
 package ai.bale.proxy
 
 import ai.bale.proxy.bale.CallEntity
-import ai.bale.proxy.livekit.AndroidLiveKitTransport
-import ai.bale.proxy.tunnel.DataTransport
 import ai.bale.proxy.tunnel.LiveKitStats
-import ai.bale.proxy.tunnel.TFrame
-import ai.bale.proxy.tunnel.lkDecode
-import ai.bale.proxy.tunnel.lkEncode
+import ai.bale.proxy.tunnel.PacketStats
 import android.app.*
 import android.content.Intent
 import android.os.Build
@@ -19,8 +15,6 @@ private const val TAG                = "BaleProxy"
 private const val PENDING_TIMEOUT_MS = 60 * 1000L
 // How often the pending sweep loop runs.
 private const val PENDING_CHECK_MS   = 15_000L
-// Max wait for the caller to actually join our LK room after we acceptCall — covers Bale push + caller LK handshake + SDK propagation.
-private const val PEER_JOIN_TIMEOUT_MS = 5_000L
 // How often the UI snapshot loop refreshes per-client stats.
 private const val STATS_REFRESH_MS   = 500L
 
@@ -32,16 +26,13 @@ class BaleServerService : Service() {
         val connectedAt:  Long,
         val rxPkts: Long, val rxBytes: Long,
         val txPkts: Long, val txBytes: Long,
-        val limitUpBps:   Long    = 0,
-        val limitDownBps: Long    = 0,
-        val isThrottled:  Boolean = false,
-        // Latest TCP/UDP/IP stats from this client's PacketProcessor (null until the
-        // first snapshot has been computed). Read by ClientStatsActivity.
-        val packetStats:  PacketStats? = null,
         // Latest WebRTC transport stats from this client's LiveKit room. Null when
         // the SDK hasn't reported a nominated candidate-pair yet (usually the first
         // ~1 s after connect).
         val lkStats:      LiveKitStats? = null,
+        // Aggregated TCP/UDP flow stats from the native NAT layer (NatDispatcher).
+        // Null when the session has no flows yet or has been torn down.
+        val packetStats:  PacketStats? = null,
     )
 
     data class PendingCall(
@@ -66,8 +57,7 @@ class BaleServerService : Service() {
     private class Client(
         val callId:      Long,
         val callerId:    Long = 0L,
-        val transport:   DataTransport,
-        val processor:   PacketProcessor,
+        val transport:   LkTunnel,
         val connectedAt: Long = System.currentTimeMillis(),
         // Display name resolved at connect time; reused on disconnect so the
         // notification reads the same name even if the WS is being torn down
@@ -77,7 +67,6 @@ class BaleServerService : Service() {
 
     private val clients     = ConcurrentHashMap<Long, Client>()
     private val pendingMap  = ConcurrentHashMap<Long, PendingCall>()
-    private val callerLimits = ConcurrentHashMap<Long, Pair<Long, Long>>()  // callerId → (upBps, downBps)
 
     companion object {
         const val ACTION_STOP = "ai.bale.proxy.SERVER_STOP"
@@ -95,14 +84,6 @@ class BaleServerService : Service() {
         // gets a stable id derived from their callerId, so a "disconnected" alert
         // replaces an older "connected" alert from the same caller.
         private const val CLIENT_EVENT_NOTIF_BASE = 1_000
-        // Default per-client cap. Stored as bytes/sec (the token-bucket charges packet sizes
-        // in bytes), expressed to the user in kilobits/sec. 62_500 B/s = 500 kbps.
-        // Every client is rate-limited; there is no "unlimited".
-        const val DEFAULT_LIMIT_BPS: Long = 62_500L    // 500 kbps
-        // Hard ceiling for per-caller overrides. The UI dialog clamps input here; AdmissionStore
-        // clamps stored values too so a hand-edited shared_prefs/config.xml can't smuggle in a
-        // 100 Mbps override.
-        const val MAX_LIMIT_BPS:     Long = 125_000L   // 1000 kbps = 1 Mbps
         // Cap on simultaneously-connected clients. Hard limit matches the Node side's
         // SNAT pool size (10.8.0.2–10.8.0.254 = 253 slots) so the two platforms behave
         // identically when paired with the same kind of peer. The user-facing default
@@ -119,13 +100,14 @@ class BaleServerService : Service() {
 
         @Volatile var isRunning   = false
         @Volatile var clientCount = 0
-        // Toggle verbose PacketProcessor diagnostics; setter propagates to live processors and persists.
+        // User-facing verbose-logging toggle. Propagates to the native NAT
+        // layer (per-flow TCP/UDP sessions + dispatcher) so retransmits,
+        // cwnd-limited stalls, fragment activity, etc. surface to logcat.
         @Volatile var debug: Boolean = false
             set(value) {
                 field = value
-                val inst = instance
-                inst?.clients?.values?.forEach { it.processor.debug = value }
-                inst?.getSharedPreferences("config", MODE_PRIVATE)
+                LkTunnel.setDebug(value)
+                instance?.getSharedPreferences("config", MODE_PRIVATE)
                     ?.edit()?.putBoolean("packet_debug", value)?.apply()
             }
         @Volatile private var instance:        BaleServerService? = null
@@ -178,20 +160,6 @@ class BaleServerService : Service() {
             instance?.scope?.launch { instance?.doRejectPending(callId, addToBlacklist = true) }
         }
 
-        fun setClientLimit(callId: Long, upBps: Long, downBps: Long) {
-            val inst = instance ?: return
-            inst.clients[callId]?.also { c ->
-                c.processor.limitUpBps   = upBps
-                c.processor.limitDownBps = downBps
-                if (c.callerId != 0L) {
-                    inst.callerLimits[c.callerId] = upBps to downBps
-                    // Persist only for admitted callers. AdmissionStore.setLimit returns
-                    // false when the caller isn't in the allow-list — that's a session-only
-                    // override and matches the user's "limits stick to admissions" mental model.
-                    AdmissionStore.setLimit(c.callerId, upBps, downBps)
-                }
-            }
-        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -213,11 +181,7 @@ class BaleServerService : Service() {
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
         AdmissionStore.init(prefs)
         BlacklistStore.init(prefs)
-        // Hydrate per-caller limits from the merged admission store so a
-        // service restart re-applies the same caps when those callers reconnect.
-        callerLimits.clear()
-        callerLimits.putAll(AdmissionStore.getAllLimits().filterValues { it.first > 0L || it.second > 0L })
-        debug = prefs.getBoolean("packet_debug", false)
+        debug           = prefs.getBoolean("packet_debug",     false)
 
         // Always re-register; idempotent and ensures the latest lambda is in place
         // even if onStartCommand is called multiple times for the same instance.
@@ -366,51 +330,42 @@ class BaleServerService : Service() {
         Log.d(TAG, "Server: acceptCall done isLivekit=$isLivekit token.len=${accepted.token.length}")
         if (!isLivekit || accepted.token.isEmpty()) { Log.w(TAG, "Server: no LK creds for $callId"); return }
 
-        val callerId  = incomingCall?.callerId ?: 0L
-        // Dedup by callerId: if the same caller already has an active client (e.g.,
-        // they reconnected before we received the callEnded for the previous call,
-        // or the LiveKit ParticipantDisconnected event hasn't fired yet), tear down
-        // the old entry first. Local-only cleanup (no discardCall) — Bale appears
-        // to end ALL calls in the caller↔callee pair when discardCall fires for one
-        // of them, which would also kill the brand-new call we're handling now.
+        val callerId = incomingCall?.callerId ?: 0L
+        // Dedup by callerId: if the same caller already has an active client
+        // (e.g., reconnected before we received the previous callEnded, or the
+        // LiveKit ParticipantDisconnected hasn't fired yet), tear the old one
+        // down. Local cleanup only — Bale's discardCall scopes at the
+        // caller↔callee session level and would kill the new call too.
         if (callerId != 0L) {
             val existing = clients.values.firstOrNull { it.callerId == callerId }
             if (existing != null) {
-                Log.d(TAG, "Server: replacing existing client ${existing.callId} from callerId=$callerId with new $callId (local cleanup only)")
+                Log.d(TAG, "Server: replacing existing client ${existing.callId} from callerId=$callerId (local cleanup only)")
                 cleanupClientLocal(existing.callId)
             }
         }
-        val transport = AndroidLiveKitTransport(applicationContext)
-        val processor = PacketProcessor(
-            onSend = { pkt -> transport.send(lkEncode(TFrame.Ip(pkt))) },
-            log = { msg -> Log.d(TAG, msg) },
-        )
-        processor.debug = debug
-        // Every client is capped — start from the default, then apply a per-caller override
-        // if one was set (only if positive; legacy 0 values mean "unlimited" which we no longer allow).
-        processor.limitUpBps   = DEFAULT_LIMIT_BPS
-        processor.limitDownBps = DEFAULT_LIMIT_BPS
-        callerLimits[callerId]?.let { (up, down) ->
-            if (up > 0L)   processor.limitUpBps   = up
-            if (down > 0L) processor.limitDownBps = down
-        }
 
-        // Resolve the caller's display name now (sync) so we have it for both
-        // the connect event AND the future disconnect event. loadUserName is
-        // cached after first hit, so this is effectively free on subsequent
-        // calls; the first call pays a single contact-list HTTP fetch.
+        // Resolve caller name now so both connect AND disconnect events show
+        // the same label. loadUserName caches after first hit, so subsequent
+        // calls are effectively free.
         val callerName: String? = if (callerId != 0L) {
             try { ws.loadUserName(callerId.toInt()) } catch (_: Exception) { null }
         } else null
 
-        val client = Client(callId, callerId, transport, processor, resolvedName = callerName)
+        acceptAndStart(callId, callerId, callerName, accepted.url, accepted.token)
+    }
 
-        transport.onData = { data ->
-            (lkDecode(data) as? TFrame.Ip)?.let { client.processor.process(it.data) }
-        }
+    /** Builds the Client / transport / NAT-side tunnel for an accepted call.
+     *  Called by handleCall once LK creds are in hand from the acceptCall RPC. */
+    private suspend fun acceptAndStart(
+        callId: Long, callerId: Long, callerName: String?,
+        url: String, token: String,
+    ) {
+        val transport = LkTunnel()
+        val client = Client(callId, callerId, transport, resolvedName = callerName)
+
         transport.onDisconnected = {
             Log.d(TAG, "Server: client $callId disconnected")
-            val removed = clients.remove(callId)?.also { it.processor.close() }
+            val removed = clients.remove(callId)?.also { it.transport.disconnect() }
             clientCount = clients.size
             rebuildSnapshot()
             updateNotification()
@@ -424,21 +379,25 @@ class BaleServerService : Service() {
         postClientEvent(callerId, "connected", callerName)
 
         Log.d(TAG, "Server: joining LK room for call $callId")
-        transport.connect(accepted.url, accepted.token)
-
-        // Watchdog: the LK session token can keep us connected for hours even
-        // with nobody on the other side, so if the caller never actually joins
-        // (e.g., their VPN was cancelled before the room handshake completed)
-        // we tear the call down ourselves to free resources. The identity
-        // check on `transport` ensures we don't kill a fresh client that
-        // replaced this one in the meantime.
-        scope.launch {
-            delay(PEER_JOIN_TIMEOUT_MS)
-            val current = clients[callId]
-            if (current?.transport === transport && !transport.hasPeer) {
-                Log.d(TAG, "Server: peer never joined call $callId — disconnecting")
-                doDisconnect(callId)
-            }
+        // Rust handles the LK data channel internally — once connect returns,
+        // inbound packets flow Rust → NAT → host sockets and outbound flow
+        // back the other way. If connect throws (ICE failure, peer never
+        // joined within Rust's PEER_WAIT_MS, etc.) we tear the call down
+        // cleanly so we don't leak the tunnel or leave UI stale.
+        try {
+            transport.connect(url, token)
+            // LK is up — pick server mode on the underlying tunnel so the
+            // Rust shim wires the NAT dispatcher for this call.
+            transport.startServer()
+        } catch (e: Exception) {
+            Log.w(TAG, "Server: transport.connect failed for $callId: ${e::class.simpleName}: ${e.message}")
+            try { transport.disconnect() } catch (_: Exception) {}
+            clients.remove(callId)
+            clientCount = clients.size
+            rebuildSnapshot()
+            updateNotification()
+            try { BaleConnection.client?.discardCall(callId) } catch (_: Exception) {}
+            postClientEvent(callerId, "disconnected", callerName)
         }
     }
 
@@ -480,21 +439,24 @@ class BaleServerService : Service() {
         }
     }
 
+
     private fun rebuildSnapshot() {
         clientSnapshot = clients.values.map { c ->
+            // [rxPkts, rxBytes, txPkts, txBytes] — atomics on the
+            // native side, lock-free read. May be null in the brief
+            // window between connect attempt and startServer; fall
+            // back to zeros so the UI doesn't blank.
+            val s = c.transport.stats() ?: longArrayOf(0, 0, 0, 0)
             ClientInfo(
                 callId       = c.callId,
                 callerId     = c.callerId,
                 connectedAt  = c.connectedAt,
-                rxPkts       = c.processor.rxPkts,
-                rxBytes      = c.processor.rxBytes,
-                txPkts       = c.processor.txPkts,
-                txBytes      = c.processor.txBytes,
-                limitUpBps   = c.processor.limitUpBps,
-                limitDownBps = c.processor.limitDownBps,
-                isThrottled  = c.processor.isThrottled,
-                packetStats  = c.processor.lastSnapshot,
+                rxPkts       = s[0],
+                rxBytes      = s[1],
+                txPkts       = s[2],
+                txBytes      = s[3],
                 lkStats      = c.transport.lastStats,
+                packetStats  = c.transport.flowStats()?.let(PacketStats::fromLongs),
             )
         }.sortedBy { it.connectedAt }
     }
@@ -503,8 +465,11 @@ class BaleServerService : Service() {
         clients.remove(callId)?.also {
             Log.d(TAG, "Server: forcibly disconnecting $callId")
             BaleConnection.client?.discardCall(callId)
+            // transport.disconnect() closes the LkTunnel handle, whose
+            // Drop tears down the NAT session AND the LK side in one
+            // shot. Order matters for the inverse case (cleanup-after-
+            // crash) but not here.
             it.transport.disconnect()
-            it.processor.close()
             clientCount = clients.size
             rebuildSnapshot()
             updateNotification()
@@ -520,7 +485,6 @@ class BaleServerService : Service() {
         clients.remove(callId)?.also {
             Log.d(TAG, "Server: local cleanup of $callId")
             runCatching { it.transport.disconnect() }
-            runCatching { it.processor.close() }
             clientCount = clients.size
             rebuildSnapshot()
             updateNotification()
@@ -551,10 +515,9 @@ class BaleServerService : Service() {
                 allCallIds.forEach { id -> try { ws.discardCall(id) } catch (_: Exception) {} }
             }
         }
-        clients.values.forEach { it.transport.disconnect(); it.processor.close() }
+        clients.values.forEach { it.transport.disconnect() }
         clients.clear()
         pendingMap.clear()
-        callerLimits.clear()
         cancelPendingNotification()
         scope.cancel()
         stopSelf()

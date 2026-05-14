@@ -1,0 +1,43 @@
+# lktunnel-rust — host-side workspace for the platform-portable
+# pieces of the lktunnel stack. The Android JNI shim lives separately
+# under `bale-vpn-android/rust/lktunnel-android/` and depends back
+# into this workspace's `lktunnel` crate via a path dep.
+#
+#   lktunnel/  core library: LiveKit room wrapper, NAT dispatcher,
+#              TCP/UDP session state machines, SOCKS5 server. Pure
+#              Rust + libc. Builds for linux-gnu, linux-android, and
+#              (with some boilerplate) darwin.
+#
+#   cli/       headless executable that joins a LiveKit room with the
+#              url + token you pass on the command line and runs the
+#              same server-side NAT dispatcher the Android app uses.
+#              Useful for testing the tunnel from a Linux VPS without
+#              having to put a phone in the loop.
+[workspace]
+resolver = "2"
+members  = ["lktunnel", "cli"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"
+
+# Vendored copies of livekit, libwebrtc and webrtc-sys so we can extend
+# their FFI surface. We need to add a `webrtc::FrameTransformerInterface`
+# subclass (the public injection point libwebrtc exposes for E2EE) to
+# substitute raw tunnel bytes for the encoded video payload between the
+# encoder and the RTP packetizer — that lets us ride RTP instead of SCTP
+# data channels, which appear to be DPI-fingerprinted on some networks.
+# All three crates are tightly version-coupled (webrtc-sys 0.3.31 ↔
+# libwebrtc 0.3.33 ↔ livekit 0.7.40) so they have to be vendored as a
+# set.
+[patch.crates-io]
+webrtc-sys  = { path = "vendor/webrtc-sys" }
+libwebrtc   = { path = "vendor/libwebrtc" }
+livekit     = { path = "vendor/livekit" }
+livekit-api = { path = "vendor/livekit-api" }

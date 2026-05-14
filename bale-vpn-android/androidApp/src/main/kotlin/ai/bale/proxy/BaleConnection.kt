@@ -2,11 +2,9 @@ package ai.bale.proxy
 
 import ai.bale.proxy.bale.BaleWsClient
 import ai.bale.proxy.bale.CallEntity
+import ai.bale.proxy.net.AppHttp
 import android.content.Context
 import android.util.Log
-import io.ktor.client.*
-import io.ktor.client.engine.okhttp.*
-import io.ktor.client.plugins.websocket.*
 
 private const val TAG = "BaleProxy"
 
@@ -23,7 +21,7 @@ private const val TAG = "BaleProxy"
  *     A live VPN doesn't need WS for steady-state traffic (it flows on the LiveKit
  *     data channel). When the VPN needs WS for signaling — initial StartCall and
  *     reconnect attempts — `BaleVpnService.resolveWs()` brings it up explicitly,
- *     bypassing reconcile, and TunnelManager's onTunnelReady callback hands
+ *     bypassing reconcile, and BaleClientSignaling's onTunnelReady callback hands
  *     control back to reconcile which drops it again.
  *   - server mode → WS up iff `!userInitiatedDisconnect`, regardless of foreground;
  *     the server foreground service must stay reachable while the user has the
@@ -34,7 +32,6 @@ private const val TAG = "BaleProxy"
  * Connect/Disconnect) updates inputs first then calls reconcile().
  */
 object BaleConnection {
-    private var http: HttpClient? = null
     private lateinit var appContext: Context
     var client: BaleWsClient? = null
         private set
@@ -62,7 +59,7 @@ object BaleConnection {
 
     /** Bring the WS up or down to match the desired state. Idempotent.
      *  Synchronized because call sites span Main thread (lifecycle / UI),
-     *  IO coroutines (`BaleVpnService.resolveWs`), and TunnelManager callbacks
+     *  IO coroutines (`BaleVpnService.resolveWs`), and signaling callbacks
      *  (`onTunnelReady` fires on whichever dispatcher completed the deferred).
      *  Without the lock, two threads could each see `client == null`, both
      *  build a WS, and leave the first orphaned with a still-live scope. */
@@ -88,9 +85,8 @@ object BaleConnection {
         if (client != null) { Log.d(TAG, "BaleConnection.connect: already connected, skipping"); return }
         if (token.isBlank())  { Log.w(TAG, "BaleConnection.connect: empty token, skipping"); return }
         Log.d(TAG, "BaleConnection.connect: creating WS client")
-        http   = HttpClient(OkHttp) { install(WebSockets) }
         val ws = BaleWsClient(
-            httpClient      = http!!,
+            httpClient      = AppHttp.client,
             accessToken     = token,
             log             = { msg -> Log.d(TAG, msg) },
             onCallReceived  = { callId, call ->
@@ -117,7 +113,6 @@ object BaleConnection {
                 sessionExpired = true
                 callEndedRemover?.invoke(); callEndedRemover = null
                 client?.disconnect(); client = null
-                http?.close(); http = null
             }
         }
         ws.onVersionMismatch = {
@@ -126,7 +121,6 @@ object BaleConnection {
                 versionMismatch = true
                 callEndedRemover?.invoke(); callEndedRemover = null
                 client?.disconnect(); client = null
-                http?.close(); http = null
             }
         }
         ws.connect()
@@ -145,6 +139,5 @@ object BaleConnection {
         // (they just log a warning and return).
         callEndedRemover?.invoke(); callEndedRemover = null
         client?.disconnect(); client = null
-        http?.close();        http   = null
     }
 }

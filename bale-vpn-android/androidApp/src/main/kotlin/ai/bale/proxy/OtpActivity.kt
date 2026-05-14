@@ -1,6 +1,7 @@
 package ai.bale.proxy
 
 import ai.bale.proxy.bale.BaleAuthClient
+import ai.bale.proxy.net.AppHttp
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
@@ -11,9 +12,6 @@ import androidx.core.view.isVisible
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
-import io.ktor.client.*
-import io.ktor.client.engine.okhttp.*
-import io.ktor.client.plugins.websocket.*
 import kotlinx.coroutines.*
 
 class OtpActivity : BaseActivity() {
@@ -31,8 +29,7 @@ class OtpActivity : BaseActivity() {
     private lateinit var progress:   View
 
     private val scope  = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val http   = HttpClient(OkHttp) { install(WebSockets) }
-    private val client = BaleAuthClient(http)
+    private val client = BaleAuthClient(AppHttp.client)
     private val prefs  by lazy { getSharedPreferences("config", MODE_PRIVATE) }
 
     private lateinit var txHash:       String
@@ -96,5 +93,5 @@ class OtpActivity : BaseActivity() {
         }
     }
 
-    override fun onDestroy() { super.onDestroy(); scope.cancel(); http.close() }
+    override fun onDestroy() { super.onDestroy(); scope.cancel() }
 }

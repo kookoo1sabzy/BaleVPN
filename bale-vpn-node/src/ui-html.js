@@ -9,22 +9,11 @@
 // load (unescaped ${…}); browser-side runtime substitutions use the escaped
 // \${…} form to survive the template eval.
 
-const crypto = require('crypto');
-const { MAX_LIMIT_KBPS } = require('./constants');
-
-// Per-process CSRF token. Embedded in the served HTML and required as the
-// X-CSRF-Token header on every mutating request. A drive-by attack from
-// some other origin can't read our HTML (same-origin policy blocks the
-// response body), so it can never extract the token, even though the
-// browser would gladly fire the cross-origin request itself.
-const csrfToken = crypto.randomBytes(32).toString('hex');
-
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="csrf" content="${csrfToken}">
 <title>Bale Proxy</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -141,19 +130,13 @@ const HTML = `<!DOCTYPE html>
   .client-row .client-rate .up   { color: #1976d2; }
   .client-row .client-rate .down { color: #2e7d32; }
   .client-row .client-meta { font-size: .72rem; opacity: .55; display: flex; gap: 1rem; flex-wrap: wrap; }
-  .client-row.throttled { background: #fdecea; }
-  .client-row.throttled .client-rate .up,
-  .client-row.throttled .client-rate .down { color: #c62828; }
   .client-row .client-actions { display: flex; flex-direction: column; gap: .3rem; }
-  .client-row .disc-btn, .client-row .lim-btn {
-    border: 1px solid #888; background: none; color: #444;
+  .client-row .disc-btn {
+    border: 1px solid #e53935; background: none; color: #e53935;
     border-radius: 5px; padding: .2rem .55rem; cursor: pointer;
     font-size: .72rem; white-space: nowrap;
   }
-  .client-row .disc-btn { border-color: #e53935; color: #e53935; }
   .client-row .disc-btn:hover { background: #e53935; color: #fff; }
-  .client-row .lim-btn { border-color: #1976d2; color: #1976d2; }
-  .client-row .lim-btn:hover { background: #1976d2; color: #fff; }
   #clientsList .empty, #pendingList .empty, #admissionList .empty {
     font-size: .78rem; opacity: .45; padding: .3rem .1rem;
   }
@@ -320,22 +303,6 @@ const HTML = `<!DOCTYPE html>
   </div>
 </div>
 <script>
-// Wrap fetch so every mutating request carries the per-process CSRF token
-// embedded in the page's <meta name="csrf">. A cross-origin attacker can't
-// read this token (same-origin policy on the response body) so they can't
-// forge a request that passes the server-side check.
-(function () {
-  const _csrf = document.querySelector('meta[name="csrf"]').content;
-  const _orig = window.fetch.bind(window);
-  window.fetch = (input, init = {}) => {
-    const method = (init.method || 'GET').toUpperCase();
-    if (method !== 'GET' && method !== 'HEAD') {
-      init.headers = Object.assign({}, init.headers, { 'X-CSRF-Token': _csrf });
-    }
-    return _orig(input, init);
-  };
-})();
-
 const dot        = document.getElementById('dot');
 const tokenInput = document.getElementById('tokenInput');
 
@@ -902,10 +869,8 @@ async function pollClients() {
       const who = c.callerName
         ? escapeHtml(c.callerName) + ' <span style="opacity:.5; font-weight:400">(' + c.callerId + ')</span>'
         : (c.callerId ? 'Caller ' + c.callerId : 'Call ' + c.callKey);
-      const upLim   = c.upBps   ? Math.round(c.upBps   * 8 / 1000) : 0;
-      const downLim = c.downBps ? Math.round(c.downBps * 8 / 1000) : 0;
       return \`
-      <div class="client-row\${c.throttled ? ' throttled' : ''}">
+      <div class="client-row">
         <div class="client-dot\${c.isTunClient ? ' active' : ''}"></div>
         <div class="client-info">
           <span class="client-id">\${who}\${c.isTunClient ? ' · TUN' : ''}</span>
@@ -916,11 +881,9 @@ async function pollClients() {
           <span class="client-meta">
             <span>up \${fmtAge(c.connectedAt)}</span>
             <span>total ↑\${fmtKB(c.rxBytes)} ↓\${fmtKB(c.txBytes)}</span>
-            <span>cap ↑\${upLim} / ↓\${downLim} kbps</span>
           </span>
         </div>
         <div class="client-actions">
-          <button class="lim-btn"  onclick="limitClient('\${encodeURIComponent(c.callKey)}', \${upLim}, \${downLim})">Limit</button>
           <button class="disc-btn" onclick="disconnectClient('\${encodeURIComponent(c.callKey)}')">Disconnect</button>
         </div>
       </div>\`;
@@ -932,21 +895,6 @@ async function pollClients() {
 
 async function disconnectClient(callKey) {
   await fetch('/tunnel/clients/' + callKey + '/disconnect', { method: 'POST' });
-  pollClients();
-}
-
-async function limitClient(callKey, curUp, curDown) {
-  const upStr = prompt('Upload limit (kbps, 1–${MAX_LIMIT_KBPS}):', String(curUp || 300));
-  if (upStr === null) return;
-  const downStr = prompt('Download limit (kbps, 1–${MAX_LIMIT_KBPS}):', String(curDown || 300));
-  if (downStr === null) return;
-  const upKbps   = Math.max(1, Math.min(${MAX_LIMIT_KBPS}, parseInt(upStr,   10) || 0));
-  const downKbps = Math.max(1, Math.min(${MAX_LIMIT_KBPS}, parseInt(downStr, 10) || 0));
-  await fetch('/tunnel/clients/' + callKey + '/limit', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ upKbps, downKbps }),
-  });
   pollClients();
 }
 
@@ -1085,4 +1033,4 @@ setInterval(pollState, 2000);
 </body>
 </html>`;
 
-module.exports = { HTML, csrfToken };
+module.exports = { HTML };

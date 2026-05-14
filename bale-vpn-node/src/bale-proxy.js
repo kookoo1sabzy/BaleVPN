@@ -26,7 +26,7 @@
 process.on('uncaughtException',  e => console.error('[Process] uncaughtException:',  e.message, e.stack));
 process.on('unhandledRejection', e => console.error('[Process] unhandledRejection:', e?.message ?? e));
 
-const { TUNNEL_MODE, HTTP_PORT } = require('./constants');
+const { TUNNEL_MODE, NAT_MODE, NAT_DEBUG, HTTP_PORT } = require('./constants');
 const { BaleWsClient }           = require('./bale-ws');
 const httpServer                 = require('./http-server');
 
@@ -202,7 +202,15 @@ server.listen(HTTP_PORT, '127.0.0.1', () => {
 });
 
 // Auto-configure tunnel mode from command-line arg. For server mode this
-// also creates the bale0 TUN interface immediately.
+// also creates the bale0 TUN interface immediately (kernel NAT mode) or
+// stays TUN-less (userspace NAT mode).
+console.log(`[Tunnel] mode=${TUNNEL_MODE} nat-mode=${NAT_MODE} nat-debug=${NAT_DEBUG}`);
+// Verbose NAT logs — needs to flip BEFORE the first tunnel comes up so
+// per-flow log sites pick up the new state on their first hit.
+if (NAT_DEBUG) {
+    try { require('../rust/lktunnel-node').setNatDebug(true); }
+    catch (e) { console.warn(`[Tunnel] couldn't enable NAT debug: ${e.message}`); }
+}
 if (TUNNEL_MODE === 'server') client.tunnel.configure('server');
 
 // Bring the WS up via reconcile() (the Android pattern). For client mode at

@@ -15,10 +15,12 @@ data class LiveKitStats(
 interface DataTransport {
     val isConnected: Boolean
     val hasPeer: Boolean        // true once at least one remote participant is in the room
+    /** Connect to a LiveKit room. Suspends until the room handshake
+     *  completes and a remote peer joins (or fails). After this call
+     *  the caller should pick a mode on the returned tunnel via
+     *  `transport.tunnel?.startServer()` / `startClient()`. */
     suspend fun connect(url: String, token: String)
-    fun send(data: ByteArray)
     fun disconnect()
-    var onData: ((ByteArray) -> Unit)?
     var onDisconnected: (() -> Unit)?
     /** Most recent transport stats, or null until the first successful poll. */
     val lastStats: LiveKitStats? get() = null

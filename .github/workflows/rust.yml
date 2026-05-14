@@ -1,0 +1,96 @@
+name: Rust
+
+# Runs the workspace test + build on every push and PR. The Android
+# and Node-binaries workflows also exercise the same Rust code, but
+# they're slow (webrtc-sys download + cross-compile + APK packaging
+# / pkg packaging), so they only fire on tags. This job is the fast
+# feedback loop — pure cargo test against the lktunnel core and its
+# Node-binding sibling.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is the fast path; macOS catches darwin-specific build
+        # issues in webrtc-sys (CoreAudio / VideoToolbox link flags
+        # etc.) that don't surface on Linux.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # webrtc-sys / livekit transitively need glib, gtk, alsa, pulse,
+      # dbus, udev dev headers on Linux. macOS gets these via Homebrew
+      # tooling already installed on the runner.
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev \
+            libglib2.0-dev libgtk-3-dev \
+            libpulse-dev libasound2-dev \
+            libdbus-1-dev libudev-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            lktunnel-rust/patches/.cache
+            lktunnel-rust/target
+            bale-vpn-node/rust/target
+          key: rust-test-${{ runner.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'bale-vpn-node/rust/lktunnel-node/Cargo.toml', 'lktunnel-rust/patches/*.patch') }}
+          restore-keys: |
+            rust-test-${{ runner.os }}-
+
+      - name: Apply vendor crate patches
+        working-directory: lktunnel-rust
+        run: ./patches/apply.sh
+
+      # Core workspace — what every consumer (CLI, Android shim, Node
+      # binding) ultimately links against. Test runs first because
+      # it's the only step that actually catches behaviour
+      # regressions; `cargo build` would still succeed on a broken
+      # unit test.
+      - name: cargo test --workspace
+        working-directory: lktunnel-rust
+        run: cargo test --workspace --release
+
+      - name: cargo build --workspace
+        working-directory: lktunnel-rust
+        run: cargo build --workspace --release
+
+      - name: cargo clippy --workspace
+        working-directory: lktunnel-rust
+        # `-D warnings` would be nice but the vendored livekit crate
+        # ships 34 warnings of its own; we only want to fail on
+        # warnings we introduced. `-A clippy::all` then explicit
+        # opt-ins is the inverse approach — for now just run clippy
+        # for visibility, don't gate the build on it.
+        run: cargo clippy --workspace --release --no-deps
+
+      # The Node-side workspace pulls in the same lktunnel crate as
+      # a path dep plus the napi-rs binding. Building it confirms the
+      # FFI surface (#[napi] macro expansion, cdylib link) is healthy
+      # before the node-binaries workflow tries to ship a release.
+      - name: cargo build (node binding workspace)
+        working-directory: bale-vpn-node/rust
+        run: cargo build --workspace --release

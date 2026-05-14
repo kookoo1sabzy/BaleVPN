@@ -1,34 +1,38 @@
 package ai.bale.proxy
 
 import ai.bale.proxy.bale.BaleWsClient
-import ai.bale.proxy.livekit.AndroidLiveKitTransport
-import ai.bale.proxy.tunnel.TunnelConfig
-import ai.bale.proxy.tunnel.TunnelManager
+import ai.bale.proxy.tunnel.BaleClientSignaling
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
-import android.system.ErrnoException
 import android.system.Os
-import android.system.OsConstants
-import android.system.StructPollfd
 import android.util.Log
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
-import java.io.FileOutputStream
+import java.io.FileDescriptor
 
 private const val TAG = "BaleProxy"
 
 class BaleVpnService : VpnService() {
 
-    private var tunFd:    ParcelFileDescriptor? = null
-    private var tunnel:   TunnelManager?        = null
-    private var wakeLock: PowerManager.WakeLock? = null
+    private var tunFd:     ParcelFileDescriptor? = null
+    /** The signaling strategy that owns the call-setup leg (Bale RPC handshake
+     *  vs. direct URL+token). Resolved from intent extras in onStartCommand and
+     *  injected into [startVpn]; nulled by [stopVpn]. */
+    private var signaling: BaleClientSignaling?       = null
+    /** The LiveKit data-channel transport. Always present once startVpn has
+     *  begun setup, regardless of which BaleClientSignaling produced the room. */
+    private var transport: LkTunnel?            = null
+    private var wakeLock:  PowerManager.WakeLock? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    @Volatile private var stopped = false
 
     companion object {
         const val EXTRA_PEER_ID   = "peerId"
@@ -38,10 +42,18 @@ class BaleVpnService : VpnService() {
         private const val CHANNEL  = "vpn"
         private const val ALERT_CHANNEL  = "vpn_alerts"
         private const val ALERT_NOTIF_ID = 2
-        var isRunning   = false
-        var isConnected = false
+        // @Volatile — both flags are written from the service's
+        // Dispatchers.Default coroutines (startVpn / stopVpn /
+        // onPermanentDisconnect) and read from the Main-thread UI
+        // poller. Without the barrier the UI sees stale `true` after
+        // a permanent disconnect, the Disconnect button persists, and
+        // tapping it just bounces an ACTION_STOP intent off a dead
+        // service that no longer touches these flags.
+        @Volatile var isRunning   = false
+        @Volatile var isConnected = false
         @Volatile var rxPkts: Long = 0; @Volatile var rxBytes: Long = 0
         @Volatile var txPkts: Long = 0; @Volatile var txBytes: Long = 0
+
 
         // Public IPv4 CIDR blocks: 0.0.0.0/0 minus RFC1918, loopback, link-local.
         val PUBLIC_IPV4_ROUTES = listOf(
@@ -59,38 +71,75 @@ class BaleVpnService : VpnService() {
             "192.192.0.0" to 10, "193.0.0.0" to 8, "194.0.0.0" to 7, "196.0.0.0" to 6,
             "200.0.0.0" to 5, "208.0.0.0" to 4,
         )
+
+        /** Live reference to the running VPN's transport, so mid-session
+         *  preference flips (Advanced → Stay in room) reach the
+         *  currently-attached tunnel without waiting for a fresh
+         *  startVpn. Set by `startVpn` after `transport.connect`,
+         *  cleared by `stopVpn`. */
+        @Volatile private var liveTransport: LkTunnel? = null
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            Log.d(TAG, "VpnService: received STOP action")
-            stopVpn(); return START_NOT_STICKY
+            Log.d(TAG, "VpnService: received STOP action (stopped=$stopped isRunning=$isRunning)")
+            stopVpn()
+            // Re-entrancy guard: stopVpn() returns early if `stopped` was
+            // already set by a prior call (e.g. startVpn's finally block,
+            // onPermanentDisconnect). When the user later presses the
+            // Disconnect button, the STOP intent must still tear the
+            // service down and clear the UI flags — otherwise the button
+            // appears to "do nothing" because the service is in a
+            // half-shut state. Force-clear flags and stopSelf() here
+            // unconditionally so the UI poll observes the off state and
+            // the system actually destroys the service.
+            isRunning = false
+            isConnected = false
+            stopSelf()
+            return START_NOT_STICKY
         }
 
-        val prefs    = getSharedPreferences("config", MODE_PRIVATE)
-        val peerId   = intent?.getIntExtra(EXTRA_PEER_ID, 0)?.takeIf { it != 0 }
-            ?: prefs.getString("peerId",   "")?.toIntOrNull()
-            ?: run { Log.d(TAG, "VpnService: no peerId available, aborting"); return START_NOT_STICKY }
-        val peerType = intent?.getIntExtra(EXTRA_PEER_TYPE, 1)
-            ?: prefs.getString("peerType", "1")?.toIntOrNull() ?: 1
-        Log.d(TAG, "VpnService: onStartCommand peerId=$peerId peerType=$peerType")
+        val signaling = signalingFromIntent(intent) ?: run {
+            Log.d(TAG, "VpnService: no signaling available, aborting")
+            return START_NOT_STICKY
+        }
 
         isRunning = true
         startForeground(NOTIF_ID, buildNotification())
         val pm = getSystemService(PowerManager::class.java)
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BaleProxy:VpnWakeLock").also { it.acquire() }
-        scope.launch { startVpn(peerId, peerType) }
+        scope.launch { startVpn(signaling) }
         return START_STICKY
     }
 
-    // Lazy WS resolver: brings the BaleConnection back up if the lifecycle observer
-    // has torn it down (e.g., app was backgrounded and the LiveKit channel later
-    // dropped, kicking off a TunnelManager reconnect attempt). Returns null only if
-    // we genuinely have nothing to work with (no token saved).
+    /** Build the Bale [BaleClientSignaling] strategy from intent extras / prefs.
+     *  Returns null if there's no peer to dial, which short-circuits the
+     *  service startup. */
+    private fun signalingFromIntent(intent: Intent?): BaleClientSignaling? {
+        val prefs    = getSharedPreferences("config", MODE_PRIVATE)
+        val peerId   = intent?.getIntExtra(EXTRA_PEER_ID, 0)?.takeIf { it != 0 }
+            ?: prefs.getString("peerId", "")?.toIntOrNull()
+            ?: return null
+        val peerType = intent?.getIntExtra(EXTRA_PEER_TYPE, 1)
+            ?: prefs.getString("peerType", "1")?.toIntOrNull() ?: 1
+        Log.d(TAG, "VpnService: injecting BaleClientSignaling peer=$peerId type=$peerType")
+        return BaleClientSignaling(
+            getBale       = ::resolveWs,
+            peerId        = peerId,
+            peerType      = peerType,
+            log           = { msg -> Log.d(TAG, msg) },
+            onTunnelReady = { BaleConnection.reconcile() },
+        )
+    }
+
+    // Lazy WS resolver — brings the BaleConnection back up if the lifecycle
+    // observer has torn it down (e.g., app was backgrounded). Used by
+    // BaleClientSignaling; not relevant for DirectSignaling.
+    //
+    // Bypasses reconcile because reconcile's rule says "client mode + VPN
+    // running → WS down", which is exactly the state we're in. We need WS
+    // briefly for signaling, then onTunnelReady → reconcile drops it again.
     private suspend fun resolveWs(): BaleWsClient? {
-        // Bypass reconcile here — its rule says "client mode + VPN running → WS down",
-        // which is exactly the state we're in. We need WS *briefly* for signaling.
-        // After connect() returns, onTunnelReady → reconcile() drops it again.
         if (BaleConnection.client == null) {
             val token = getSharedPreferences("config", MODE_PRIVATE).getString("token", "").orEmpty()
             if (token.isEmpty()) { Log.e(TAG, "VPN: no saved token"); return null }
@@ -100,11 +149,17 @@ class BaleVpnService : VpnService() {
         return BaleConnection.client
     }
 
-    private suspend fun startVpn(peerId: Int, peerType: Int) {
+    /** VPN bring-up. The injected [signaling] handles the call-setup leg
+     *  (Bale RPC handshake); everything from the native session id and TUN
+     *  forward is identical regardless of how the call was established. */
+    private suspend fun startVpn(signaling: BaleClientSignaling) {
+        this.signaling = signaling
         try {
-            Log.d(TAG, "VPN: starting (peer=$peerId type=$peerType)")
+            Log.d(TAG, "VPN: starting (${signaling::class.simpleName})")
 
-            // 1. Bring the WS up and wait for it to finish handshaking
+            // Pre-flight the WS so a stuck handshake aborts silently instead of
+            // tripping the permanent-disconnect alert from signaling.connect.
+            // The user already sees the WS status indicator in the UI.
             val ws = resolveWs() ?: return
             if (!ws.ready) {
                 var retries = 0
@@ -113,45 +168,10 @@ class BaleVpnService : VpnService() {
             }
             Log.d(TAG, "VPN: WS ready")
 
-            // 2. Establish TUN interface — DNS goes to server (NAT handles it)
-            val builder = Builder()
-                .setSession("Bale VPN")
-                .addAddress("10.8.0.2", 24)
-                .addDnsServer("8.8.8.8")
-                .addDnsServer("217.218.155.155") // Iran's DNS server
-                .setMtu(1500)
-                .addDisallowedApplication(packageName)
-            for ((addr, prefix) in PUBLIC_IPV4_ROUTES) builder.addRoute(addr, prefix)
-            builder.addRoute("::", 0)
-            val fd = builder.establish() ?: run { Log.e(TAG, "VPN: TUN establish failed"); return }
-            tunFd = fd
-            Log.d(TAG, "VPN: TUN up (10.8.0.2/24)")
+            val transport = LkTunnel()
+            this.transport = transport
 
-            // 3. Wire up TunnelManager. resolveWs runs fresh on every (re)connect
-            // attempt so a backgrounded-then-dropped session can heal itself; the
-            // onTunnelReady callback hands WS state back to reconcile() once
-            // signaling is done so the WS drops out from under us when not needed.
-            val mgr = TunnelManager(
-                getBale       = ::resolveWs,
-                log           = { msg -> Log.d(TAG, msg) },
-                newTransport  = { AndroidLiveKitTransport(applicationContext) },
-                onTunnelReady = { BaleConnection.reconcile() },
-            )
-            tunnel  = mgr
-            mgr.config = TunnelConfig(serverPeerId = peerId, serverPeerType = peerType)
-
-            // 4. Wire inject callback: packets from server → TUN
-            val out = FileOutputStream(fd.fileDescriptor)
-            rxPkts = 0; rxBytes = 0; txPkts = 0; txBytes = 0
-            mgr.onPacket = { pkt ->
-                try {
-                    txBytes += pkt.size; txPkts++
-                    out.write(pkt)
-                } catch (_: Exception) {}
-            }
-
-            // 5. Call the peer → get LiveKit credentials → join room
-            mgr.onPermanentDisconnect = { rejected ->
+            signaling.onPermanentDisconnect = { rejected ->
                 Log.d(TAG, "VPN: permanent disconnect — stopping service (rejected=$rejected)")
                 // High-importance notification (audible) — the user may have
                 // backgrounded the app. Tap routes back to MainActivity so they
@@ -163,104 +183,166 @@ class BaleVpnService : VpnService() {
                 showAlert(title, text)
                 scope.launch { stopVpn() }
             }
-            // Single attempt — no auto-retry. On failure, TunnelManager has
-            // already fired onPermanentDisconnect (which posts the alert
-            // notification and stops the VPN); the user retries by tapping it.
-            if (!mgr.connect()) { Log.e(TAG, "VPN: WebRTC tunnel failed"); return }
+
+            // Dial the call BEFORE touching TUN — if we establish TUN first,
+            // apps route into a half-up VPN whose tunnel isn't ready yet,
+            // packets queue, TCP SYNs time out. The signaling impl already
+            // fired onPermanentDisconnect on failure, so we just return.
+            if (!signaling.connect(transport)) {
+                Log.e(TAG, "VPN: signaling.connect returned false"); return
+            }
             isConnected = true
-            Log.d(TAG, "VPN: connected ✓")
 
-            // 6. Read loop: raw IP packets from TUN → server via LiveKit LOSSY.
+            // Establish TUN — tunnel is up and ready to carry packets.
+            // Client mode is implied by `attachTun`; no separate call needed.
             //
-            // The VpnService TUN fd on this Android version is in O_NONBLOCK mode and
-            // refuses to be cleared with fcntl(F_SETFL) (the driver reapplies the flag).
-            // So we use the canonical Linux pattern: poll(2) waits in the kernel for
-            // POLLIN, then read(2) is guaranteed to return data immediately. This is
-            // efficient (no busy-looping, no spinning on EAGAIN) and works regardless
-            // of the fd's blocking mode.
-            val tunFdNative = fd.fileDescriptor
-            val pollFd = StructPollfd().apply {
-                this.fd  = tunFdNative
-                events   = OsConstants.POLLIN.toShort()
-            }
-            val pollFds = arrayOf(pollFd)
-            val buf     = ByteArray(65536)
-            Log.d(TAG, "VPN: entering TUN read loop (scope.isActive=${scope.isActive})")
-            while (scope.isActive) {
-                // Wait for data. 1 s timeout so we periodically re-check scope.isActive
-                // / isRunning and can exit cleanly if stopVpn flips them while we're
-                // parked in poll().
-                val ready = try {
-                    withContext(Dispatchers.IO) { Os.poll(pollFds, 1_000) }
-                } catch (e: ErrnoException) {
-                    if (e.errno == OsConstants.EINTR) continue
-                    if (!isRunning || e.errno == OsConstants.EBADF) {
-                        Log.d(TAG, "VPN: TUN poll interrupted by shutdown (errno=${e.errno})"); break
-                    }
-                    throw e
-                }
-                if (ready == 0) continue                                   // timed out, loop and re-check
-                if ((pollFd.revents.toInt() and OsConstants.POLLIN) == 0) continue
+            // Bypass the VPN for our own app via addDisallowedApplication:
+            // every socket the app opens (Bale WS, LK signaling over Rust,
+            // LK media UDP via libwebrtc, gRPC-web auth) skips the TUN
+            // entirely. Required because the Rust LiveKit SDK doesn't
+            // expose a per-socket protect() hook or
+            // networkIgnoreMask = ADAPTER_TYPE_VPN, so we can't selectively
+            // bypass control-plane sockets the way we used to with the
+            // Kotlin LK SDK. Coarse but correct: nothing the app initiates
+            // ever loops through its own VPN.
+            //
+            // SOCKS5-forwarded destination sockets opened from this app
+            // therefore also bypass — LAN clients SOCKS5-ing through us
+            // reach destinations via the device's underlying WiFi/cellular
+            // directly, not via the Bale tunnel. Forcing them through the
+            // TUN with android_setsocknetwork() doesn't work: the bound
+            // socket exits TUN with src=WiFi-IP (no VPN address for a
+            // disallowed-app socket), and TUN-arrived replies are never
+            // delivered to the disallowed-app socket.
+            // IPv4-only carrier, IPv6 black-holed at the route layer to
+            // prevent leakage. We deliberately don't `addAddress(<v6>, …)`
+            // because Samsung Knox-patched devices reject every IPv6
+            // address we've tried (ULA `fd00::2`, doc-prefix `2001:db8::2`)
+            // at the JNI gate with `VpnJni: Invalid address`.
+            //
+            // `addRoute("::", 0)` steers v6 traffic into `tun0` so the
+            // device's underlying interface (WiFi / cellular) can't
+            // carry it — without this, v6 packets would just bypass
+            // the VPN entirely. With the route installed but no v6
+            // source address on the TUN, the kernel's source-address
+            // selection fails at `connect()` time with
+            // `EADDRNOTAVAIL`. Apps see the v6 attempt fail
+            // immediately and Happy Eyeballs falls back to v4 within
+            // ms. No leak, fast fallback.
+            //
+            // MTU sized to fit our payload inside a single Opus RTP
+            // packet. Opus RTP (RFC 7587) is one-Opus-frame-per-packet
+            // — no fragmentation framing — and the practical max
+            // payload is ~1275 B. Our wire frame is `FRAME_TYPE_IP`
+            // (1 B) + IP packet, so an MTU of 1200 keeps us safely
+            // below the Opus ceiling with headroom for RTP/SRTP/UDP/IP
+            // overhead on the wire.
+            val builder = Builder()
+                .setSession("Bale VPN")
+                .addAddress("10.8.0.2", 24)
+                .addRoute("::", 0)
+                .addDnsServer("8.8.8.8")
+                .addDnsServer("217.218.155.155") // Iran's DNS server
+                .setMtu(1000)
+                .addDisallowedApplication(packageName)
 
-                val n = try {
-                    Os.read(tunFdNative, buf, 0, buf.size)
-                } catch (e: ErrnoException) {
-                    if (e.errno == OsConstants.EAGAIN) continue
-                    if (e.errno == OsConstants.EINTR) continue
-                    if (!isRunning || e.errno == OsConstants.EBADF) {
-                        Log.d(TAG, "VPN: TUN read interrupted by shutdown (errno=${e.errno})"); break
+            for ((addr, prefix) in PUBLIC_IPV4_ROUTES) builder.addRoute(addr, prefix)
+
+            val fd = builder.establish() ?: run { Log.e(TAG, "VPN: TUN establish failed"); return }
+            tunFd = fd
+            Log.d(TAG, "VPN: TUN up (10.8.0.2/24)")
+
+            // ParcelFileDescriptor.detachFd transfers fd ownership to
+            // native; we must NOT call tunFd.close() any more. The
+            // tunnel's Drop (on close()) closes the fd as part of
+            // native teardown.
+            transport.attachTun(fd.detachFd())
+            tunFd = null
+            rxPkts = 0; rxBytes = 0; txPkts = 0; txBytes = 0
+            liveTransport = transport
+            Log.d(TAG, "VPN: native bridge attached")
+
+            // Poll the native counters so MainActivity's 500 ms tick can read
+            // them from the companion fields.
+            scope.launch {
+                while (isActive) {
+                    val t = transport ?: break
+                    val s = t.stats()
+                    if (s != null && s.size == 4) {
+                        // rx = client→server (TUN→DC) → UI "↑ uploaded"
+                        // tx = server→client (DC→TUN) → UI "↓ downloaded"
+                        rxPkts = s[0]; rxBytes = s[1]
+                        txPkts = s[2]; txBytes = s[3]
                     }
-                    throw e
-                }
-                if (n < 0) {
-                    Log.w(TAG, "VPN: TUN read returned n=$n — exiting loop (isRunning=$isRunning isConnected=$isConnected)")
-                    break
-                }
-                if (n == 0) continue
-                rxBytes += n; rxPkts++
-                // IPv6: reject immediately with ICMPv6 Destination Unreachable so apps
-                // fall back to IPv4 fast instead of waiting for TCP timeout.
-                if (n >= 40 && (buf[0].toInt() and 0xF0) == 0x60) {
-                    rejectIpv6(buf, n, out)
-                } else {
-                    // Pass (buf, 0, n) instead of buf.copyOf(n) — the lk-frame
-                    // alloc inside sendPacket absorbs the slice, saving one
-                    // full-payload copy per packet on the hottest path.
-                    mgr.sendPacket(buf, 0, n)
+                    delay(500)
                 }
             }
-            Log.d(TAG, "VPN: TUN read loop exited cleanly (scope.isActive=${scope.isActive})")
+
+            // (SOCKS5-from-UI option removed; BaleSocks5Service still
+            // exists in the codebase but is never started from here.)
+
+            // Park until cancelled. The native dispatcher is doing all the
+            // per-packet work; we keep the service alive so the foreground
+            // notification, wake-lock, and signaling callbacks stay in place.
+            Log.d(TAG, "VPN: connected ✓ — yielding to native dispatcher")
+            try {
+                while (scope.isActive) delay(60_000)
+            } catch (_: CancellationException) { /* stopVpn cancels us */ }
         } catch (e: CancellationException) {
             Log.d(TAG, "VPN: startVpn cancelled (${e.message})")
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "startVpn: exception: ${e::class.simpleName}: ${e.message}", e)
         } finally {
-            Log.d(TAG, "startVpn: finally block — calling stopVpn (isRunning=$isRunning)")
+            Log.d(TAG, "startVpn: finally — calling stopVpn (isRunning=$isRunning)")
             stopVpn()
         }
     }
 
+    @Synchronized
     private fun stopVpn() {
+        // Idempotent: stopVpn is called from at least three places that can
+        // race — startVpn()'s finally block, onPermanentDisconnect, and
+        // onDestroy. Without this guard, the second caller hits
+        // `WakeLock under-locked` because the ref-counted release goes
+        // negative once the first caller has already released it.
+        if (stopped) return
+        stopped = true
         Log.d(TAG, "stopVpn: isRunning=$isRunning isConnected=$isConnected")
         isRunning   = false
         isConnected = false
-        wakeLock?.release(); wakeLock = null
-        tunnel?.stop()
+        try { wakeLock?.release() } catch (_: Exception) {}
+        wakeLock = null
+        // transport.disconnect() closes the LkTunnel handle, whose
+        // Drop tears down the NAT/TUN session and the LK side in one
+        // shot (closes the TUN fd, aborts the per-tunnel task, fires
+        // Room::close). The local tunFd is only non-null in the
+        // window before detachFd transferred ownership.
+        signaling?.stop();      signaling = null
+        transport?.disconnect(); transport = null
+        liveTransport = null
         tunFd?.close(); tunFd = null
         scope.coroutineContext.cancelChildren()
+        // SOCKS5 server is meaningful only while VPN is up — its destination
+        // sockets route via the TUN by default; without VPN they'd silently
+        // fall back to the underlying network. Stop it explicitly.
+        if (BaleSocks5Service.isRunning) {
+            startService(Intent(this, BaleSocks5Service::class.java)
+                .setAction(BaleSocks5Service.ACTION_STOP))
+        }
         // VPN no longer running; let reconcile re-apply the foreground rule
         // (so the WS comes back up if the user is still in the app).
         BaleConnection.reconcile()
         stopSelf()
     }
 
+
     override fun onDestroy() { Log.d(TAG, "VpnService: onDestroy"); stopVpn(); scope.cancel(); super.onDestroy() }
 
     // ── IPv6 rejection ────────────────────────────────────────────────────────────
     // Send ICMPv6 Destination Unreachable (no route) so apps fail fast and use IPv4.
 
-    private fun rejectIpv6(pkt: ByteArray, len: Int, out: FileOutputStream) {
+    private fun rejectIpv6(pkt: ByteArray, len: Int, tunFd: FileDescriptor) {
         if (len < 40) return
         // Never reply to an ICMPv6 error (types 0–127) to avoid error loops.
         val nextHdr = pkt[6].toInt() and 0xFF
@@ -275,7 +357,8 @@ class BaleVpnService : VpnService() {
         pkt.copyInto(icmp, 8, 0, excerptLen)
         val pseudo = pseudoV6(dstIp, srcIp, 58, icmpLen)
         putU16(icmp, 2, checksum(pseudo + icmp))
-        try { out.write(ipv6Header(dstIp, srcIp, 58, icmpLen) + icmp) } catch (_: Exception) {}
+        val reply = ipv6Header(dstIp, srcIp, 58, icmpLen) + icmp
+        try { Os.write(tunFd, reply, 0, reply.size) } catch (_: Exception) {}
     }
 
     private fun ipv6Header(src: String, dst: String, nextHdr: Int, payLen: Int): ByteArray {

@@ -55,7 +55,6 @@ Rows are grouped (with divider lines) into **connected**, **allowed offline**, a
 Per-row actions:
 - **Disconnect** — kicks the current session only. There's no auto-retry from the client app — the caller has to manually re-initiate from their side. If they're still on the allow-list, that new call is auto-accepted.
 - **Remove** — drops them from the allow-list and kicks the active session. Future calls go to the pending notification (no auto-accept), but the caller isn't blocked.
-- **Limit** — set per-direction kbps cap, 1–1000. Default is 500 kbps. Persists for admitted callers; session-only otherwise.
 - **Stats** — opens a per-client detail screen with live RTT, retransmits / TLP fires / SACK losses, congestion-window averages, TCP flow-state breakdown, and incoming-queue depth.
 - **Unblock** — only on blocked rows; removes the caller from the block-list.
 
@@ -65,7 +64,7 @@ Action-bar overflow:
 
 <p align="center"><img src="screens/06-manage-clients.jpg" alt="Manage clients" width="320"></p>
 
-All settings (allow-list, block-list, per-caller caps, max-clients) persist in `SharedPreferences("config")` across app restarts and device reboots. Clear them via Settings → Apps → Storage → Clear data.
+All settings (allow-list, block-list, max-clients) persist in `SharedPreferences("config")` across app restarts and device reboots. Clear them via Settings → Apps → Storage → Clear data.
 
 To stop the server, press the **Disconnect** button on the server screen. This kicks every active client and stops accepting new incoming calls. Press **Connect** to resume.
 

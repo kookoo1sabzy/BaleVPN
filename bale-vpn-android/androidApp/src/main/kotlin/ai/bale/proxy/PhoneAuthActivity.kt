@@ -1,6 +1,7 @@
 package ai.bale.proxy
 
 import ai.bale.proxy.bale.BaleAuthClient
+import ai.bale.proxy.net.AppHttp
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
@@ -11,9 +12,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.edit
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.textfield.TextInputEditText
-import io.ktor.client.*
-import io.ktor.client.engine.okhttp.*
-import io.ktor.client.plugins.websocket.*
 import kotlinx.coroutines.*
 
 class PhoneAuthActivity : BaseActivity() {
@@ -28,8 +26,7 @@ class PhoneAuthActivity : BaseActivity() {
 
     private val prefs  by lazy { getSharedPreferences("config", MODE_PRIVATE) }
     private val scope  = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val http   = HttpClient(OkHttp) { install(WebSockets) }
-    private val client = BaleAuthClient(http)
+    private val client = BaleAuthClient(AppHttp.client)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -86,5 +83,5 @@ class PhoneAuthActivity : BaseActivity() {
         }
     }
 
-    override fun onDestroy() { super.onDestroy(); scope.cancel(); http.close() }
+    override fun onDestroy() { super.onDestroy(); scope.cancel() }
 }

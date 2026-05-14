@@ -1,0 +1,65 @@
+diff -urN a/src/room/track/local_audio_track.rs b/src/room/track/local_audio_track.rs
+--- a/src/room/track/local_audio_track.rs	2006-07-24 03:21:28
++++ b/src/room/track/local_audio_track.rs	2026-05-19 12:42:13
+@@ -145,7 +145,11 @@
+         self.inner.events.lock().unmuted.replace(Box::new(f));
+     }
+ 
+-    pub(crate) fn transceiver(&self) -> Option<RtpTransceiver> {
++    /// The RtpTransceiver this track is bound to once `publish_track`
++    /// has set it. Exposed publicly so external callers can reach the
++    /// underlying RtpSender — needed to install a custom
++    /// FrameTransformer (e.g. raw-bytes-over-RTP for tunnels).
++    pub fn transceiver(&self) -> Option<RtpTransceiver> {
+         self.inner.info.read().transceiver.clone()
+     }
+ 
+diff -urN a/src/room/track/local_video_track.rs b/src/room/track/local_video_track.rs
+--- a/src/room/track/local_video_track.rs	2006-07-24 03:21:28
++++ b/src/room/track/local_video_track.rs	2026-05-19 12:42:13
+@@ -150,7 +150,11 @@
+         self.inner.events.lock().unmuted.replace(Box::new(f));
+     }
+ 
+-    pub(crate) fn transceiver(&self) -> Option<RtpTransceiver> {
++    /// The RtpTransceiver this track is bound to once `publish_track`
++    /// has set it. Exposed publicly so external callers can reach the
++    /// underlying RtpSender — needed to install a custom
++    /// FrameTransformer (e.g. raw-bytes-over-RTP for tunnels).
++    pub fn transceiver(&self) -> Option<RtpTransceiver> {
+         self.inner.info.read().transceiver.clone()
+     }
+ 
+diff -urN a/src/room/track/remote_audio_track.rs b/src/room/track/remote_audio_track.rs
+--- a/src/room/track/remote_audio_track.rs	2006-07-24 03:21:28
++++ b/src/room/track/remote_audio_track.rs	2026-05-19 12:42:13
+@@ -106,8 +106,11 @@
+         self.inner.events.lock().unmuted.replace(Box::new(f));
+     }
+ 
+-    #[allow(dead_code)]
+-    pub(crate) fn transceiver(&self) -> Option<RtpTransceiver> {
++    /// The RtpTransceiver this track is bound to once `TrackSubscribed`
++    /// has set it. Exposed publicly so external callers can reach the
++    /// underlying RtpReceiver — needed to install a custom
++    /// FrameTransformer (e.g. raw-bytes-over-RTP for tunnels).
++    pub fn transceiver(&self) -> Option<RtpTransceiver> {
+         self.inner.info.read().transceiver.clone()
+     }
+ 
+diff -urN a/src/room/track/remote_video_track.rs b/src/room/track/remote_video_track.rs
+--- a/src/room/track/remote_video_track.rs	2006-07-24 03:21:28
++++ b/src/room/track/remote_video_track.rs	2026-05-19 12:42:13
+@@ -120,7 +120,11 @@
+         self.inner.events.lock().unmuted.replace(Box::new(f));
+     }
+ 
+-    pub(crate) fn transceiver(&self) -> Option<RtpTransceiver> {
++    /// The RtpTransceiver this track is bound to once `TrackSubscribed`
++    /// has set it. Exposed publicly so external callers can reach the
++    /// underlying RtpReceiver — needed to install a custom
++    /// FrameTransformer (e.g. raw-bytes-over-RTP for tunnels).
++    pub fn transceiver(&self) -> Option<RtpTransceiver> {
+         self.inner.info.read().transceiver.clone()
+     }
+ 

@@ -1,0 +1,27 @@
+# napi-rs binding for the Linux-server-side Node app. Mirrors
+# `bale-vpn-android/rust/lktunnel-android/` in role: a thin shim over
+# the portable `lktunnel` core, exposing a JS-callable Tunnel handle
+# plus Linux-only TUN open/configure helpers (ported from the C++
+# tun_addon so all native code on the Node side is Rust).
+[package]
+name              = "lktunnel-node"
+version           = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description       = "napi-rs bindings exposing lktunnel to the Node server."
+
+[lib]
+# napi-rs requires cdylib so node can dlopen the produced .so/.dylib
+# as a .node module.
+crate-type = ["cdylib"]
+
+[dependencies]
+lktunnel    = { path = "../../../lktunnel-rust/lktunnel" }
+napi        = { version = "2", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive = "2"
+log         = "0.4"
+env_logger  = "0.11"
+libc        = "0.2"
+
+[build-dependencies]
+napi-build = "2"
