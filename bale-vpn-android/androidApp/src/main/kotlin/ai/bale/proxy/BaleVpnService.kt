@@ -119,7 +119,7 @@ class BaleVpnService : VpnService() {
                 .addAddress("10.8.0.2", 24)
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("217.218.155.155") // Iran's DNS server
-                .setMtu(1500)
+                .setMtu(1200)
                 .addDisallowedApplication(packageName)
             for ((addr, prefix) in PUBLIC_IPV4_ROUTES) builder.addRoute(addr, prefix)
             builder.addRoute("::", 0)

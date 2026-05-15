@@ -39,12 +39,21 @@ function open(name) {
 // is point-to-point and has a different ifaliasreq layout than Linux), then
 // add an explicit subnet route — the P2P ifconfig only installs a host route
 // for the peer address, not the whole client subnet.
-function configure(name, ip, prefix) {
+//
+// mtu (optional): when provided, sets the interface MTU before bringing it up.
+// Pass 1200 to prevent double-fragmentation of UDP packets over ADSL/PPPoE
+// links — each bale0 IP fragment stays <=1200 B and fits inside the
+// LiveKit/WebRTC/DTLS envelope (~80 B overhead) without further fragmentation.
+function configure(name, ip, prefix, mtu) {
     if (!addon) throw new Error('TUN addon not built. Run: npm run build-tun');
     if (isDarwin) {
         // Point-to-point: utun needs a peer. .1 → .1 (server is its own peer;
         // clients live on the subnet and reach us via the route below).
         execFileSync('/sbin/ifconfig', [name, 'inet', ip, ip, 'up'], { stdio: 'pipe' });
+        // Set MTU on macOS via ifconfig after bringing the interface up.
+        if (mtu > 0) {
+            execFileSync('/sbin/ifconfig', [name, 'mtu', String(mtu)], { stdio: 'pipe' });
+        }
         // Subnet route: tell the kernel the entire 10.8.0.0/24 is reachable
         // via this utun. Without this, return packets after un-NAT have no
         // route back to the client. Wipe any stale route first.
@@ -52,7 +61,7 @@ function configure(name, ip, prefix) {
         try { execFileSync('/sbin/route', ['-q', '-n', 'delete', '-inet', `${subnet}/${prefix}`], { stdio: 'pipe' }); } catch (_) {}
         execFileSync('/sbin/route', ['-q', '-n', 'add', '-inet', `${subnet}/${prefix}`, '-interface', name], { stdio: 'pipe' });
     } else {
-        addon.configureIf(name, ip, prefix);
+        addon.configureIf(name, ip, prefix, mtu || 0);
     }
 }
 

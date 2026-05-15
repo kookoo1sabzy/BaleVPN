@@ -802,7 +802,7 @@ class TunnelManager {
         const t = tun.open('bale0');
         this._tunFd = t.fd; this._tunName = t.name;
         console.log(`[TUN] Opened ${this._tunName}`);
-        tun.configure(this._tunName, '10.8.0.1', 24);
+        tun.configure(this._tunName, '10.8.0.1', 24, 1200);
         console.log(`[TUN] ${this._tunName} up  10.8.0.1/24`);
         try {
             fs.writeFileSync('/proc/sys/net/ipv4/ip_forward', '1');
@@ -860,7 +860,7 @@ class TunnelManager {
         const t = tun.open();   // kernel picks utunN
         this._tunFd = t.fd; this._tunName = t.name;
         console.log(`[TUN] Opened ${this._tunName}`);
-        tun.configure(this._tunName, '10.8.0.1', 24);
+        tun.configure(this._tunName, '10.8.0.1', 24, 1200);
         console.log(`[TUN] ${this._tunName} up  10.8.0.1/24`);
         try { execSync('sysctl -w net.inet.ip.forwarding=1', { stdio: 'pipe' }); }
         catch (e) { console.warn('[TUN] Could not enable forwarding:', e.message); }
