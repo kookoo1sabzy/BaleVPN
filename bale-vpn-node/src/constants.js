@@ -60,8 +60,8 @@ const PENDING_SWEEP_MS   = 15 * 1000;
 
 // Per-client TUN bandwidth caps (server mode) — match Android.
 // 500 kbps default, 1-second burst.
-const DEFAULT_LIMIT_KBPS = 500;
-const MAX_LIMIT_KBPS     = 1000;
+const DEFAULT_LIMIT_KBPS = 50000;
+const MAX_LIMIT_KBPS     = 100000;
 const THROTTLE_FLAG_MS   = 2000;   // row stays "throttled" 2s after last drop
 
 // Cap on simultaneously-connected clients. Hard limit matches the SNAT pool
