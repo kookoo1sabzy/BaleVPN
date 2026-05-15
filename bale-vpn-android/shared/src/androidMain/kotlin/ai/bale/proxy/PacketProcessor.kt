@@ -18,7 +18,7 @@ package ai.bale.proxy
  *     CLOSE_WAIT → LAST_ACK → TIME_WAIT → CLOSED.
  *   • SYN-ACK retransmission with its own RTO branch (no zombie SYN_RCVD sessions).
  *   • Duplicate-SYN detection: same-ISN SYN re-sends SYN-ACK without recreating session.
- *   • Options: MSS=1460 advertised in SYN-ACK; window scaling (RFC 7323) shift=4 →
+ *   • Options: MSS=1160 advertised in SYN-ACK; window scaling (RFC 7323) shift=4 →
  *     up to 1 MB advertised window; SACK-Permitted + SACK consumption (RFC 2018).
  *   • Loss recovery: RFC 6298 RTO with Karn's algorithm; RFC 5681 fast retransmit
  *     (3 dup-ACK fallback); RFC 6675 IsLost — fast-recovery on the *first* dup-ACK
@@ -149,9 +149,13 @@ private const val SESSION_CHECK_MS = 30_000L
 private const val STATS_SNAPSHOT_MS = 1_000L
 private const val TCP_SLOTS        = 11
 private const val UDP_SLOTS        = 5
-// On-the-wire MSS for the IP packets we synthesize back to the peer (1500-byte MTU minus headers).
-private const val TCP_MSS          = 1460   // 1500 − 20 IP − 20 TCP
-private const val UDP_MSS          = 1472   // 1500 − 20 IP −  8 UDP
+// On-the-wire MSS for the IP packets we synthesize back to the peer.
+// MTU is set to 1200 on the TUN interface to avoid IP fragmentation over
+// ADSL/PPPoE links (PPPoE -8 B → 1492 B physical) once WebRTC DTLS+SCTP
+// overhead (~80 B) is added. 1200 B leaves ~212 B of headroom.
+private const val TUN_MTU          = 1200
+private const val TCP_MSS          = TUN_MTU - 20 - 20  // 1160 — 1200 − IP − TCP
+private const val UDP_MSS          = TUN_MTU - 20 -  8  // 1172 — 1200 − IP − UDP
 
 private val EMPTY = ByteArray(0)
 
@@ -859,7 +863,7 @@ private const val MAX_RTO_RETRIES = 9            // RFC 9293 R2 — close sessio
 private const val PTO_MIN_MS      = 10L          // RFC 8985 §6.2.1 minimum probe-timeout
 
 // ── TCP options we advertise in our SYN-ACK ──────────────────────────────────
-private const val OUR_MSS         = 1460         // 1500-MTU minus IP+TCP headers
+private const val OUR_MSS         = 1160         // 1200-MTU minus IP+TCP headers (matches TCP_MSS)
 private const val OUR_RECV_WSCALE = 4            // RFC 7323 window-scale shift; factor 16 → up to ~1 MB window
 
 private enum class TcpState {
@@ -1849,7 +1853,7 @@ internal fun buildUdpPkt(
     return pkt
 }
 
-// Fragments a UDP datagram into IP fragments that each fit within MTU (≤ 1500 bytes).
+// Fragments a UDP datagram into IP fragments that each fit within MTU (≤ 1200 bytes).
 // The first fragment carries the UDP header; subsequent fragments carry raw payload slices.
 // Each fragment's payload must be a multiple of 8 bytes except the last one (RFC 791).
 internal fun buildUdpFragments(
@@ -1860,7 +1864,7 @@ internal fun buildUdpFragments(
     val id = Random.nextInt(0x10000)
     val result = mutableListOf<ByteArray>()
     // First fragment: IP header (20) + UDP header (8) + up to (UDP_MSS - 8) bytes of payload
-    val firstPayload = UDP_MSS - 8   // 1464 bytes, multiple of 8 ✓
+    val firstPayload = UDP_MSS - 8   // 1164 bytes, multiple of 8 ✓
     val udpTotalLen  = 8 + payloadLen
     // Build first fragment with UDP header
     val frag0 = ByteArray(20 + 8 + firstPayload)
@@ -1878,9 +1882,9 @@ internal fun buildUdpFragments(
     putI32(frag0, 12, sIp); putI32(frag0, 16, dIp)
     putU16(frag0, 10, csumFinish(csumRange(0, frag0, 0, 20)))
     result.add(frag0)
-    // Subsequent fragments: each carries up to 1480 bytes (multiple of 8) of original payload.
+    // Subsequent fragments: each carries up to 1176 bytes (multiple of 8) of original payload.
     // Fragment offset is measured in units of 8 bytes from start of original IP payload (UDP header + data).
-    val fragDataMax = 1480   // 1500 - 20 IP header, and 1480 is divisible by 8
+    val fragDataMax = 1176   // 1200 - 20 IP header = 1180, rounded down to multiple of 8
     var offset8 = (8 + firstPayload) / 8   // offset of next fragment in 8-byte units
     var pos = payloadOff + firstPayload
     while (pos < payloadOff + payloadLen) {
