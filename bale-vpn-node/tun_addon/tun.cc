@@ -41,15 +41,21 @@ Napi::Value OpenTun(const Napi::CallbackInfo &info) {
 
 // Assigns an IPv4 address and brings the interface up via ioctls in the current
 // process — works with setcap cap_net_admin without spawning child processes.
+// Optional 4th argument: mtu (int). When provided, sets the interface MTU via
+// SIOCSIFMTU before bringing the interface up. Set to 1200 on bale0 so large
+// UDP responses are fragmented to <=1200 B before entering the LiveKit/WebRTC
+// tunnel, preventing double-fragmentation over ADSL/PPPoE links on the client.
 Napi::Value ConfigureIf(const Napi::CallbackInfo &info) {
     Napi::Env env = info.Env();
     if (info.Length() < 3 || !info[0].IsString() || !info[1].IsString() || !info[2].IsNumber()) {
-        Napi::TypeError::New(env, "configureIf(name, ip, prefixLen)").ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "configureIf(name, ip, prefixLen[, mtu])").ThrowAsJavaScriptException();
         return env.Null();
     }
     std::string ifname = info[0].As<Napi::String>().Utf8Value();
     std::string ip     = info[1].As<Napi::String>().Utf8Value();
     int prefix         = info[2].As<Napi::Number>().Int32Value();
+    int mtu            = (info.Length() >= 4 && info[3].IsNumber())
+                         ? info[3].As<Napi::Number>().Int32Value() : 0;
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -85,6 +91,17 @@ Napi::Value ConfigureIf(const Napi::CallbackInfo &info) {
         e = errno; close(sock);
         Napi::Error::New(env, std::string("SIOCSIFNETMASK: ") + strerror(e)).ThrowAsJavaScriptException();
         return env.Null();
+    }
+
+    // Set MTU (optional — skipped when mtu <= 0)
+    if (mtu > 0) {
+        initIfr(ifr, ifname);
+        ifr.ifr_mtu = mtu;
+        if (ioctl(sock, SIOCSIFMTU, &ifr) < 0) {
+            e = errno; close(sock);
+            Napi::Error::New(env, std::string("SIOCSIFMTU: ") + strerror(e)).ThrowAsJavaScriptException();
+            return env.Null();
+        }
     }
 
     // Bring up
