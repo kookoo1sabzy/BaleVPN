@@ -15,10 +15,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest,   target: node18-macos-arm64, suffix: macos-arm64, ext: '' }
-          - { os: macos-26-intel, target: node18-macos-x64,   suffix: macos-x64,   ext: '' }
-          - { os: ubuntu-latest,  target: node18-linux-x64,   suffix: linux-x64,   ext: '' }
-          - { os: windows-latest, target: node18-win-x64,     suffix: win-x64,     ext: '.exe' }
+          - { os: macos-latest,   suffix: macos-arm64, ext: '' }
+          - { os: macos-13,       suffix: macos-x64,   ext: '' }
+          - { os: ubuntu-latest,  suffix: linux-x64,   ext: '' }
+          - { os: windows-latest, suffix: win-x64,     ext: '.exe' }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -46,14 +46,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build TUN addon
+      # node-datachannel is a native addon — it ships prebuilt binaries via
+      # @mapbox/node-pre-gyp. On the very first `npm ci` the prebuilt for the
+      # current host platform is fetched automatically. No manual build-tun
+      # step is needed for node-datachannel itself.
+      #
+      # The TUN kernel module (tun_addon) is still built on Linux only.
+      - name: Build TUN addon (Linux only)
         if: matrix.os == 'ubuntu-latest'
         run: npm run build-tun
 
       - name: Package binary
         run: |
           npx pkg . \
-            --target ${{ matrix.target }} \
+            --target node18-${{ matrix.suffix }} \
             --output dist/balevpn-${{ steps.ver.outputs.version }}-${{ matrix.suffix }}${{ matrix.ext }}
 
       - name: Upload artifact
