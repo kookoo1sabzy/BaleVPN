@@ -1,0 +1,334 @@
+syntax = "proto3";
+package bale.meet.v1;
+
+// Service: bale.meet.v1.Meet
+service Meet {
+  rpc StartCall (StartCallRequest) returns (StartCallResponse);
+  rpc AcceptCall (AcceptCallRequest) returns (AcceptCallResponse);
+  rpc DiscardCall (DiscardCallRequest) returns (DiscardCallResponse);
+  rpc ReceiveCall (ReceiveCallRequest) returns (ReceiveCallResponse);
+  rpc GetWssURL (GetWssURLRequest) returns (GetWssURLResponse);
+  rpc StartGroupCall (StartGroupCallRequest) returns (StartGroupCallResponse);
+  rpc JoinGroupCall (JoinGroupCallRequest) returns (JoinGroupCallResponse);
+  rpc LeaveGroupCall (LeaveGroupCallRequest) returns (LeaveGroupCallResponse);
+  rpc InviteToCall (InviteToCallRequest) returns (InviteToCallResponse);
+  rpc GetGroupCall (GetGroupCallRequest) returns (GetGroupCallResponse);
+  rpc SubmitCallFeedback (SubmitCallFeedbackRequest) returns (SubmitCallFeedbackResponse);
+  rpc SendCallReaction (SendCallReactionRequest) returns (SendCallReactionResponse);
+  rpc GetCallLogs (GetCallLogsRequest) returns (GetCallLogsResponse);
+  rpc DeleteCallLogs (DeleteCallLogsRequest) returns (DeleteCallLogsResponse);
+  rpc GetOngoingCalls (GetOngoingCallsRequest) returns (GetOngoingCallsResponse);
+  rpc MuteParticipant (MuteParticipantRequest) returns (MuteParticipantResponse);
+  rpc RemoveParticipant (RemoveParticipantRequest) returns (RemoveParticipantResponse);
+  rpc StartRecording (StartRecordingRequest) returns (StartRecordingResponse);
+  rpc StopRecording (StopRecordingRequest) returns (StopRecordingResponse);
+  rpc UpdateLayout (UpdateLayoutRequest) returns (UpdateLayoutResponse);
+  rpc GenerateCallLink (GenerateCallLinkRequest) returns (GenerateCallLinkResponse);
+  rpc GetCallLinkDetails (GetCallLinkDetailsRequest) returns (GetCallLinkDetailsResponse);
+  rpc AskToJoinCall (AskToJoinCallRequest) returns (AskToJoinCallResponse);
+  rpc AnswerCallJoinRequest (AnswerCallJoinRequestRequest) returns (AnswerCallJoinRequestResponse);
+  rpc SetLinkTitle (SetLinkTitleRequest) returns (SetLinkTitleResponse);
+  rpc StartStream (StartStreamRequest) returns (StartStreamResponse);
+  rpc DeleteStream (DeleteStreamRequest) returns (DeleteStreamResponse);
+  rpc TakeCallAction (TakeCallActionRequest) returns (TakeCallActionResponse);
+  rpc GetCallState (GetCallStateRequest) returns (GetCallStateResponse);
+  rpc SendFanoosEvent (SendFanoosEventRequest) returns (SendFanoosEventResponse);
+}
+
+message StartCallRequest {
+  bytes peer = 1;
+  int64 rid = 2;
+  bool video = 3;
+  bytes internalCall = 4;
+  bytes sipCall = 5;
+  bytes liveKitCall = 6;
+}
+
+message StartCallResponse {
+  bytes call = 1;
+  int32 seq = 3;
+  bytes sipCall = 4;
+  bytes isStream = 5;
+}
+
+message AcceptCallRequest {
+  int64 callId = 1;
+  bytes inviteEnable = 2;
+}
+
+message AcceptCallResponse {
+  bytes call = 1;
+  int32 seq = 3;
+  bytes sipCall = 4;
+  bytes isStream = 5;
+}
+
+message DiscardCallRequest {
+  int64 callId = 1;
+  int32 duration = 2;
+  int32 reason = 3;
+  int32 type = 4;
+}
+
+message DiscardCallResponse {
+  bytes call = 1;
+  int32 seq = 3;
+  bytes sipCall = 4;
+  bytes isStream = 5;
+}
+
+message ReceiveCallRequest {
+  int64 callId = 1;
+}
+
+message GetWssURLRequest {
+  int64 callId = 1;
+}
+
+message GetWssURLResponse {
+  string url = 1;
+}
+
+message StartGroupCallRequest {
+  bytes peer = 1;
+  int64 randomId = 2;
+  bool video = 3;
+  int32 mode = 4;
+}
+
+message StartGroupCallResponse {
+  bytes groupCall = 1;
+  int32 seq = 2;
+}
+
+message JoinGroupCallRequest {
+  int64 callId = 1;
+  bytes name = 2;
+}
+
+message JoinGroupCallResponse {
+  bytes groupCall = 1;
+}
+
+message LeaveGroupCallRequest {
+  int64 callId = 1;
+  bool end = 2;
+}
+
+message LeaveGroupCallResponse {
+  bytes groupCall = 1;
+  int32 seq = 2;
+}
+
+message InviteToCallRequest {
+  int64 callId = 1;
+}
+
+message InviteToCallResponse {
+  repeated bytes peerStates = 1;
+}
+
+message GetGroupCallRequest {
+  bytes peer = 1;
+}
+
+message GetGroupCallResponse {
+  bytes groupCall = 1;
+}
+
+message SubmitCallFeedbackRequest {
+  int64 callId = 1;
+  int32 rate = 2;
+  bytes userOpinion = 3;
+  int32 client = 4;
+  bytes clientVersion = 5;
+  bytes isStream = 7;
+}
+
+message SendCallReactionRequest {
+  int64 callId = 1;
+  string reaction = 2;
+}
+
+message GetCallLogsRequest {
+  bytes pageNumber = 1;
+  bytes pageSize = 2;
+  bytes afterDate = 3;
+  bytes beforeDate = 4;
+}
+
+message GetCallLogsResponse {
+  repeated bytes callLogs = 1;
+  int32 total = 2;
+}
+
+message DeleteCallLogsRequest {
+  repeated bytes callIds = 1;
+  bool all = 2;
+  bool invert = 3;
+}
+
+message GetOngoingCallsRequest {
+  bytes pageNumber = 1;
+  bytes pageSize = 2;
+}
+
+message GetOngoingCallsResponse {
+  repeated bytes callLogs = 1;
+}
+
+message MuteParticipantRequest {
+  int64 callId = 1;
+  string identity = 2;
+  string trackId = 3;
+  bool revokePublishPermission = 4;
+}
+
+message RemoveParticipantRequest {
+  int64 callId = 1;
+  string identity = 2;
+  bool blockFromCall = 3;
+}
+
+message StartRecordingRequest {
+  int64 callId = 1;
+  string layout = 2;
+  int32 quality = 3;
+}
+
+message StopRecordingRequest {
+  int64 callId = 1;
+}
+
+message UpdateLayoutRequest {
+  int64 callId = 1;
+  string requestedLayout = 2;
+}
+
+message GenerateCallLinkRequest {
+  bool isPublic = 1;
+  bytes callId = 2;
+  bytes title = 3;
+}
+
+message GenerateCallLinkResponse {
+  bytes groupCall = 1;
+  int64 linkExpirationPeriod = 2;
+}
+
+message GetCallLinkDetailsRequest {
+  string session = 1;
+}
+
+message GetCallLinkDetailsResponse {
+  bytes groupCall = 1;
+}
+
+message AskToJoinCallRequest {
+  int64 callId = 1;
+  string name = 2;
+}
+
+message AnswerCallJoinRequestRequest {
+  int64 callId = 1;
+  string requesterIdentifier = 2;
+  bool isAllowed = 3;
+}
+
+message SetLinkTitleRequest {
+  string title = 1;
+  bytes callId = 2;
+  bytes linkUrl = 3;
+}
+
+message StartStreamRequest {
+  bytes streamUser = 1;
+  string url = 2;
+  string rtmpServer = 3;
+}
+
+message StartStreamResponse {
+  string streamKey = 1;
+}
+
+message DeleteStreamRequest {
+  bytes streamUser = 1;
+}
+
+message TakeCallActionRequest {
+  int64 callId = 1;
+  bytes lowerHand = 2;
+  bytes raiseHand = 3;
+}
+
+message TakeCallActionResponse {
+  // (no fields extracted — empty or complex message)
+}
+
+message GetCallStateRequest {
+  int64 callId = 1;
+}
+
+message GetCallStateResponse {
+  bytes groupCall = 1;
+}
+
+message AnswerCallJoinRequestResponse {
+  // fields not extracted (shared/external type)
+}
+
+message AskToJoinCallResponse {
+  // fields not extracted (shared/external type)
+}
+
+message DeleteCallLogsResponse {
+  // fields not extracted (shared/external type)
+}
+
+message DeleteStreamResponse {
+  // fields not extracted (shared/external type)
+}
+
+message MuteParticipantResponse {
+  // fields not extracted (shared/external type)
+}
+
+message ReceiveCallResponse {
+  // fields not extracted (shared/external type)
+}
+
+message RemoveParticipantResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SendCallReactionResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SendFanoosEventRequest {
+  // fields not extracted (shared/external type)
+}
+
+message SendFanoosEventResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SetLinkTitleResponse {
+  // fields not extracted (shared/external type)
+}
+
+message StartRecordingResponse {
+  // fields not extracted (shared/external type)
+}
+
+message StopRecordingResponse {
+  // fields not extracted (shared/external type)
+}
+
+message SubmitCallFeedbackResponse {
+  // fields not extracted (shared/external type)
+}
+
+message UpdateLayoutResponse {
+  // fields not extracted (shared/external type)
+}
