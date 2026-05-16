@@ -138,12 +138,14 @@ function isBlockedIp4(ip) {
     return isBlockedOctets(parts[0], parts[1]);
 }
 
-// Resolve a SOCKS5 destination host to an IPv4 address and gate it through
-// the egress filter. Always passes a resolved literal back so the caller
-// hands `net.connect` / `dgram.send` an IP — eliminates a TOCTOU where the
-// downstream socket could re-resolve the hostname to a different (or
-// IPv6) address we hadn't checked. cb(err, addr) — err on DNS failure,
-// IPv6 literal, or blocked address.
+// DNS cache — avoids a round-trip lookup on every new SOCKS5 session to the
+// same host. TTL is 30 s (conservative; game servers rarely rotate IPs faster).
+// The cache is deliberately small (512 entries) so stale entries age out in
+// a long-running process. Negative results (blocked / NXDOMAIN) are NOT cached
+// — a misconfigured app will retry and we don't want to lock it out forever.
+const _dnsCache = new Map();   // host → { addr, expires }
+const DNS_TTL_MS = 30_000;
+
 function resolveAndCheck(host, cb) {
     const v = net.isIP(host);
     if (v === 4) {
@@ -151,9 +153,17 @@ function resolveAndCheck(host, cb) {
         return cb(null, host);
     }
     if (v === 6) return cb(new Error(`IPv6 destinations not supported: ${host}`));
+
+    // Cache hit?
+    const hit = _dnsCache.get(host);
+    if (hit && Date.now() < hit.expires) return cb(null, hit.addr);
+
     dns.lookup(host, { family: 4 }, (err, addr) => {
         if (err) return cb(err);
         if (isBlockedIp4(addr)) return cb(new Error(`destination ${host} (${addr}) blocked by egress filter`));
+        _dnsCache.set(host, { addr, expires: Date.now() + DNS_TTL_MS });
+        // Evict oldest when the cache grows too large.
+        if (_dnsCache.size > 512) _dnsCache.delete(_dnsCache.keys().next().value);
         cb(null, addr);
     });
 }
@@ -960,7 +970,7 @@ class TunnelManager {
             // tiny window before the lookup callback finds it. socket stays
             // null until the resolved address passes the egress filter; the
             // 'D' handler null-guards on sess.socket below.
-            const sess = { key, host, port, socket: null, fromUid, lk: lk || null, txSeq: 0, rxBuf: new Map(), rxNext: 0, dead: false, txBytes: 0, rxBytes: 0 };
+            const sess = { key, host, port, socket: null, fromUid, lk: lk || null, txSeq: 0, rxBuf: new Map(), rxNext: 0, dead: false, txBytes: 0, rxBytes: 0, connectedAt: Date.now() };
             this.sessions.set(key, sess);
 
             resolveAndCheck(host, (err, addr) => {
@@ -974,7 +984,28 @@ class TunnelManager {
                 const socket = net.connect({ host: addr, port });
                 sess.socket = socket;
                 socket.setNoDelay(true);
+                // Keep-alive: detect dead connections within 15 s instead of
+                // waiting for OS defaults (~2 h). Critical for game sessions
+                // where the server stops sending data mid-match (e.g. server
+                // restart) but doesn't send a FIN/RST.
+                socket.setKeepAlive(true, 15_000);
+                // Connect timeout: if the remote server doesn't respond in 10 s
+                // report failure to the SOCKS5 client instead of hanging forever.
+                const connectTimer = setTimeout(() => {
+                    if (!sess.dead && socket && !socket.destroyed) {
+                        console.warn(`[Tunnel/S] ${key} TCP connect timeout ${host}:${port}`);
+                        this._srvSend(sess, { t: 'A', s: sid, ok: false });
+                        this.sessions.delete(key);
+                        socket.destroy();
+                    }
+                }, 10_000);
+                // Keep-alive: detect dead connections within 15 s instead of
+                // waiting for OS defaults (~2 h). Critical for game sessions
+                // where the server stops sending data mid-match (e.g. server
+                // restart) but doesn't send a FIN/RST.
+                socket.setKeepAlive(true, 15_000);
                 socket.once('connect', () => {
+                clearTimeout(connectTimer);
                 console.log(`[Tunnel/S] ${key} TCP ✓ ${host}:${port}`);
                 this._srvSend(sess, { t: 'A', s: sid, ok: true });
 
@@ -1031,31 +1062,79 @@ class TunnelManager {
             }
 
         } else if (t === 'U') {
-            console.log(`[Tunnel/S] ${key} UDP → ${msg.h}:${msg.p} ${msg.data?.length ?? 0}B`);
-            resolveAndCheck(msg.h, (err, addr) => {
-                if (err) {
-                    console.warn(`[Tunnel/S] ${key} UDP ✗ ${msg.h}:${msg.p} — ${err.message}`);
-                    return;
-                }
-                const sock = dgram.createSocket('udp4');
-                sock.send(msg.data, msg.p, addr, () => {});
-                sock.once('message', resp => {
-                    this._srvSend({ lk: lk || null, fromUid: lk ? null : Number(fromKey) },
-                        { t: 'U', s: sid, h: msg.h, p: msg.p, data: resp });
-                    sock.close();
+            // Persistent UDP session: keep the socket alive across multiple
+            // datagrams (needed for games, DNS-over-UDP, QUIC, etc.).
+            // First datagram creates the session; subsequent datagrams reuse it.
+            // The session is torn down after UDP_IDLE_MS of inactivity or when
+            // the client sends an 'X' frame with the same sid.
+            const UDP_IDLE_MS = 30_000;
+            let udpSess = this.sessions.get(key);
+            if (!udpSess) {
+                // New UDP flow — resolve once and bind the socket.
+                resolveAndCheck(msg.h, (err, addr) => {
+                    if (err) {
+                        console.warn(`[Tunnel/S] ${key} UDP ✗ ${msg.h}:${msg.p} — ${err.message}`);
+                        return;
+                    }
+                    const uSock = dgram.createSocket('udp4');
+                    const srvRef = { lk: lk || null, fromUid: lk ? null : Number(fromKey) };
+                    let idleTimer = null;
+                    const resetIdle = () => {
+                        if (idleTimer) clearTimeout(idleTimer);
+                        idleTimer = setTimeout(() => {
+                            console.log(`[Tunnel/S] ${key} UDP idle timeout`);
+                            try { uSock.close(); } catch {}
+                            this.sessions.delete(key);
+                        }, UDP_IDLE_MS);
+                    };
+                    uSock.on('message', (resp) => {
+                        resetIdle();
+                        this._srvSend(srvRef, { t: 'U', s: sid, h: msg.h, p: msg.p, data: resp });
+                    });
+                    uSock.on('error', (e) => {
+                        console.warn(`[Tunnel/S] ${key} UDP socket error — ${e.message}`);
+                        try { uSock.close(); } catch {}
+                        this.sessions.delete(key);
+                    });
+                    const newSess = { key, udp: true, uSock, addr, port: msg.p, dead: false, idleTimer };
+                    this.sessions.set(key, newSess);
+                    console.log(`[Tunnel/S] ${key} UDP session → ${msg.h}:${msg.p}`);
+                    resetIdle();
+                    // Send the datagram that triggered session creation.
+                    uSock.send(msg.data, msg.p, addr, (e) => {
+                        if (e) console.warn(`[Tunnel/S] ${key} UDP send error: ${e.message}`);
+                    });
                 });
-                setTimeout(() => { try { sock.close(); } catch {} }, 5000);
-            });
+            } else if (udpSess.udp && !udpSess.dead) {
+                // Existing UDP session — send additional datagrams.
+                if (udpSess.idleTimer) clearTimeout(udpSess.idleTimer);
+                udpSess.idleTimer = setTimeout(() => {
+                    console.log(`[Tunnel/S] ${key} UDP idle timeout`);
+                    try { udpSess.uSock.close(); } catch {}
+                    this.sessions.delete(key);
+                }, UDP_IDLE_MS);
+                udpSess.uSock.send(msg.data, udpSess.port, udpSess.addr, (e) => {
+                    if (e) console.warn(`[Tunnel/S] ${key} UDP send error: ${e.message}`);
+                });
+            }
 
         } else if (t === 'X') {
             const sess = this.sessions.get(key);
             if (sess) {
                 sess.dead = true;
-                sess.socket?.destroy();   // null when DNS hasn't resolved yet
-                this.sessions.delete(key);
-                console.log(`[Tunnel/S] ${key} TCP ✕ ${sess.host}:${sess.port} (client)  ↑${sess.txBytes}B ↓${sess.rxBytes}B`);
+                if (sess.udp) {
+                    // UDP session teardown
+                    if (sess.idleTimer) clearTimeout(sess.idleTimer);
+                    try { sess.uSock.close(); } catch {}
+                    this.sessions.delete(key);
+                    console.log(`[Tunnel/S] ${key} UDP ✕ (client closed)`);
+                } else {
+                    sess.socket?.destroy();   // null when DNS hasn't resolved yet
+                    this.sessions.delete(key);
+                    console.log(`[Tunnel/S] ${key} TCP ✕ ${sess.host}:${sess.port} (client)  ↑${sess.txBytes}B ↓${sess.rxBytes}B`);
+                }
             } else {
-                console.log(`[Tunnel/S] ${key} TCP ✕ (already closed)`);
+                console.log(`[Tunnel/S] ${key} closed (already gone)`);
             }
         }
     }
@@ -1075,7 +1154,8 @@ class TunnelManager {
                 .catch(err => console.error('[Tunnel] send:', err.message));
         }
         this.sessions.delete(key);
-        console.log(`[Tunnel/S] ${key} TCP ✕ ${sess.host}:${sess.port} (${reason})  ↑${sess.txBytes}B ↓${sess.rxBytes}B`);
+        const dur = sess.connectedAt ? ` ${((Date.now() - sess.connectedAt)/1000).toFixed(1)}s` : '';
+        console.log(`[Tunnel/S] ${key} TCP ✕ ${sess.host}:${sess.port} (${reason})${dur}  ↑${sess.txBytes}B ↓${sess.rxBytes}B`);
     }
 
     _srvSend(sess, obj) {
@@ -1129,7 +1209,9 @@ class TunnelManager {
             sock.write(Buffer.from([0x05, 0x00]));
 
             sock.once('data', req => {
-                if (req[0] !== 0x05 || req[1] !== 0x01) {
+                const cmd = req[1];
+                // cmd=1: CONNECT (TCP), cmd=3: UDP ASSOCIATE
+                if (req[0] !== 0x05 || (cmd !== 0x01 && cmd !== 0x03)) {
                     sock.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0]));
                     sock.destroy(); return;
                 }
@@ -1159,6 +1241,13 @@ class TunnelManager {
                     sock.destroy(); return;
                 }
 
+                // ── UDP ASSOCIATE ──────────────────────────────────────────
+                if (cmd === 0x03) {
+                    this._handleSocks5Udp(sock);
+                    return;
+                }
+
+                // ── CONNECT (TCP) — original path ──────────────────────────
                 const sid  = makeSid();
                 const sess = { sid, sock, txSeq: 0, rxBuf: new Map(), rxNext: 0, ready: false, queue: [], dead: false };
                 this.sessions.set(sid, sess);
@@ -1181,6 +1270,79 @@ class TunnelManager {
                 sock.on('error', () => this._cliClose(sid));
             });
         });
+    }
+
+    // UDP ASSOCIATE: open a local UDP relay socket, tell the app to send
+    // datagrams there, unwrap the SOCKS5 UDP header on each datagram, and
+    // forward via the tunnel as a 'U' frame. Replies come back as 'U'
+    // frames and are re-wrapped before being sent to the local UDP socket.
+    _handleSocks5Udp(tcpSock) {
+        // Bind a local UDP socket on a random port — this is the relay endpoint
+        // we report back to the SOCKS5 client in the success reply.
+        const relay = dgram.createSocket('udp4');
+        // Map of "host:port" → sid so one relay socket can multiplex multiple flows.
+        const flowMap  = new Map();  // `${rhost}:${rport}` → sid
+        const sidMap   = new Map();  // sid → { rhost, rport, clientAddr, clientPort }
+        const self = this;
+
+        relay.bind(0, '127.0.0.1', () => {
+            const relayPort = relay.address().port;
+            console.log(`[Tunnel/C] UDP relay bound on 127.0.0.1:${relayPort}`);
+            // Tell SOCKS5 client: success, relay is at 127.0.0.1:relayPort
+            const reply = Buffer.alloc(10);
+            reply[0] = 0x05; reply[1] = 0x00; reply[2] = 0x00; reply[3] = 0x01;
+            reply.writeUInt32BE(0x7f000001, 4);   // 127.0.0.1
+            reply.writeUInt16BE(relayPort, 8);
+            tcpSock.write(reply);
+        });
+
+        relay.on('message', (msg, rinfo) => {
+            // SOCKS5 UDP request header:
+            //   2B reserved | 1B frag | 1B atyp | host | 2B port | data
+            if (msg.length < 4 || msg[2] !== 0x00) return;  // drop fragments
+            let off = 4, rhost, rport;
+            const atyp = msg[3];
+            if (atyp === 0x01) {
+                rhost = `${msg[4]}.${msg[5]}.${msg[6]}.${msg[7]}`;
+                off = 8;
+            } else if (atyp === 0x03) {
+                const len = msg[4]; off = 5;
+                rhost = msg.slice(5, 5 + len).toString(); off = 5 + len;
+            } else { return; }  // IPv6 not supported
+            rport = msg.readUInt16BE(off); off += 2;
+            const payload = msg.slice(off);
+            const flowKey = `${rhost}:${rport}`;
+
+            let sid = flowMap.get(flowKey);
+            if (!sid) {
+                sid = makeSid();
+                flowMap.set(flowKey, sid);
+                sidMap.set(sid, { rhost, rport, clientAddr: rinfo.address, clientPort: rinfo.port });
+                // Register in the main sessions map so _cliMsg('U') can find it.
+                self.sessions.set(sid, { sid, udp: true, relay, flowKey, dead: false });
+                console.log(`[Tunnel/C] ${sid} UDP ASSOCIATE → ${rhost}:${rport}`);
+            }
+            self._cliSend({ t: 'U', s: sid, h: rhost, p: rport, data: payload });
+        });
+
+        relay.on('error', (e) => {
+            console.warn('[Tunnel/C] UDP relay error:', e.message);
+            relay.close();
+        });
+
+        // When the TCP control connection drops, the app is done — clean up.
+        tcpSock.on('close', () => {
+            for (const [, sid] of flowMap) {
+                self.sessions.delete(sid);
+                self._cliSend({ t: 'X', s: sid });
+            }
+            flowMap.clear(); sidMap.clear();
+            try { relay.close(); } catch {}
+        });
+        tcpSock.on('error', () => tcpSock.destroy());
+
+        // Stash the sidMap on the relay so _cliMsg can look up the client addr.
+        relay._sidMap = sidMap;
     }
 
     _cliMsg(msg) {
@@ -1220,7 +1382,24 @@ class TunnelManager {
             }
 
         } else if (t === 'X') {
-            sess.dead = true; sess.sock.end(); this.sessions.delete(sid);
+            sess.dead = true; sess.sock?.end(); this.sessions.delete(sid);
+        } else if (t === 'U') {
+            // Reply datagram from server for a UDP ASSOCIATE flow.
+            // Re-wrap with SOCKS5 UDP header and send to the relay socket.
+            if (!sess.udp || !sess.relay || sess.dead) return;
+            const info = sess.relay._sidMap && sess.relay._sidMap.get(sid);
+            if (!info) return;
+            const hostBuf  = Buffer.from(info.rhost, 'utf8');
+            const portBuf  = Buffer.alloc(2); portBuf.writeUInt16BE(info.rport, 0);
+            // SOCKS5 UDP header: RSV(2) FRAG(1) ATYP(1=domain) LEN(1) HOST PORT
+            const header = Buffer.concat([
+                Buffer.from([0x00, 0x00, 0x00, 0x03, hostBuf.length]),
+                hostBuf, portBuf,
+            ]);
+            const wrapped = Buffer.concat([header, msg.data]);
+            sess.relay.send(wrapped, info.clientPort, info.clientAddr, (e) => {
+                if (e) console.warn(`[Tunnel/C] UDP reply send error: ${e.message}`);
+            });
         }
     }
 
@@ -1261,8 +1440,13 @@ class TunnelManager {
             console.log(`[Tunnel/S] Closing ${this.sessions.size} session(s)`);
             for (const sess of this.sessions.values()) {
                 sess.dead = true;
-                sess.socket?.destroy();
-                sess.sock?.destroy();
+                if (sess.udp) {
+                    if (sess.idleTimer) clearTimeout(sess.idleTimer);
+                    try { sess.uSock.close(); } catch {}
+                } else {
+                    sess.socket?.destroy();
+                    sess.sock?.destroy();
+                }
             }
             this.sessions.clear();
         }
