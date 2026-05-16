@@ -20,13 +20,11 @@
     ],
     "outputPath": "dist",
     "assets": [
-      "node_modules/@livekit/rtc-node/dist/**",
-      "node_modules/@livekit/rtc-ffi-bindings/**",
-      "node_modules/@livekit/rtc-ffi-bindings-*/**"
+      "node_modules/node-datachannel/build/Release/**"
     ]
   },
   "dependencies": {
-    "@livekit/rtc-node": "^0.13.27",
+    "node-datachannel": "^0.10.1",
     "node-addon-api": "^8.0.0",
     "protobufjs": "^7.4.0",
     "ws": "^8.20.0"
