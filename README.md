@@ -119,6 +119,7 @@ The tunnel rides on Bale's LiveKit infrastructure. Heavy traffic from a "voice c
 | Server | Android | In-process userspace TCP/IP NAT; no root, no kernel TUN, no `iptables`. |
 | Server | Node.js — Linux | **Kernel TUN** mode (best throughput) needs `setcap cap_net_admin` + `iptables` MASQUERADE — one-time setup. **Userspace NAT** mode runs unprivileged. |
 | Server | Node.js — macOS | **Kernel TUN** mode (best throughput) runs as root; `pf` anchor + IP forwarding auto-set. **Userspace NAT** mode runs unprivileged. |
+| Server | Node.js — Windows | Userspace NAT mode only. |
 
 The Node application currently runs as **server only** — for the client side, use the Android app.
 
@@ -126,7 +127,7 @@ The Node application currently runs as **server only** — for the client side, 
 >
 > **Most efficient: Linux or macOS Node kernel-TUN server + Android client.** The kernel does the IP forwarding (TUN device) and the NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS) — substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
 
-The Node server's forwarding mode is selectable at startup via `--nat-mode kernel|userspace`. `kernel` requires the one-time setup linked above; `userspace` runs with no privilege. See the [Node guide](docs/node-en.md) for details.
+The Node server's forwarding mode is selectable at startup via `--nat-mode kernel|userspace`. `kernel` requires the one-time setup linked above; `userspace` runs with no privilege on any OS. See the [Node guide](docs/node-en.md) for details.
 
 <div dir="rtl">
 
@@ -136,7 +137,7 @@ The Node server's forwarding mode is selectable at startup via `--nat-mode kerne
 >
 > **پربازده‌ترین: سرور TUN-هسته روی Node لینوکسی یا macOS + کلاینت اندرویدی.** هستهٔ سیستم‌عامل فوروارد IP را انجام می‌دهد (دستگاه TUN) و NAT را هم (روی لینوکس با قاعدهٔ `iptables` MASQUERADE، روی macOS با اَنکر `pf`) اعمال می‌کند — به‌مراتب سریع‌تر از جایگزین‌های فضای کاربری. کلاینت اندرویدی هم از طریق `VpnService` استاندارد به یک VPN کاملاً یکپارچهٔ سیستمی وصل می‌شود.
 
-حالت فوروارد سرور Node در زمان اجرا با آرگومان `--nat-mode kernel|userspace` انتخاب می‌شود. حالت `kernel` به همان تنظیمات یک‌بارهٔ بالا نیاز دارد؛ حالت `userspace` بدون دسترسی ویژه کار می‌کند. جزئیات در [راهنمای Node](docs/node-fa.md).
+حالت فوروارد سرور Node در زمان اجرا با آرگومان `--nat-mode kernel|userspace` انتخاب می‌شود. حالت `kernel` به همان تنظیمات یک‌بارهٔ بالا نیاز دارد؛ حالت `userspace` بدون دسترسی ویژه روی هر سیستم‌عاملی کار می‌کند. جزئیات در [راهنمای Node](docs/node-fa.md).
 
 </div>
 
@@ -149,7 +150,7 @@ Per-platform setup, manuals, and screenshots:
 | Platform | English | فارسی |
 |---|---|---|
 | **Android** (client and userspace-TCP/IP server) | [Android user guide](docs/android-en.md) | [راهنمای کاربری اپلیکیشن اندروید](docs/android-fa.md) |
-| **Node.js** — Linux / macOS (server only — kernel TUN or userspace NAT) | [Node.js application guide](docs/node-en.md) | [راهنمای نسخهٔ Node](docs/node-fa.md) |
+| **Node.js** — Linux / macOS / Windows (server only — kernel TUN on Linux/macOS, userspace NAT on any OS) | [Node.js application guide](docs/node-en.md) | [راهنمای نسخهٔ Node](docs/node-fa.md) |
 
 For protocol internals, wire formats, and architecture details: [CLAUDE.md](CLAUDE.md).
 

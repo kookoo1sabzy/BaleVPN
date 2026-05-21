@@ -38,6 +38,12 @@ pub fn now_ms() -> u32 {
 /// socket is bound to — if the app's UID gets routed via cellular
 /// while shell-UID uses WiFi, the source IPs will differ and explain
 /// asymmetric throughput between app traffic and `adb shell curl`.
+///
+/// Unix-only — the raw fd + `sockaddr_in` + `getsockname` plumbing
+/// doesn't translate to Windows' WinSock surface and this is just a
+/// debug log, not a correctness path. Callers wrap the call in
+/// `#[cfg(unix)]`.
+#[cfg(unix)]
 pub fn log_local_sockname(tag: &str, fd: i32, dst: &IpAddr, dst_port: u16, proto: &str) {
     let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let mut len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;

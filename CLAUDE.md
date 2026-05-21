@@ -17,7 +17,7 @@ The Node and Android server modes are interchangeable: an Android client can con
 |---|---|---|
 | Server | Node.js (Linux) | Kernel TUN (`bale0`) + iptables MASQUERADE — best throughput. One-time root setup. |
 | Server | Node.js (macOS) | Kernel TUN (`utunN`) + pf anchor — best throughput. Runs as root. |
-| Server | Node.js (Linux / macOS) | Userspace NAT — no root needed. |
+| Server | Node.js (any OS) | Userspace NAT — no root needed. Works on Linux, macOS, Windows. |
 | Server | Android | Userspace NAT — no root. APK install, no command line. |
 | Client | Android | Kernel TUN via `VpnService`. Optional LAN-facing SOCKS5 proxy lets other devices on the same WiFi use this Android as their proxy. |
 
@@ -53,7 +53,7 @@ The Node entry point is `node src/bale-proxy.js`. It accepts:
 | Argument | Default | Meaning |
 |---|---|---|
 | `<integer>` (positional) | `3001` | HTTP port for the management UI. |
-| `--nat-mode kernel\|userspace` | `kernel` | Selects how server-side forwarding works. `kernel` requires the one-time setup below; `userspace` runs with no privileges. |
+| `--nat-mode kernel\|userspace` | `kernel` on Linux/macOS, `userspace` on Windows | Selects how server-side forwarding works. `kernel` requires the one-time setup below; `userspace` runs with no privileges and works on any OS. |
 
 The mode is fixed at startup; switching between `kernel` and `userspace` requires a restart. If `--nat-mode=kernel` is selected but the required kernel privileges or `iptables` rule are missing, the process exits with an actionable error rather than silently degrading.
 

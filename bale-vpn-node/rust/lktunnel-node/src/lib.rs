@@ -151,8 +151,11 @@ impl Tunnel {
     /// Hand the TUN fd over to the lktunnel core. The library takes
     /// ownership: it spawns the TUN read loop on its dispatcher
     /// thread and closes the fd on teardown. After this call the JS
-    /// side must NOT close the fd itself.
+    /// side must NOT close the fd itself. Unix-only — kernel TUN
+    /// doesn't exist on Windows; the Node app forces userspace NAT
+    /// there.
     #[napi]
+    #[cfg(unix)]
     pub fn attach_tun(&self, fd: i32) -> Result<()> {
         self.inner
             .attach_tun(fd)
@@ -392,12 +395,18 @@ pub fn set_nat_debug(enabled: bool) {
 //   gw.unregister(t); t.disconnect();
 //   // on shutdown:
 //   gw.close();
+//
+// Unix-only — Windows builds force userspace-NAT mode (see
+// bale-vpn-node/src/constants.js), so the JS side never references
+// `TunGateway` there.
 
+#[cfg(unix)]
 #[napi]
 pub struct TunGateway {
     inner: Arc<lktunnel::server::tun_gateway::TunGateway>,
 }
 
+#[cfg(unix)]
 #[napi]
 impl TunGateway {
     /// Take ownership of an open TUN fd (from `openTun`). Spawns the

@@ -1421,24 +1421,25 @@ impl TcpSession {
         // state machine transition and is waiting for data to flow.
         if !self.host_writable {
             if let Some(socket) = self.host.as_ref() {
-                use std::os::fd::AsRawFd;
-                let fd = socket.as_raw_fd();
-                let mut err: libc::c_int = 0;
-                let mut len: libc::socklen_t =
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-                let rc = unsafe {
-                    libc::getsockopt(
-                        fd, libc::SOL_SOCKET, libc::SO_ERROR,
-                        &mut err as *mut libc::c_int as *mut libc::c_void,
-                        &mut len,
-                    )
-                };
-                if rc != 0 || err != 0 {
-                    nat_log!(target: TAG, "host-connect failed {}:{} so_err={} → RST",
-                        self.key.dst, self.key.dst_port, err);
-                    self.emit_rst(self.snd_nxt, self.rcv_nxt);
-                    self.mark_closed();
-                    return;
+                // `mio::net::TcpStream::take_error()` wraps SO_ERROR on every
+                // platform — same one-shot connect-result query as the raw
+                // getsockopt below it used to do, but portable.
+                match socket.take_error() {
+                    Ok(Some(e)) => {
+                        nat_log!(target: TAG, "host-connect failed {}:{} so_err={} → RST",
+                            self.key.dst, self.key.dst_port, e);
+                        self.emit_rst(self.snd_nxt, self.rcv_nxt);
+                        self.mark_closed();
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        nat_log!(target: TAG, "host-connect take_error failed {}:{}: {} → RST",
+                            self.key.dst, self.key.dst_port, e);
+                        self.emit_rst(self.snd_nxt, self.rcv_nxt);
+                        self.mark_closed();
+                        return;
+                    }
                 }
             }
             nat_log!(target: TAG, "host-connect ok {}:{} pending_to_host={}B",

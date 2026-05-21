@@ -6,4 +6,9 @@
 //! `LkTunnel` because the TUN is by definition shared across all
 //! tunnels (one kernel device, N peers).
 
+// Kernel TUN is a Unix concept — `tun_gateway` uses `libc::poll`,
+// `libc::read/write`, and the `/dev/net/tun` ioctl surface. Windows
+// builds compile without it; the Node app on Windows is forced into
+// userspace-NAT mode at startup.
+#[cfg(unix)]
 pub mod tun_gateway;

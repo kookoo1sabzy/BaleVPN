@@ -1,25 +1,25 @@
-# Node.js application — Linux / macOS
+# Node.js application — Linux / macOS / Windows
 
 > Persian / فارسی: [راهنمای نسخهٔ Node](node-fa.md)
 
 The Node application (`bale-vpn-node/`) is a single-binary **VPN server**. It listens for incoming Bale calls from allow-listed contacts and bridges each caller's IP traffic to the open internet.
 
-- Binary builds for Linux and macOS.
+- One binary works on Linux, macOS, and Windows.
 - Two forwarding strategies, chosen at startup:
-  - **kernel TUN** — the kernel handles IP forwarding and NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS). Highest throughput. Requires a one-time root step.
-  - **userspace NAT** — runs unprivileged. Per-flow Rust TCP / UDP state machine inside the process.
+  - **kernel TUN** — Linux / macOS only. The kernel handles IP forwarding and NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS). Highest throughput. Requires a one-time root step.
+  - **userspace NAT** — runs unprivileged on any OS, including Windows. Per-flow Rust TCP / UDP state machine inside the process.
 - A local **web UI** at `http://localhost:3001` is the only configuration surface — sign-in, allow-list management, pending requests, connected-client view.
 
 > The Node application currently runs as **server only**. For the client side, use the [Android app](android-en.md).
 
 ## Modes at a glance
 
-| Mode | Privileges | Throughput |
-|---|---|---|
-| `--nat-mode kernel` | One-time root (`setcap` + `iptables` on Linux, runs as root on macOS) | Highest — kernel-managed TUN device + native NAT |
-| `--nat-mode userspace` | None | Lower than kernel mode but fully featured (SACK, RACK, TLP, PRR, Window Scaling, Timestamps) |
+| Mode | Platforms | Privileges | Throughput |
+|---|---|---|---|
+| `--nat-mode kernel` | Linux, macOS | One-time root (`setcap` + `iptables` on Linux, runs as root on macOS) | Highest — kernel-managed TUN device + native NAT |
+| `--nat-mode userspace` | Linux, macOS, Windows | None | Lower than kernel mode but fully featured (SACK, RACK, TLP, PRR, Window Scaling, Timestamps) |
 
-The default is `kernel`.
+The default is `kernel` on Linux / macOS and `userspace` on Windows.
 
 ---
 
@@ -30,10 +30,15 @@ The default is `kernel`.
 Download a prebuilt `balevpn-<version>-<platform>` binary from the repository's [Releases](../../../releases) page.
 
 ```bash
+# Linux / macOS:
 chmod +x balevpn-<version>-{linux,macos}-*
 ./balevpn-...                             # default port 3001, default mode
 ./balevpn-... 8080                        # custom UI port
 ./balevpn-... --nat-mode=userspace        # force userspace NAT
+
+# Windows (PowerShell):
+.\balevpn-...-win-x64.exe                 # defaults to userspace NAT
+.\balevpn-...-win-x64.exe 8080
 ```
 
 ### Command-line arguments
@@ -41,7 +46,7 @@ chmod +x balevpn-<version>-{linux,macos}-*
 | Argument | Default | Meaning |
 |---|---|---|
 | `<integer>` (positional) | `3001` | HTTP port for the management UI. Any bare number is taken as the port. |
-| `--nat-mode kernel\|userspace` | `kernel` | Selects how server-side forwarding works. `kernel` requires the one-time setup linked below; `userspace` runs with no privilege. The mode is fixed at startup. |
+| `--nat-mode kernel\|userspace` | `kernel` on Linux/macOS, `userspace` on Windows | Selects how server-side forwarding works. `kernel` requires the one-time setup linked below; `userspace` runs with no privilege. The mode is fixed at startup. |
 
 If `--nat-mode=kernel` is selected but the required kernel privileges or `iptables` MASQUERADE rule are missing, the process exits with an actionable error rather than silently degrading.
 
@@ -86,9 +91,9 @@ macOS has no `setcap` analog, so kernel-TUN mode runs as root. NAT (pf anchor `b
 sudo ./balevpn-<version>-macos-arm64
 ```
 
-### Userspace NAT
+### Userspace NAT (any OS)
 
-No privileged setup needed. Just run the binary with `--nat-mode=userspace`.
+No privileged setup needed. Just run the binary with `--nat-mode=userspace` (or rely on the Windows default).
 
 ```bash
 ./balevpn-<version>-linux-x64 --nat-mode=userspace

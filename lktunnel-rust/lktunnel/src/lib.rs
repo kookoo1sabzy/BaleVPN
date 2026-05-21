@@ -27,6 +27,10 @@ pub mod nat;
 pub mod rtp;
 pub mod server;
 pub mod socks5;
+// Kernel TUN is Unix-only. The Android client uses it via JNI;
+// the Node CLI uses it on Linux/macOS. Windows server-mode is
+// userspace-NAT only and never touches a kernel TUN.
+#[cfg(unix)]
 pub mod tun;
 
 use livekit::prelude::*;
@@ -39,6 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::nat::{NatDispatcher, Stats as NatStats};
+#[cfg(unix)]
 use crate::tun::{InjectStatus, TunBridge};
 
 /// Portable `errno` accessor — the `libc` crate exposes the thread-local
@@ -192,7 +197,9 @@ struct TunnelInner {
     /// Client-mode TUN bridge — set by [`LkTunnel::attach_tun`].
     /// Mutated only on the dispatcher thread (TunBridge attach /
     /// inject / resume) — the mutex is held briefly so a teardown
-    /// elsewhere can take the Box out for deferred drop.
+    /// elsewhere can take the Box out for deferred drop. Unix-only;
+    /// the Windows build has no kernel TUN.
+    #[cfg(unix)]
     tun:         Mutex<Option<Box<TunBridge>>>,
     /// Lifecycle flag. `Arc` so the per-tunnel task can hold it
     /// independently of Inner (avoids pinning Inner to the task).
@@ -258,6 +265,7 @@ impl LkTunnel {
             tx:            send_tx,
             drain_waiters: Mutex::new(Vec::new()),
             nat:           Mutex::new(None),
+            #[cfg(unix)]
             tun:           Mutex::new(None),
             connected:     Arc::new(AtomicBool::new(false)),
             inbound:       Mutex::new(VecDeque::with_capacity(INBOUND_QUEUE_CAP)),
@@ -449,6 +457,7 @@ impl LkTunnel {
         let id = self.inner.id;
         let emit = self.nat_emit();
         let mut nat = self.inner.nat.lock();
+        #[cfg(unix)]
         if self.inner.tun.lock().is_some() { return Err("already in client mode"); }
         if nat.is_some()                   { return Err("already in server mode"); }
         // `NatDispatcher::new` doesn't touch the reactor — sockets are
@@ -479,6 +488,8 @@ impl LkTunnel {
     /// bridge takes ownership of `fd` (closes on detach / drop).
     /// Inbound IP from this point on is written to the TUN. Fails if
     /// the tunnel is already in server mode or already has a TUN.
+    /// Unix-only — Windows has no kernel TUN.
+    #[cfg(unix)]
     pub fn attach_tun(&self, fd: i32) -> Result<(), &'static str> {
         if !self.inner.connected.load(Ordering::Relaxed) { return Err("not connected"); }
         if fd < 0 { return Err("invalid fd"); }
@@ -511,6 +522,7 @@ impl LkTunnel {
         self.inner.nat.lock().as_ref().map(|n| n.flow_stats())
     }
 
+    #[cfg(unix)]
     fn tun_send(&self) -> tun::SendIp {
         // Weak ref to break the Inner → tun → SendIp → LkTunnel → Inner
         // cycle. Upgrade per call; treat a defunct tunnel as a drop
@@ -526,6 +538,7 @@ impl LkTunnel {
         })
     }
 
+    #[cfg(unix)]
     fn tun_wake_on_drain(&self) -> tun::WakeOnDrain {
         // Weak — same cycle-break as `tun_send`. The outer closure
         // runs on a TUN-bridge pause; upgrade once to register the
@@ -585,6 +598,7 @@ impl TunnelInner {
             n.process(ip);
             return;
         }
+        #[cfg(unix)]
         if let Some(b) = self.tun.lock().as_mut() {
             match b.inject(ip) {
                 InjectStatus::Accepted  => {}
@@ -617,7 +631,10 @@ impl TunnelInner {
         // Move NAT/TUN boxes out and drop them on the dispatcher
         // thread (mio source de-registration must run there).
         let nat_box = self.nat.lock().take();
+        #[cfg(unix)]
         let tun_box = self.tun.lock().take();
+        #[cfg(not(unix))]
+        let tun_box: Option<Box<()>> = None;
         if nat_box.is_some() || tun_box.is_some() {
             dispatcher::post(Box::new(move || {
                 drop(nat_box);
