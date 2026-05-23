@@ -42,3 +42,30 @@ socket2     = "0.5"
 # Errno + a handful of POSIX constants we still poke directly. Will
 # shrink further as the session ports land in steps 2-4.
 libc        = "0.2"
+
+# QUIC carrier (Stage 1 of the SOCKS5-over-QUIC integration). quinn is
+# the reliability layer that sits ON TOP of the existing lossy RTP-as-
+# Opus substrate — its UDP send/recv calls are intercepted by a custom
+# `AsyncUdpSocket` impl in `quic_tunnel.rs` that ferries datagrams as
+# 'Q'-tagged frames through `LkTunnel`. Crypto is rustls/ring; ring is
+# already pulled in transitively by livekit so this adds no new C deps.
+#
+# `runtime-tokio` because we drive quinn from the same tokio runtime
+# the rest of the crate uses.
+quinn       = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Server-side: rcgen builds a self-signed cert at startup (we live
+# inside an already-DTLS-encrypted LK channel, so the TLS cert is
+# functionally throwaway). Client-side: rustls is configured with
+# `dangerous_configuration` to skip verification.
+rcgen       = "0.13"
+# Need rustls types directly to build the no-verify ClientConfig.
+rustls      = { version = "0.23", default-features = false, features = ["std", "ring"] }
+# quinn::AsyncUdpSocket returns Poll::Ready(()), so we lean on
+# futures_util's poll helpers in the bridge impl.
+futures-util = "0.3"
+# zero-copy byte buffer used in the quic datagram queues.
+bytes       = "1"
+
+[dev-dependencies]
+# Integration tests want a logger so failures are diagnosable.
+env_logger  = "0.11"

@@ -115,6 +115,53 @@ class LkTunnel : DataTransport, AutoCloseable {
         val h = handle; if (h != 0L) LkTunnelNative.nativeAttachTun(h, fd)
     }
 
+    /** Drop the TUN bridge: closes the fd, deregisters from the mio
+     *  reactor, stops routing inbound IP packets to it. Idempotent.
+     *  The LK tunnel + SOCKS5 listener (if up) keep running. */
+    @Synchronized
+    fun detachTun() {
+        val h = handle; if (h != 0L) LkTunnelNative.nativeDetachTun(h)
+    }
+
+    /** Idempotently bring up the QUIC client connection to the peer.
+     *  Safe to call multiple times; subsequent calls just return.
+     *  Blocks briefly while the QUIC handshake completes (typically
+     *  a couple of RTTs over the LK channel). Returns true on success.
+     *
+     *  Pre-warms the QUIC connection at tunnel startup so toggling
+     *  the SOCKS5 listener later is instantaneous (no per-toggle
+     *  handshake). */
+    @Synchronized
+    fun ensureQuicClient(): Boolean {
+        val h = handle; if (h == 0L) return false
+        return LkTunnelNative.nativeEnsureQuicClient(h)
+    }
+
+    /** Start a SOCKS5 listener on `127.0.0.1:port` that pumps every
+     *  accepted connection through a QUIC stream multiplexed over
+     *  this tunnel's LK channel. Pass `port = 0` for an OS-assigned
+     *  port; returns the actual bound port, or `0` on failure (check
+     *  logcat for the cause).
+     *
+     *  Blocks briefly while the QUIC handshake with the peer
+     *  completes. Safe to call once per tunnel; subsequent calls
+     *  without an intervening [disableSocks5Server] no-op and return
+     *  `0`. */
+    @Synchronized
+    fun enableSocks5Server(port: Int): Int {
+        val h = handle; if (h == 0L) return 0
+        return LkTunnelNative.nativeEnableSocks5(h, port)
+    }
+
+    /** Idempotent — aborts the SOCKS5 accept loop. The persistent
+     *  QUIC client connection stays up so re-enabling SOCKS5 later
+     *  is instantaneous (no fresh handshake). The QUIC client is
+     *  torn down only when the whole tunnel disconnects. */
+    @Synchronized
+    fun disableSocks5Server() {
+        val h = handle; if (h != 0L) LkTunnelNative.nativeDisableSocks5(h)
+    }
+
     /** RX/TX counters as `[rxPkts, rxBytes, txPkts, txBytes]`, or
      *  null if no mode is set yet. */
     @Synchronized
@@ -246,6 +293,10 @@ internal object LkTunnelNative {
     @JvmStatic external fun nativeIsConnected(handle: Long): Boolean
     @JvmStatic external fun nativeStartServer(handle: Long)
     @JvmStatic external fun nativeAttachTun(handle: Long, fd: Int)
+    @JvmStatic external fun nativeDetachTun(handle: Long)
+    @JvmStatic external fun nativeEnsureQuicClient(handle: Long): Boolean
+    @JvmStatic external fun nativeEnableSocks5(handle: Long, port: Int): Int
+    @JvmStatic external fun nativeDisableSocks5(handle: Long)
     @JvmStatic external fun nativeStats(handle: Long): LongArray?
     @JvmStatic external fun nativeFlowStats(handle: Long): LongArray?
     @JvmStatic external fun nativeDisconnect(handle: Long)

@@ -96,45 +96,6 @@ pub extern "system" fn Java_ai_bale_proxy_NativeJni_natSetDebug<'l>(
 // single load-time probe is now `Java_..._LkNative_nativeVersion`
 // (called from `BaleApp.onCreate` and `NativeJni.<clinit>`).
 
-// ── SOCKS5 server JNI surface ──────────────────────────────────────
-
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_NativeJni_socks5Start<'l>(
-    _env: JNIEnv<'l>, _cls: JClass<'l>, port: jint,
-) {
-    lktunnel::socks5::start(port);
-}
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_NativeJni_socks5Stop<'l>(
-    _env: JNIEnv<'l>, _cls: JClass<'l>,
-) {
-    lktunnel::socks5::stop();
-}
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_NativeJni_socks5IsRunning<'l>(
-    _env: JNIEnv<'l>, _cls: JClass<'l>,
-) -> jboolean {
-    if lktunnel::socks5::is_running() { JNI_TRUE } else { JNI_FALSE }
-}
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_NativeJni_socks5ActiveConnections<'l>(
-    _env: JNIEnv<'l>, _cls: JClass<'l>,
-) -> jint {
-    lktunnel::socks5::active_connections()
-}
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_NativeJni_socks5TotalAccepted<'l>(
-    _env: JNIEnv<'l>, _cls: JClass<'l>,
-) -> jlong {
-    lktunnel::socks5::total_accepted()
-}
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_NativeJni_socks5SetDebug<'l>(
-    _env: JNIEnv<'l>, _cls: JClass<'l>, enabled: jboolean,
-) {
-    lktunnel::socks5::set_debug(enabled != JNI_FALSE);
-}
-
 /// Drain the native error queue into `NativeJni.onNativeError`. Same
 /// pull-model the C++ implementation had: producers never touch JVM,
 /// the JNI cost lives here on the poller thread.
@@ -311,6 +272,68 @@ pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeAttachTun<'l>(
             log::warn!("nativeAttachTun: {e}");
         }
     });
+}
+
+/// Drop the TUN bridge. Idempotent. Used when the Android side
+/// toggles the VPN off at runtime — the LK tunnel + any SOCKS5
+/// listener stay up.
+#[no_mangle]
+pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeDetachTun<'l>(
+    _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong,
+) {
+    with_tunnel(handle, |t| {
+        if let Err(e) = t.detach_tun() {
+            log::warn!("nativeDetachTun: {e}");
+        }
+    });
+}
+
+/// Idempotently bring up the QUIC client connection to the peer.
+/// Safe to call multiple times. Blocks on the lktunnel runtime so
+/// Kotlin sees a sync return. Returns 1 on success, 0 on failure
+/// (check logcat for cause).
+#[no_mangle]
+pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeEnsureQuicClient<'l>(
+    _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong,
+) -> jboolean {
+    let mut ok = JNI_FALSE;
+    with_tunnel(handle, |t| {
+        let t = t.clone();
+        ok = match lktunnel::runtime().block_on(t.ensure_quic_client()) {
+            Ok(())  => JNI_TRUE,
+            Err(e)  => { log::warn!("nativeEnsureQuicClient: {e}"); JNI_FALSE }
+        };
+    });
+    ok
+}
+
+/// Enable the LAN-facing SOCKS5 listener on `127.0.0.1:port`. Async on
+/// the Rust side (it has to dial QUIC to the peer); we block here on
+/// the lktunnel runtime so Kotlin gets a sync return.
+///
+/// Returns the bound port (typically == `port`, unless `port == 0` for
+/// auto-assign) or `0` on failure. Errors are logged.
+#[no_mangle]
+pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeEnableSocks5<'l>(
+    _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong, port: jint,
+) -> jint {
+    let port = if port < 0 { 0 } else { port as u16 };
+    let mut result: jint = 0;
+    with_tunnel(handle, |t| {
+        let t = t.clone();
+        result = match lktunnel::runtime().block_on(t.enable_socks5_server(port)) {
+            Ok(addr) => addr.port() as jint,
+            Err(e)   => { log::warn!("nativeEnableSocks5: {e}"); 0 }
+        };
+    });
+    result
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeDisableSocks5<'l>(
+    _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong,
+) {
+    with_tunnel(handle, |t| t.disable_socks5_server());
 }
 
 #[no_mangle]

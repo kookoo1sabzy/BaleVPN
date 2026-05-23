@@ -197,8 +197,8 @@ abstract class BaseActivity : AppCompatActivity() {
             Runtime.getRuntime()
                 .exec(arrayOf(
                     "logcat", "-d", "-t", "500",
-                    "BaleProxy:V", "BaleVPN:V", "BaleSocks5:V", "ContactsActivity:V", "UserCache:V",
-                    "nat:V", "tcp-session:V", "udp-session:V",
+                    "BaleProxy:V", "BaleVPN:V", "ContactsActivity:V", "UserCache:V",
+                    "nat:V", "tcp-session:V", "udp-session:V", "socks5:V",
                     "*:S"
                 ))
                 .inputStream.bufferedReader().use { it.readText() }

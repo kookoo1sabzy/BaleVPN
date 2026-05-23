@@ -287,7 +287,17 @@ function create(client, connection) {
                         }
                         throw e;
                     }
-                    if (!resp.jwt) throw new Error('No JWT in ValidateCode response');
+                    // Bale's API used to error with `PHONE_NUMBER_UNOCCUPIED`
+                    // for unregistered numbers; current behavior is to succeed
+                    // with an empty `jwt` field on the response — same
+                    // meaning, different shape. Route both to the signup
+                    // prompt rather than throwing.
+                    if (!resp.jwt) {
+                        console.log('[Auth] ValidateCode: empty JWT — needs signup');
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ ok: true, needsSignup: true }));
+                        return;
+                    }
                     const token = await fetchAccessToken(resp.jwt) || resp.jwt;
                     console.log('[Auth] ValidateCode success, token obtained');
                     // Set the token server-side and let reconcile bring up the WS.

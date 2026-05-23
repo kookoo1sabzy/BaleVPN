@@ -138,6 +138,18 @@ impl Tunnel {
         self.inner.is_connected()
     }
 
+    /// Await the tunnel reaching the Connected state (peer has joined
+    /// the LK room). Throws on a terminal failure (LK error or no-peer
+    /// timeout). Necessary before calling `enableSocks5Server` —
+    /// otherwise the QUIC handshake races vs. LK room join and
+    /// retries unnecessarily.
+    #[napi]
+    pub async fn await_connected(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        inner.await_connected().await
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
     /// Promote this tunnel to server mode — installs the userspace
     /// NAT that bridges client IP packets to host sockets. Idempotent
     /// at call sites — fails if already in client or server mode.
@@ -179,6 +191,43 @@ impl Tunnel {
     #[napi]
     pub fn disconnect(&self) {
         self.inner.disconnect();
+    }
+
+    /// Idempotently bring up the persistent QUIC client connection
+    /// to the peer. Safe to call multiple times. Pre-warms the
+    /// connection at tunnel startup so toggling `enable_socks5_server`
+    /// later is instantaneous (no per-toggle handshake).
+    #[napi]
+    pub async fn ensure_quic_client(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        inner.ensure_quic_client().await
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    /// Start a SOCKS5 listener on `127.0.0.1:port` that funnels every
+    /// accepted connection through a QUIC stream over this tunnel's
+    /// LK channel. The peer must be in server mode — its QUIC stream
+    /// acceptor was auto-installed by `start_server` and forwards
+    /// each incoming stream to the resolved host TCP.
+    ///
+    /// Returns the actually-bound port (matches `port` unless `0` was
+    /// passed for auto-assign). Throws if a SOCKS5 listener is already
+    /// up or if the QUIC handshake fails.
+    #[napi]
+    pub async fn enable_socks5_server(&self, port: u16) -> Result<u16> {
+        let inner = self.inner.clone();
+        inner.enable_socks5_server(port).await
+            .map(|addr| addr.port())
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    /// Tear down the SOCKS5 listener. The persistent QUIC client
+    /// connection stays up (re-enabling SOCKS5 won't re-handshake);
+    /// it's torn down only when the tunnel itself disconnects.
+    /// Idempotent.
+    #[napi]
+    pub fn disable_socks5_server(&self) {
+        self.inner.disable_socks5_server();
     }
 }
 

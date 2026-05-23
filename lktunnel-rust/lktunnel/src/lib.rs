@@ -25,8 +25,9 @@ pub mod errors;
 pub mod ipv6;
 pub mod nat;
 pub mod rtp;
+pub(crate) mod quic_tunnel;
 pub mod server;
-pub mod socks5;
+pub mod socks5_quic;
 // Kernel TUN is Unix-only. The Android client uses it via JNI;
 // the Node CLI uses it on Linux/macOS. Windows server-mode is
 // userspace-NAT only and never touches a kernel TUN.
@@ -76,6 +77,10 @@ pub fn errno() -> i32 {
 // lossy carrier — the tag just reserves namespace.
 
 const FRAME_TYPE_IP: u8 = 0x49;        // 'I'
+/// QUIC datagram. Used by `quic_tunnel` to ferry quinn's UDP packets
+/// over the lossy RTP carrier. quinn's own ARQ + congestion control
+/// turns the carrier into a reliable, stream-multiplexed transport.
+pub(crate) const FRAME_TYPE_QUIC: u8 = 0x51; // 'Q'
 
 /// How long to wait for a remote peer to be present in the room before
 /// giving up. Covers the worst-case server-side flow: `callAccepted`
@@ -230,9 +235,141 @@ struct TunnelInner {
     /// through a kernel TUN with SNAT). Default `None` keeps the
     /// existing behaviour for Android / CLI.
     on_ip_override: Mutex<Option<Arc<dyn Fn(&[u8]) + Send + Sync>>>,
+    /// QUIC inbound datagram channel — set by `enable_quic_*` when a
+    /// QUIC endpoint is started on top of this tunnel. The `'Q'`-frame
+    /// dispatcher pushes raw quinn datagrams here; the
+    /// `quic_tunnel::TunnelUdpSocket` AsyncUdpSocket impl drains them.
+    /// `None` until QUIC is enabled.
+    quic_rx_tx: Mutex<Option<tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+    /// Persistent client-side QUIC connection to the peer. Brought
+    /// up by [`LkTunnel::ensure_quic_client`] once per tunnel and
+    /// reused by every SOCKS5 enable/disable cycle. Independent of
+    /// the SOCKS5 listener so the QUIC handshake completes at tunnel
+    /// startup, not at first SOCKS5 toggle.
+    quic_client: Mutex<Option<Arc<quic_tunnel::QuicClient>>>,
+    /// Client-side SOCKS5 listener handle. Set by
+    /// `enable_socks5_server`; cleared by `disable_socks5_server`.
+    socks5_handle: Mutex<Option<socks5_quic::Socks5Handle>>,
+    /// Server-side QUIC stream-acceptor handle. Auto-installed by
+    /// `start_server` so the peer side can route incoming SOCKS5
+    /// streams to host TCP without a separate JS/Kotlin toggle.
+    quic_server_handle: Mutex<Option<socks5_quic::QuicServerHandle>>,
 }
 
 static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Build a pair of [`LkTunnel`]s wired to each other by in-process
+/// mpsc channels — **no LiveKit room, no RTP, no Opus**. Outbound
+/// frames from each tunnel are routed straight into the other
+/// tunnel's `dispatch_payload`-equivalent (an `on_ip`/`on_quic`
+/// fork that's a verbatim copy of what [`LkTunnel::connect`] sets
+/// up internally).
+///
+/// Used by integration tests to exercise QUIC + SOCKS5 + NAT
+/// offline. Both tunnels come back already in the
+/// [`TunnelState::Connected`] state.
+#[doc(hidden)]
+pub fn connect_loopback() -> (LkTunnel, LkTunnel) {
+    crate::dispatcher::init();
+    let (a_inner, a_send_rx) = build_loopback_inner();
+    let (b_inner, b_send_rx) = build_loopback_inner();
+    spawn_loopback_forwarder(a_send_rx, Arc::clone(&b_inner));
+    spawn_loopback_forwarder(b_send_rx, Arc::clone(&a_inner));
+    a_inner.connected.store(true, Ordering::Relaxed);
+    b_inner.connected.store(true, Ordering::Relaxed);
+    let _ = a_inner.state_tx.send(TunnelState::Connected);
+    let _ = b_inner.state_tx.send(TunnelState::Connected);
+    (LkTunnel { inner: a_inner }, LkTunnel { inner: b_inner })
+}
+
+fn build_loopback_inner() -> (Arc<TunnelInner>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+    let id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
+    let (send_tx, send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(SEND_QUEUE_CAP);
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(TunnelState::Connecting);
+    let inner = Arc::new(TunnelInner {
+        id,
+        counters:      Arc::new(counters::Counters::new()),
+        room:          Mutex::new(None),
+        state_tx,
+        task:          Mutex::new(None),
+        sender_task:   Mutex::new(None),
+        tx:            send_tx,
+        drain_waiters: Mutex::new(Vec::new()),
+        nat:           Mutex::new(None),
+        #[cfg(unix)]
+        tun:           Mutex::new(None),
+        connected:     Arc::new(AtomicBool::new(false)),
+        inbound:       Mutex::new(VecDeque::with_capacity(INBOUND_QUEUE_CAP)),
+        inbound_drops: AtomicU64::new(0),
+        rtp_sender:    Mutex::new(None),
+        rtp_receivers: Mutex::new(Vec::new()),
+        on_ip_override: Mutex::new(None),
+        quic_rx_tx:    Mutex::new(None),
+        quic_client:   Mutex::new(None),
+        socks5_handle: Mutex::new(None),
+        quic_server_handle: Mutex::new(None),
+    });
+    (inner, send_rx)
+}
+
+/// Forwarder task: pulls pre-tagged frames from `from_rx` (the
+/// outbound channel of one loopback tunnel) and dispatches them into
+/// `to_inner` exactly the way [`dispatch_payload`] would on the
+/// receive side. `'I'` frames go through the same drain-queue
+/// pattern `on_ip` uses; `'Q'` frames feed `quic_rx_tx`.
+fn spawn_loopback_forwarder(
+    mut from_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    to_inner:    Arc<TunnelInner>,
+) {
+    runtime().spawn(async move {
+        while let Some(frame) = from_rx.recv().await {
+            if frame.is_empty() { continue; }
+            match frame[0] {
+                FRAME_TYPE_IP => {
+                    let payload = frame[1..].to_vec();
+                    let needs_drain = {
+                        let mut q = to_inner.inbound.lock();
+                        let was_empty = q.is_empty();
+                        if q.len() >= INBOUND_QUEUE_CAP {
+                            q.pop_front();
+                            let n = to_inner.inbound_drops
+                                .fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_power_of_two() {
+                                log::warn!("loopback: inbound overflow — \
+                                            {n} packets dropped on tunnel {}",
+                                           to_inner.id);
+                            }
+                        }
+                        q.push_back(payload);
+                        was_empty
+                    };
+                    if needs_drain {
+                        let weak = Arc::downgrade(&to_inner);
+                        dispatcher::post(Box::new(move || {
+                            let Some(inner) = weak.upgrade() else { return };
+                            loop {
+                                let pkt = inner.inbound.lock().pop_front();
+                                match pkt {
+                                    Some(b) => inner.inject_inbound_ip(&b),
+                                    None    => break,
+                                }
+                            }
+                        }));
+                    }
+                }
+                FRAME_TYPE_QUIC => {
+                    let payload = &frame[1..];
+                    to_inner.counters.bump_rx(payload.len());
+                    let tx = to_inner.quic_rx_tx.lock().clone();
+                    if let Some(tx) = tx {
+                        let _ = tx.try_send(bytes::Bytes::copy_from_slice(payload));
+                    }
+                }
+                _ => {}  // unknown frame type, drop silently
+            }
+        }
+    });
+}
 
 impl LkTunnel {
     /// Build a handle and kick off the async connect work on the
@@ -273,6 +410,10 @@ impl LkTunnel {
             rtp_sender:    Mutex::new(None),
             rtp_receivers: Mutex::new(Vec::new()),
             on_ip_override: Mutex::new(None),
+            quic_rx_tx:    Mutex::new(None),
+            quic_client:   Mutex::new(None),
+            socks5_handle: Mutex::new(None),
+            quic_server_handle: Mutex::new(None),
         });
 
         // Inbound IP routing — same bounded per-tunnel queue pattern.
@@ -366,10 +507,27 @@ impl LkTunnel {
         let mut buf = Vec::with_capacity(1 + ip.len());
         buf.push(FRAME_TYPE_IP);
         buf.extend_from_slice(ip);
+        let plen = ip.len();
+        self.send_raw_frame(buf, plen)
+    }
+
+    /// Send an **already-tagged** wire frame. Caller is responsible
+    /// for prepending the frame-type byte (`'I'`, `'Q'`, …). Used by
+    /// [`crate::quic_tunnel::TunnelUdpSocket`] which prepends `'Q'`
+    /// itself before ferrying quinn datagrams. The `tx_payload_len`
+    /// argument is the *post-tag* byte count fed into the counter
+    /// (the tag byte itself isn't billed to the consumer).
+    pub fn send_raw_frame(&self, buf: Vec<u8>, tx_payload_len: usize) -> Result<(), SendError> {
+        if buf.is_empty() || buf.len() > 65536 {
+            return Err(SendError::Invalid);
+        }
+        if !self.inner.connected.load(Ordering::Relaxed) {
+            return Err(SendError::NotConnected);
+        }
         use tokio::sync::mpsc::error::TrySendError;
         match self.inner.tx.try_send(buf) {
             Ok(()) => {
-                self.inner.counters.bump_tx(ip.len());
+                self.inner.counters.bump_tx(tx_payload_len);
                 Ok(())
             }
             Err(TrySendError::Full(_))   => Err(SendError::Backpressure),
@@ -481,6 +639,27 @@ impl LkTunnel {
             ((used * 1000) / cap.max(1)) as u16
         })));
         *nat = Some(d);
+        drop(nat);
+
+        // Auto-bring-up the QUIC stream acceptor so the peer-side
+        // SOCKS5-over-QUIC mode works without a separate JS/Kotlin
+        // knob. Idempotent — if a previous start_server installed one
+        // we leave it alone. Failures (cert build / endpoint create)
+        // are logged but don't abort start_server: IP-tunnel mode is
+        // independent of QUIC and should keep working.
+        if self.inner.quic_server_handle.lock().is_none() {
+            match self.enable_quic_server() {
+                Ok(server) => {
+                    let handle = socks5_quic::spawn_server_acceptor(server);
+                    *self.inner.quic_server_handle.lock() = Some(handle);
+                    log::info!("quic stream acceptor up on tunnel {id}");
+                }
+                Err(e) => {
+                    log::warn!("quic stream acceptor setup failed: {e} — \
+                                socks5-over-quic mode will not be available");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -516,10 +695,145 @@ impl LkTunnel {
         rx.recv().unwrap_or(Err("dispatcher not running"))
     }
 
+    /// Drop the TUN bridge installed by [`Self::attach_tun`]. The
+    /// `TunBridge`'s `Drop` closes the fd and deregisters from the
+    /// mio reactor, so inbound IP packets stop being routed to a TUN
+    /// after this returns. Idempotent — no-op if no TUN is attached.
+    /// Used by the Android side when the user toggles VPN off at
+    /// runtime; the LK tunnel + SOCKS5 listener (if up) keep running.
+    #[cfg(unix)]
+    pub fn detach_tun(&self) -> Result<(), &'static str> {
+        if self.inner.tun.lock().is_none() { return Ok(()); }
+        let inner = Arc::clone(&self.inner);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Drop on the dispatcher thread — the TunBridge's mio source
+        // de-registration must happen there, same as attach.
+        dispatcher::post(Box::new(move || {
+            let _bridge = inner.tun.lock().take();
+            // _bridge drops here, on the dispatcher thread. The Drop
+            // closes the fd and deregisters from the reactor.
+            let _ = tx.send(());
+        }));
+        let _ = rx.recv();
+        Ok(())
+    }
+
     /// Snapshot of NAT per-flow stats (server mode only). Returns
     /// `None` if no NAT is active.
     pub fn flow_stats(&self) -> Option<NatStats> {
         self.inner.nat.lock().as_ref().map(|n| n.flow_stats())
+    }
+
+    /// Bring up a QUIC endpoint in **server** mode on top of this
+    /// tunnel. Internal — only the SOCKS5 server/client wiring in
+    /// the same crate consumes this. There's no JS/Kotlin surface
+    /// for QUIC directly; the only externally-visible knob is the
+    /// SOCKS5 server toggle that internally drives QUIC.
+    pub(crate) fn enable_quic_server(&self)
+        -> Result<quic_tunnel::QuicServer, quic_tunnel::QuicEndpointError>
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(
+            quic_tunnel::QUIC_RX_QUEUE_CAP);
+        {
+            let mut slot = self.inner.quic_rx_tx.lock();
+            if slot.is_some() {
+                return Err(quic_tunnel::QuicEndpointError::Io(
+                    std::io::Error::new(std::io::ErrorKind::AlreadyExists,
+                                        "quic already enabled on this tunnel")));
+            }
+            *slot = Some(tx);
+        }
+        let server_config = quic_tunnel::make_server_config()?;
+        let endpoint = quic_tunnel::build_endpoint(self.clone(), rx, Some(server_config))?;
+        Ok(quic_tunnel::QuicServer { endpoint })
+    }
+
+    /// Idempotently bring up the QUIC client connection to the peer
+    /// and spawn the auto-reconnect keeper. Safe to call multiple
+    /// times. After the first successful call, the keeper task
+    /// monitors `Connection.closed()` and re-establishes
+    /// automatically on idle timeout / network blip / peer restart,
+    /// so the SOCKS5 listener doesn't have to be toggled to recover.
+    pub async fn ensure_quic_client(&self)
+        -> Result<(), quic_tunnel::QuicEndpointError>
+    {
+        if self.inner.quic_client.lock().is_some() { return Ok(()); }
+        let client = self.connect_quic_to_peer().await?;
+        *self.inner.quic_client.lock() = Some(Arc::new(client));
+        // Spawn the keeper. Holds a Weak so it exits naturally on
+        // tunnel teardown (no extra lifecycle plumbing needed).
+        let weak = Arc::downgrade(&self.inner);
+        let tunnel_for_keeper = self.clone();
+        runtime().spawn(quic_tunnel::keeper_task(weak, tunnel_for_keeper));
+        Ok(())
+    }
+
+    /// Start a SOCKS5 listener on `0.0.0.0:port` that pumps each
+    /// accepted connection through a QUIC stream to the peer. Uses
+    /// the persistent QUIC client established by
+    /// [`Self::ensure_quic_client`] (calls it if not already up).
+    /// The peer must be in server mode (which auto-enables the matching
+    /// QUIC stream acceptor via [`Self::start_server`]).
+    ///
+    /// The accept loop reads the *current* QuicClient from `TunnelInner`
+    /// on each accept, so it transparently follows the reconnect
+    /// keeper — a connection that drops while the listener is up
+    /// recovers in the background; new SOCKS5 client requests just
+    /// have to wait for the keeper to reconnect.
+    pub async fn enable_socks5_server(&self, port: u16)
+        -> Result<std::net::SocketAddr, socks5_quic::Socks5Error>
+    {
+        if self.inner.socks5_handle.lock().is_some() {
+            return Err(socks5_quic::Socks5Error::AlreadyEnabled);
+        }
+        self.ensure_quic_client().await?;
+        let handle = socks5_quic::enable_listener(self.clone(), port).await?;
+        let addr = handle.local_addr;
+        {
+            let mut slot = self.inner.socks5_handle.lock();
+            if slot.is_some() {
+                handle.listener_abort.abort();
+                return Err(socks5_quic::Socks5Error::AlreadyEnabled);
+            }
+            *slot = Some(handle);
+        }
+        Ok(addr)
+    }
+
+    /// Tear down the SOCKS5 listener. The persistent QUIC client
+    /// stays up — re-enabling SOCKS5 won't re-handshake. Idempotent.
+    pub fn disable_socks5_server(&self) {
+        if let Some(h) = self.inner.socks5_handle.lock().take() {
+            h.listener_abort.abort();
+            log::info!("socks5: listener at {} torn down", h.local_addr);
+        }
+    }
+
+    /// Bring up a QUIC endpoint in **client** mode and dial the peer.
+    /// Internal — same rationale as [`Self::enable_quic_server`].
+    pub(crate) async fn connect_quic_to_peer(&self)
+        -> Result<quic_tunnel::QuicClient, quic_tunnel::QuicEndpointError>
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(
+            quic_tunnel::QUIC_RX_QUEUE_CAP);
+        {
+            let mut slot = self.inner.quic_rx_tx.lock();
+            if slot.is_some() {
+                return Err(quic_tunnel::QuicEndpointError::Io(
+                    std::io::Error::new(std::io::ErrorKind::AlreadyExists,
+                                        "quic already enabled on this tunnel")));
+            }
+            *slot = Some(tx);
+        }
+        let client_config = quic_tunnel::make_client_config()?;
+        let mut endpoint = quic_tunnel::build_endpoint(self.clone(), rx, None)?;
+        endpoint.set_default_client_config(client_config);
+        // "lktunnel" matches the SAN in the self-signed cert built
+        // by `make_server_config`.
+        let connection = endpoint
+            .connect(quic_tunnel::peer_sentinel_addr(), "lktunnel")?
+            .await?;
+        Ok(quic_tunnel::QuicClient { endpoint, connection })
     }
 
     #[cfg(unix)]
@@ -628,6 +942,21 @@ impl TunnelInner {
         self.connected.store(false, Ordering::Relaxed);
         if let Some(h) = self.task.lock().take()        { h.abort(); }
         if let Some(h) = self.sender_task.lock().take() { h.abort(); }
+        // Tear down SOCKS5 / QUIC ahead of NAT/TUN drop — they own
+        // tokio tasks that hold weak refs into Inner, so aborting
+        // them first means those tasks can't observe a partially-
+        // torn state during the dispatcher hop below.
+        if let Some(h) = self.socks5_handle.lock().take() {
+            h.listener_abort.abort();
+        }
+        if let Some(h) = self.quic_server_handle.lock().take() {
+            h.accept_abort.abort();
+        }
+        // Drop the persistent QUIC client — closes the connection +
+        // endpoint, releases TunnelUdpSocket and quic_rx_tx sender.
+        let _ = self.quic_client.lock().take();
+        *self.quic_rx_tx.lock() = None;
+
         // Move NAT/TUN boxes out and drop them on the dispatcher
         // thread (mio source de-registration must run there).
         let nat_box = self.nat.lock().take();
@@ -746,36 +1075,62 @@ async fn run_connect_task(
         // of N — keeping us under the SFU's per-track bitrate cap on
         // small-packet bursts (SYN-ACKs, ACKs, DNS) without adding
         // any artificial buffering delay.
-        let flush = |batch: &mut Vec<u8>,
-                     drops: &mut u64,
-                     sent:  &mut u64,
-                     packets: u64,
-                     rtp: &rtp::RtpSender|
-        {
+        // `flush` is async because it has to await the FrameTransformer
+        // drain when its 256-slot outgoing queue is full. Awaiting here
+        // — instead of the old "log + clear + move on" — is what makes
+        // backpressure actually propagate: sender task awaits → mpsc
+        // (send_rx) fills → AsyncUdpSocket.try_send returns WouldBlock
+        // → DrainPoller parks quinn → quinn's per-stream flow control
+        // kicks in. Without this, quinn happily pushes datagrams that
+        // we silently drop, and TCP-over-QUIC sees collapse.
+        async fn flush_with_backpressure(
+            batch: &mut Vec<u8>,
+            sent:  &mut u64,
+            cumulative_waits: &mut u64,
+            packets: u64,
+            rtp:   &rtp::RtpSender,
+        ) {
             if batch.is_empty() { return; }
-            if !rtp.send(batch) {
-                *drops += 1;
-                if drops.is_power_of_two() {
+            // Encoder runs at ~50 Hz (20ms ticks). On overflow, retry
+            // with a short backoff that doesn't burn CPU but doesn't
+            // wait through more than one encoder tick either.
+            const RETRY_MS: u64 = 5;
+            // Local wait counter: tracks just *this* flush. Logged once
+            // on entry into backpressure and once on recovery — no
+            // power-of-two spam.
+            let mut local_waits = 0u64;
+            while !rtp.send(batch) {
+                if local_waits == 0 {
+                    // First time we couldn't push this batch — emit one
+                    // line so the operator knows we're pacing.
                     log::warn!(
-                        "rtp send queue full — dropped {drops} frames total \
-                         (depth={})",
+                        "rtp send queue full — backpressuring (depth={})",
                         rtp.queue_depth(),
                     );
                 }
-            } else {
-                *sent = sent.saturating_add(1);
-                if sent.is_power_of_two() {
-                    log::debug!(
-                        "rtp send checkpoint: enqueued {sent} frames packing \
-                         {packets} ip-packets total (last_frame={}B, depth={}, \
-                         drops={drops})",
-                        batch.len(),
-                        rtp.queue_depth(),
-                    );
-                }
+                local_waits = local_waits.saturating_add(1);
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+            }
+            if local_waits > 0 {
+                // Came out of backpressure — log once.
+                log::warn!(
+                    "rtp send drained after {local_waits} waits (~{}ms)",
+                    local_waits * RETRY_MS,
+                );
+                *cumulative_waits = cumulative_waits.saturating_add(local_waits);
+            }
+            *sent = sent.saturating_add(1);
+            if sent.is_power_of_two() {
+                log::debug!(
+                    "rtp send checkpoint: enqueued {sent} frames packing \
+                     {packets} ip-packets total (last_frame={}B, depth={}, \
+                     cumulative_waits={cumulative_waits})",
+                    batch.len(),
+                    rtp.queue_depth(),
+                );
             }
             batch.clear();
-        };
+        }
 
         loop {
             // Block for the first packet of the next batch.
@@ -795,7 +1150,9 @@ async fn run_connect_task(
                     Ok(next) => {
                         packets = packets.saturating_add(1);
                         if !rtp::push_packed(&mut batch, &next) {
-                            flush(&mut batch, &mut drops, &mut sent, packets, &rtp_for_sender);
+                            flush_with_backpressure(
+                                &mut batch, &mut sent, &mut drops, packets, &rtp_for_sender,
+                            ).await;
                             rtp::push_packed(&mut batch, &next);
                         }
                     }
@@ -804,7 +1161,9 @@ async fn run_connect_task(
                 }
             }
 
-            flush(&mut batch, &mut drops, &mut sent, packets, &rtp_for_sender);
+            flush_with_backpressure(
+                &mut batch, &mut sent, &mut drops, packets, &rtp_for_sender,
+            ).await;
 
             if let Some(inner) = weak_for_sender.upgrade() {
                 let drained: Vec<_> = inner.drain_waiters.lock().drain(..).collect();
@@ -812,7 +1171,9 @@ async fn run_connect_task(
             }
         }
         // Final flush (channel closed mid-batch).
-        flush(&mut batch, &mut drops, &mut sent, packets, &rtp_for_sender);
+        flush_with_backpressure(
+            &mut batch, &mut sent, &mut drops, packets, &rtp_for_sender,
+        ).await;
     });
     inner.sender_task.lock().replace(sender.abort_handle());
     drop(inner);  // release Arc; only weak remains for the rest of the task.
@@ -892,6 +1253,28 @@ async fn run_tunnel_loop(
     emit_event(&on_event, EventKind::Connected, String::new());
     log::info!("LkTunnel: connected (peer present)");
 
+    // Auto-warm the QUIC client connection as soon as the peer is
+    // in, **only on the client side**. We detect "client side" by
+    // the absence of a NAT (server mode installs it via
+    // `start_server`) and the absence of a QUIC server handle
+    // (auto-installed by `start_server` too). Pre-warming here
+    // means platform shims (Android, Node) don't have to explicitly
+    // call `ensure_quic_client` — toggling SOCKS5 on later is
+    // instantaneous because the handshake already completed.
+    if let Some(inner) = weak.upgrade() {
+        let is_client_role = inner.nat.lock().is_none()
+            && inner.quic_server_handle.lock().is_none();
+        if is_client_role {
+            let tunnel = LkTunnel { inner: inner.clone() };
+            runtime().spawn(async move {
+                if let Err(e) = tunnel.ensure_quic_client().await {
+                    log::warn!("auto ensure_quic_client failed: {e} — \
+                                SOCKS5 will retry on first enable");
+                }
+            });
+        }
+    }
+
     // Main loop. The LK SDK doesn't always deliver ParticipantDisconnected
     // promptly when a peer drops ungracefully (m144 waits out the
     // signaling-stream timeout, ~30 s). A 2 s probe of the roster
@@ -956,15 +1339,18 @@ fn emit_event(
     on_event(Event { kind, info });
 }
 
-/// Parse one wire payload and route to the consumer's `on_ip` if it's
-/// an IP frame (leading `'I'` byte). Anything else is dropped with a
-/// debug log — the tag byte exists so a future peer could multiplex
-/// extra planes on the same RTP carrier without a breaking change.
+/// Parse one wire payload and route to the matching consumer.
+/// `'I'`-tagged frames go to `on_ip` (raw IP packets for NAT / TUN);
+/// `'Q'`-tagged frames go to `on_quic` (quinn datagrams for the QUIC
+/// reliable channel that backs SOCKS5-over-tunnel). Unknown tags are
+/// dropped with a debug log — the tag byte reserves namespace for
+/// additional planes without a breaking wire change.
 /// Bytes arrive here from the RTP transformer's on_data observer
 /// (see [`rtp`]).
 fn dispatch_payload(
     payload: &[u8],
     on_ip:   &Arc<dyn Fn(&[u8]) + Send + Sync>,
+    on_quic: &Arc<dyn Fn(&[u8]) + Send + Sync>,
 ) {
     static DISPATCHED: AtomicU64 = AtomicU64::new(0);
     let n = DISPATCHED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -972,10 +1358,11 @@ fn dispatch_payload(
         log::debug!("rtp dispatch checkpoint: {n} payloads (last len={})", payload.len());
     }
     match payload.first() {
-        Some(&FRAME_TYPE_IP) => on_ip(&payload[1..]),
-        Some(&other)         => log::debug!(
+        Some(&FRAME_TYPE_IP)   => on_ip(&payload[1..]),
+        Some(&FRAME_TYPE_QUIC) => on_quic(&payload[1..]),
+        Some(&other)           => log::debug!(
             "unknown frame type 0x{other:02x} (len={}) — dropping", payload.len()),
-        None                 => {}
+        None                   => {}
     }
 }
 
@@ -994,8 +1381,26 @@ fn attach_rtp_receiver(
     };
     let Some(inner) = weak.upgrade() else { return };
     let on_ip = Arc::clone(on_ip);
+    // QUIC inbound: try to push to inner.quic_rx_tx (set by
+    // `LkTunnel::enable_quic_*`). If no QUIC channel is configured the
+    // 'Q' frame is silently dropped — same shape as 'I' frames when no
+    // override / NAT / TUN is set yet. Counts toward this tunnel's rx
+    // counters so the JS/UI bandwidth display covers QUIC traffic
+    // alongside IP traffic.
+    let quic_weak = std::sync::Arc::downgrade(&inner);
+    let on_quic: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
+        let Some(inner) = quic_weak.upgrade() else { return };
+        inner.counters.bump_rx(bytes.len());
+        let tx = inner.quic_rx_tx.lock().clone();
+        if let Some(tx) = tx {
+            // Datagram is best-effort: a full receiver queue means
+            // quinn isn't draining fast enough → drop, same as a UDP
+            // socket buffer overflow. quinn handles real loss via ARQ.
+            let _ = tx.try_send(bytes::Bytes::copy_from_slice(bytes));
+        }
+    });
     let on_data: Arc<dyn Fn(&[u8]) + Send + Sync> =
-        Arc::new(move |payload: &[u8]| dispatch_payload(payload, &on_ip));
+        Arc::new(move |payload: &[u8]| dispatch_payload(payload, &on_ip, &on_quic));
     match rtp::attach_remote(&audio, on_data) {
         Ok(receiver) => {
             log::info!("LkTunnel[{}]: rtp receiver attached on track sid={}",

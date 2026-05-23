@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent" android:layout_height="match_parent">
 
 <LinearLayout
@@ -98,10 +99,14 @@
                 android:text="Select Peer"
                 android:layout_marginBottom="8dp"/>
 
+            <!-- Start / Disconnect — single button that toggles the
+                 tunnel (with SOCKS5 listener) on or off. Text and
+                 colour change with state. The VPN toggle below
+                 controls device-wide TUN routing on top. -->
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnVpn"
                 android:layout_width="match_parent" android:layout_height="wrap_content"
-                android:text="Start VPN"
+                android:text="Start"
                 android:layout_marginBottom="8dp"
                 android:visibility="gone"/>
 
@@ -112,6 +117,71 @@
                 android:gravity="center"
                 android:layout_gravity="center_horizontal"
                 android:visibility="gone"/>
+
+            <!-- ── Tunnel-up panel: VPN toggle + LAN proxy section ───── -->
+            <LinearLayout android:id="@+id/layoutSocks5"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:layout_marginTop="16dp"
+                android:visibility="gone">
+
+                <!-- VPN toggle: route this device's own traffic through
+                     the tunnel (VpnService TUN). Sits above the SOCKS5
+                     section so the relationship "VPN on top of proxy"
+                     is visually obvious. -->
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/swVpn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="VPN"
+                    android:textSize="15sp"
+                    android:showText="false"
+                    android:textOn=""
+                    android:textOff=""/>
+
+                <!-- SOCKS5 proxy: label + port + toggle on one row.
+                     Independent of VPN; other devices on the same
+                     LAN can use this device's tunnel as a proxy. -->
+                <LinearLayout
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="16dp">
+
+                    <TextView
+                        android:layout_width="0dp" android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="SOCKS5 proxy"
+                        android:textSize="15sp"/>
+
+                    <EditText
+                        android:id="@+id/etSocks5Port"
+                        android:layout_width="72dp" android:layout_height="wrap_content"
+                        android:inputType="number"
+                        android:hint="1080"
+                        android:text="1080"
+                        android:textSize="14sp"
+                        android:gravity="end"
+                        android:layout_marginEnd="8dp"
+                        android:importantForAutofill="no"
+                        tools:ignore="LabelFor"/>
+
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/swSocks5"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:showText="false"
+                        android:textOn=""
+                        android:textOff=""/>
+                </LinearLayout>
+
+                <TextView android:id="@+id/tvSocks5Status"
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:textSize="11sp" android:alpha="0.6"
+                    android:fontFamily="monospace"
+                    android:layout_marginTop="4dp"
+                    android:visibility="gone"/>
+            </LinearLayout>
 
         </LinearLayout>
 

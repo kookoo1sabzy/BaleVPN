@@ -89,7 +89,7 @@ class TunnelManager {
         this.getBale               = getBale || (async () => null);
         this.onTunnelReady         = onTunnelReady         || (() => {});
         this.onPermanentDisconnect = onPermanentDisconnect || (() => {});
-        this.mode = null;                     // 'server' | null  (client mode gone)
+        this.mode = null;                     // 'server' | 'client' | null
         // Field-name preserved for http-server.js compatibility — the
         // entries are now `ClientInfo` records, not `LiveKitTransport`
         // instances, but the read-side code only touches `_callerId`,
@@ -102,9 +102,21 @@ class TunnelManager {
         this._gateway       = null;           // TunGateway handle (kernel mode only)
         this._tunFd         = null;           // raw fd of bale0 (kernel mode only)
         this._tunName       = null;           // 'bale0' (kernel mode only)
+        // ── Client-mode state (mode === 'client') ─────────────────
+        // The Node app dials a single server peer over Bale signaling,
+        // joins the LK room, brings up a SOCKS5-over-QUIC listener via
+        // the napi Tunnel's `enableSocks5Server`. Reliability + stream
+        // mux live entirely in the Rust core — JS just orchestrates.
+        this.serverPeer        = null;        // { id, type }
+        this.socks5Port        = 1080;        // requested port
+        this._socks5BoundPort  = 0;           // actually-bound port (0 if not up)
+        this._clientTunnel     = null;        // napi Tunnel
+        this._clientCallId     = null;        // Bale call id we initiated
+        this._clientReady      = false;
+        this._clientStarting   = false;       // re-entrancy guard for _startClient
     }
 
-    configure(mode) {
+    configure(mode, opts = {}) {
         this._stopAll();
         this.mode = mode || null;
         if (mode === 'server' && NAT_MODE === 'kernel') {
@@ -125,23 +137,162 @@ unavailable on this platform/host. Refusing to start. Use \
                 process.exit(1);
             }
         }
+        if (mode === 'client') {
+            // Stash the target peer and SOCKS5 port; the actual call
+            // happens once WS is ready (onWsReady).
+            this.serverPeer = opts.serverPeerId
+                ? { id: opts.serverPeerId, type: opts.serverPeerType }
+                : null;
+            this.socks5Port = Number(opts.socks5Port) || 1080;
+            // Kick off if WS already up; otherwise onWsReady will retry.
+            this._startClientIfReady().catch(e => {
+                console.error('[Tunnel/C] start failed:', e.message);
+                try { this.onPermanentDisconnect(); } catch (_) {}
+            });
+        }
         console.log(`[Tunnel] configure mode=${mode || 'none'} nat-mode=${NAT_MODE}`);
     }
 
-    /** Bale WS landed handshake — for kernel mode we set the TUN up
-     *  eagerly at `configure` so there's nothing to do here, but the
-     *  hook stays in the API contract for symmetry with the old
-     *  flow / Android. */
-    onWsReady() {}
+    /** Bale WS landed handshake — for server kernel mode we set the
+     *  TUN up eagerly at `configure` so there's nothing to do here.
+     *  Client mode uses this hook as the trigger to actually dial
+     *  the peer (the WS becomes available asynchronously). */
+    onWsReady() {
+        if (this.mode === 'client') {
+            this._startClientIfReady().catch(e => {
+                console.error('[Tunnel/C] start failed:', e.message);
+                try { this.onPermanentDisconnect(); } catch (_) {}
+            });
+        }
+    }
+
+    /** Client-mode entry point — idempotent. Either starts the tunnel
+     *  if conditions are met (mode=client, peer set, WS up, not
+     *  already running) or no-ops. */
+    async _startClientIfReady() {
+        if (this.mode !== 'client' || !this.serverPeer) return;
+        if (this._clientTunnel || this._clientStarting) return;
+        this._clientStarting = true;
+        try {
+            const ws = await this.getBale();
+            if (!ws) {
+                // WS not up yet — onWsReady will retry when it lands.
+                return;
+            }
+            await this._startClient(ws);
+        } finally {
+            this._clientStarting = false;
+        }
+    }
+
+    /** Dial the server peer, wait for callAccepted, join the LK room
+     *  via the napi Tunnel, then bring up the SOCKS5 listener. Throws
+     *  on any failure; caller should clear client state and notify
+     *  onPermanentDisconnect. */
+    async _startClient(ws) {
+        console.log(`[Tunnel/C] startCall to peer ${this.serverPeer.id}/${this.serverPeer.type}`);
+        const resp = await ws.startCall(this.serverPeer.id, this.serverPeer.type);
+        const call = resp.call;
+        if (!call?.isLivekit || !call?.token) {
+            throw new Error('startCall: no LiveKit info in response');
+        }
+        this._clientCallId = call.id;
+
+        console.log(`[Tunnel/C] call ${call.id}, waiting for callAccepted...`);
+        await new Promise((resolve, reject) => {
+            const ACCEPT_TIMEOUT_MS = 60_000;
+            const timer = setTimeout(() => {
+                remover();
+                reject(new Error(`callAccepted timeout after ${ACCEPT_TIMEOUT_MS / 1000}s`));
+            }, ACCEPT_TIMEOUT_MS);
+            const remover = ws.addOnCallAccepted((id) => {
+                if (String(id) === String(call.id)) {
+                    clearTimeout(timer);
+                    remover();
+                    resolve();
+                }
+            });
+        });
+        console.log(`[Tunnel/C] callAccepted, joining LK room ${call.room || '(no room id)'}`);
+
+        const binding = lk();
+        const tunnel = binding.Tunnel.connect(call.url, call.token, (kind, _info) => {
+            if (kind === 'PeerJoined') {
+                console.log('[Tunnel/C] peer joined LK room');
+            } else if (kind === 'Disconnected' || kind === 'Failed') {
+                console.warn(`[Tunnel/C] LK event ${kind} — tearing down`);
+                this._clientReady = false;
+                if (this._clientTunnel === tunnel) {
+                    try { tunnel.disableSocks5Server(); } catch (_) {}
+                    try { tunnel.disconnect(); } catch (_) {}
+                    this._clientTunnel = null;
+                    this._socks5BoundPort = 0;
+                    this.onPermanentDisconnect();
+                }
+            }
+        });
+        this._clientTunnel = tunnel;
+
+        // **Await the LK room actually being up** before bringing up
+        // SOCKS5/QUIC. Tunnel.connect() returns immediately and the
+        // room join completes asynchronously; calling
+        // enableSocks5Server before the peer has joined makes the QUIC
+        // handshake race vs. LK room readiness and burn retries.
+        try {
+            await tunnel.awaitConnected();
+        } catch (e) {
+            try { tunnel.disconnect(); } catch (_) {}
+            this._clientTunnel = null;
+            this._clientCallId = null;
+            throw new Error(`awaitConnected: ${e.message}`);
+        }
+
+        // The Rust core auto-warms QUIC on the client-role tunnel
+        // when peer-joined fires. By the time we call
+        // enableSocks5Server below, the QUIC handshake has either
+        // completed or is in flight; either way, no explicit
+        // ensureQuicClient is needed here.
+
+        // enableSocks5Server reuses the (possibly-already-up) QUIC
+        // client and binds the SOCKS5 TCP listener.
+        try {
+            const bound = await tunnel.enableSocks5Server(this.socks5Port);
+            this._socks5BoundPort = bound;
+            this._clientReady = true;
+            console.log(`[Tunnel/C] SOCKS5 listening on 0.0.0.0:${bound}`);
+            this.onTunnelReady();
+        } catch (e) {
+            try { tunnel.disconnect(); } catch (_) {}
+            this._clientTunnel = null;
+            this._clientCallId = null;
+            throw new Error(`enableSocks5Server: ${e.message}`);
+        }
+    }
 
     status() {
-        return {
+        const base = {
             mode:        this.mode || 'none',
             natMode:     NAT_MODE,
             transport:   'rtp',
             lkActive:    this.lkRooms.size > 0,
             lkRooms:     this.lkRooms.size,
         };
+        if (this.mode === 'client') {
+            // Surface client-mode state for the UI (SOCKS5 port,
+            // connect-readiness, and tunnel bandwidth so the
+            // status badge can update live).
+            let s = [0, 0, 0, 0];
+            try { if (this._clientTunnel) s = this._clientTunnel.stats(); } catch (_) {}
+            return {
+                ...base,
+                serverPeer:   this.serverPeer,
+                socks5Port:   this._socks5BoundPort || this.socks5Port,
+                clientReady:  this._clientReady,
+                sessions:     this._clientReady ? 1 : 0,
+                rxPkts: s[0], rxBytes: s[1], txPkts: s[2], txBytes: s[3],
+            };
+        }
+        return base;
     }
 
     clients() {
@@ -549,6 +700,15 @@ unavailable on this platform/host. Refusing to start. Use \
         this.pendingMap.clear();
         if (this._pendingSweep) { clearInterval(this._pendingSweep); this._pendingSweep = null; }
         this._teardownTun();
+        // Client-mode tear-down: disable SOCKS5 + drop the Tunnel.
+        if (this._clientTunnel) {
+            try { this._clientTunnel.disableSocks5Server(); } catch (_) {}
+            try { this._clientTunnel.disconnect(); } catch (_) {}
+            this._clientTunnel = null;
+        }
+        this._clientCallId    = null;
+        this._clientReady     = false;
+        this._socks5BoundPort = 0;
     }
 }
 

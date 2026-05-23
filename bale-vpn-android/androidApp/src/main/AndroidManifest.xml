@@ -68,14 +68,6 @@
                 android:value="VPN tunnel service for user-initiated secure proxy connection" />
         </service>
 
-        <service
-            android:name=".BaleSocks5Service"
-            android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Local SOCKS5 proxy listener for LAN clients" />
-        </service>
 
     </application>
 </manifest>

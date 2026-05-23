@@ -41,8 +41,21 @@ class MainActivity : BaseActivity() {
     private lateinit var btnVpn:        MaterialButton
     private lateinit var tvStats:       TextView
 
-    // (SOCKS5-from-UI option removed; BaleSocks5Service is kept in
-    // the codebase but is no longer started or surfaced.)
+    // Client section "tunnel up" panel: VPN toggle (route device
+    // traffic through the TUN) + LAN SOCKS5 proxy toggle + port.
+    // Both toggles persist across app restarts and take effect on the
+    // next Start (BaleVpnService reads the prefs at startup). Defaults:
+    // swVpn = true (most users want their own device routed),
+    // swSocks5 = false (LAN sharing is an opt-in extra).
+    private lateinit var layoutSocks5:    LinearLayout
+    private lateinit var swVpn:           com.google.android.material.switchmaterial.SwitchMaterial
+    private lateinit var swSocks5:        com.google.android.material.switchmaterial.SwitchMaterial
+    private lateinit var etSocks5Port:    android.widget.EditText
+    private lateinit var tvSocks5Status:  TextView
+    // Guard against programmatic `swSocks5.isChecked = …` recursively
+    // firing the listener it lives inside.
+    private var socks5UpdatingProgrammatically = false
+    private var vpnUpdatingProgrammatically    = false
 
     // Server section
     private lateinit var layoutServer:      LinearLayout
@@ -62,7 +75,13 @@ class MainActivity : BaseActivity() {
     private val pendingRowViews = mutableMapOf<Long, View>()
 
     private companion object {
-        const val VPN_REQUEST = 1
+        const val VPN_REQUEST          = 1
+        // Distinct request code so onActivityResult can tell apart
+        // "user pressed Start → grant permission → startVpn" (the
+        // VPN_REQUEST path) from "service is already running and the
+        // user flipped swVpn on" (this path). Same prepare-intent;
+        // different completion handler.
+        const val VPN_REQUEST_RUNTIME  = 2
     }
 
     private val notifPermLauncher = registerForActivityResult(
@@ -93,6 +112,11 @@ class MainActivity : BaseActivity() {
         btnSelectPeer = findViewById(R.id.btnSelectPeer)
         btnVpn        = findViewById(R.id.btnVpn)
         tvStats       = findViewById(R.id.tvStats)
+        layoutSocks5    = findViewById(R.id.layoutSocks5)
+        swVpn           = findViewById(R.id.swVpn)
+        swSocks5        = findViewById(R.id.swSocks5)
+        etSocks5Port    = findViewById(R.id.etSocks5Port)
+        tvSocks5Status  = findViewById(R.id.tvSocks5Status)
         layoutServer       = findViewById(R.id.layoutServer)
         tvServerStatus     = findViewById(R.id.tvServerStatus)
         tvPendingHeader    = findViewById(R.id.tvPendingHeader)
@@ -132,7 +156,18 @@ class MainActivity : BaseActivity() {
             }
         }
         btnVpn.setOnClickListener {
-            if (BaleVpnService.isRunning) stopVpn() else prepareVpn()
+            if (BaleVpnService.isRunning) {
+                stopVpn()
+            } else if (prefs.getBoolean("vpn_enabled", true)) {
+                // VPN ON → need the system VPN-permission grant before
+                // BaleVpnService can call Builder().establish().
+                prepareVpn()
+            } else {
+                // VPN OFF → tunnel-only (SOCKS5 listener if toggled).
+                // Skip VpnService.prepare entirely; the service can run
+                // as a regular foreground service when no TUN is needed.
+                startVpn()
+            }
         }
         btnSelectPeer.setOnClickListener {
             startActivity(Intent(this, ContactsActivity::class.java))
@@ -146,6 +181,81 @@ class MainActivity : BaseActivity() {
             startActivity(Intent(this, ServerClientsActivity::class.java))
         }
         btnLogout.setOnClickListener { logout() }
+
+        etSocks5Port.setText(prefs.getInt("socks5_port", 1080).toString())
+        // Defaults: VPN on, SOCKS5 off.
+        swVpn.isChecked    = prefs.getBoolean("vpn_enabled",    true)
+        swSocks5.isChecked = prefs.getBoolean("socks5_enabled", false)
+
+        swVpn.setOnCheckedChangeListener { _, isChecked ->
+            if (vpnUpdatingProgrammatically) return@setOnCheckedChangeListener
+            prefs.edit().putBoolean("vpn_enabled", isChecked).apply()
+            if (!BaleVpnService.isRunning) return@setOnCheckedChangeListener
+            if (isChecked) {
+                // Runtime enable: needs VpnService.prepare() permission
+                // since the user might have started the service in
+                // "no VPN" mode (no prior grant). If already granted,
+                // prepare() returns null and we enable immediately.
+                val intent = android.net.VpnService.prepare(this)
+                if (intent != null) {
+                    startActivityForResult(intent, VPN_REQUEST_RUNTIME)
+                } else {
+                    enableTunWithUiUpdate()
+                }
+            } else {
+                BaleVpnService.disableTun()
+            }
+        }
+
+        swSocks5.setOnCheckedChangeListener { _, isChecked ->
+            if (socks5UpdatingProgrammatically) return@setOnCheckedChangeListener
+            prefs.edit().putBoolean("socks5_enabled", isChecked).apply()
+            val port = etSocks5Port.text?.toString()?.toIntOrNull() ?: 1080
+            prefs.edit().putInt("socks5_port", port).apply()
+            // Runtime enable/disable when the tunnel is up; otherwise
+            // just persist and let the next Start pick it up.
+            if (!BaleVpnService.isRunning) {
+                tvSocks5Status.visibility = View.GONE
+                return@setOnCheckedChangeListener
+            }
+            if (isChecked) {
+                tvSocks5Status.visibility = View.VISIBLE
+                tvSocks5Status.text = "Starting…"
+                uiScope.launch {
+                    val bound = withContext(Dispatchers.Default) {
+                        BaleVpnService.enableSocks5(port)
+                    }
+                    if (bound == 0) {
+                        tvSocks5Status.text = "Failed — check logcat"
+                        socks5UpdatingProgrammatically = true
+                        try { swSocks5.isChecked = false }
+                        finally { socks5UpdatingProgrammatically = false }
+                    } else {
+                        renderSocks5Listening(bound)
+                    }
+                }
+            } else {
+                BaleVpnService.disableSocks5()
+                tvSocks5Status.visibility = View.GONE
+            }
+        }
+        etSocks5Port.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                val p = etSocks5Port.text?.toString()?.toIntOrNull() ?: 1080
+                prefs.edit().putInt("socks5_port", p).apply()
+                if (swSocks5.isChecked && BaleVpnService.isRunning &&
+                    BaleVpnService.socks5Port != 0 &&
+                    BaleVpnService.socks5Port != p) {
+                    uiScope.launch {
+                        val bound = withContext(Dispatchers.Default) {
+                            BaleVpnService.disableSocks5()
+                            BaleVpnService.enableSocks5(p)
+                        }
+                        renderSocks5Listening(bound)
+                    }
+                }
+            }
+        }
 
         requestBackgroundPermissions()
     }
@@ -183,9 +293,35 @@ class MainActivity : BaseActivity() {
         startService(Intent(this, BaleServerService::class.java))
     }
 
+    /** Render the SOCKS5 status text from the live bound port. Callers:
+     *
+     *  - The toggle listener (right after `enableSocks5` returns) —
+     *    so the user sees feedback the moment the listener binds.
+     *  - The 500ms `tick()` — so the auto-enable path on tunnel
+     *    startup also surfaces the LAN address without a manual
+     *    toggle cycle.
+     *
+     *  Cheap: just builds a string and assigns if it actually
+     *  changed (TextView invalidation cost). */
+    private fun renderSocks5Listening(bound: Int) {
+        tvSocks5Status.visibility = View.VISIBLE
+        val newText = if (bound == 0) {
+            "Failed — check logcat"
+        } else {
+            val lan = getLocalLanIpv4()
+            if (lan != null)
+                "Listening on $lan:$bound (point other devices here)"
+            else
+                "Listening on port $bound (no LAN IP yet)"
+        }
+        if (tvSocks5Status.text != newText) tvSocks5Status.text = newText
+    }
+
     private fun showModeLayout(mode: String) {
         layoutClient.visibility = if (mode == "server") View.GONE else View.VISIBLE
         layoutServer.visibility = if (mode == "server") View.VISIBLE else View.GONE
+        // SOCKS5 toggle is only meaningful in client mode.
+        layoutSocks5.visibility = if (mode == "server") View.GONE else View.VISIBLE
     }
 
     private fun requestBackgroundPermissions() {
@@ -326,9 +462,9 @@ class MainActivity : BaseActivity() {
             // will trigger, not the current state, so users aren't surprised when
             // tapping "Connecting…" stops the attempt.
             btnVpn.text             = when {
-                connected -> "Disconnect VPN"
+                connected -> "Disconnect"
                 running   -> "Cancel (Connecting…)"
-                else      -> "Start VPN"
+                else      -> "Start"
             }
             btnVpn.isEnabled        = running || wsReady
             btnSelectPeer.text      = "Change Peer"
@@ -341,6 +477,17 @@ class MainActivity : BaseActivity() {
                 tvStats.visibility = View.VISIBLE
             } else {
                 tvStats.visibility = View.GONE
+            }
+            // SOCKS5 status — single source of truth is the live bound
+            // port. Whether the listener was started by the auto-enable
+            // path in BaleVpnService (at tunnel-up) or by a manual
+            // swSocks5 flip, the same `renderSocks5Listening` call
+            // surfaces the LAN address.
+            val bound = BaleVpnService.socks5Port
+            if (connected && bound != 0) {
+                renderSocks5Listening(bound)
+            } else if (!swSocks5.isChecked || !connected) {
+                tvSocks5Status.visibility = View.GONE
             }
         }
     }
@@ -441,7 +588,38 @@ class MainActivity : BaseActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == VPN_REQUEST && resultCode == RESULT_OK) startVpn()
+        when (requestCode) {
+            VPN_REQUEST          ->
+                if (resultCode == RESULT_OK) startVpn()
+            VPN_REQUEST_RUNTIME  -> {
+                if (resultCode == RESULT_OK) {
+                    enableTunWithUiUpdate()
+                } else {
+                    // User denied permission — revert the toggle.
+                    vpnUpdatingProgrammatically = true
+                    try { swVpn.isChecked = false }
+                    finally { vpnUpdatingProgrammatically = false }
+                    prefs.edit().putBoolean("vpn_enabled", false).apply()
+                }
+            }
+        }
+    }
+
+    /** Bring up the TUN on the live service, on a worker thread (the
+     *  Builder().establish() call hits JNI and shouldn't block the
+     *  UI thread). On failure, revert the toggle. */
+    private fun enableTunWithUiUpdate() {
+        uiScope.launch {
+            val ok = withContext(Dispatchers.Default) { BaleVpnService.enableTun() }
+            if (!ok) {
+                Toast.makeText(this@MainActivity,
+                    "VPN enable failed — check logcat", Toast.LENGTH_SHORT).show()
+                vpnUpdatingProgrammatically = true
+                try { swVpn.isChecked = false }
+                finally { vpnUpdatingProgrammatically = false }
+                prefs.edit().putBoolean("vpn_enabled", false).apply()
+            }
+        }
     }
 
     private fun startVpn() {

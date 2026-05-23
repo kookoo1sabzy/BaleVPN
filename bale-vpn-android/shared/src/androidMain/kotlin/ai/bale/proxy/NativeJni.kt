@@ -23,19 +23,6 @@ internal object NativeJni {
         LkNative.nativeVersion()
     }
 
-    // ── Native SOCKS5 server ───────────────────────────────────────────────
-    //
-    // Process-wide singleton implemented in lktunnel-rust's
-    // `socks5.rs`. All calls are safe from any thread; the native
-    // side posts work onto the shared dispatcher.
-
-    @JvmStatic external fun socks5Start(port: Int)
-    @JvmStatic external fun socks5Stop()
-    @JvmStatic external fun socks5IsRunning(): Boolean
-    @JvmStatic external fun socks5ActiveConnections(): Int
-    @JvmStatic external fun socks5TotalAccepted(): Long
-    @JvmStatic external fun socks5SetDebug(enabled: Boolean)
-
     /** Toggle verbose logging in the native NAT layer. Sticky /
      *  process-wide. Wrapped by [LkTunnel.setDebug]. */
     @JvmStatic external fun natSetDebug(enabled: Boolean)

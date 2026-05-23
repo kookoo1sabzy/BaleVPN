@@ -73,11 +73,91 @@ class BaleVpnService : VpnService() {
         )
 
         /** Live reference to the running VPN's transport, so mid-session
-         *  preference flips (Advanced → Stay in room) reach the
-         *  currently-attached tunnel without waiting for a fresh
-         *  startVpn. Set by `startVpn` after `transport.connect`,
-         *  cleared by `stopVpn`. */
+         *  preference flips (VPN / SOCKS5 toggles) reach the currently-
+         *  attached tunnel without waiting for a fresh startVpn. Set by
+         *  `startVpn` after `transport.connect`, cleared by `stopVpn`. */
         @Volatile private var liveTransport: LkTunnel? = null
+
+        /** Live reference to the running service instance — needed to
+         *  construct `VpnService.Builder()` at runtime (the Builder is
+         *  an inner class of `VpnService` and must be instantiated
+         *  against an active service). Set in `onCreate`, cleared in
+         *  `onDestroy`. */
+        @Volatile private var instance: BaleVpnService? = null
+
+        /** Bring up the TUN at runtime against the live tunnel.
+         *  Assumes the user has already granted VPN permission via
+         *  `VpnService.prepare(...)` in an Activity context. Returns
+         *  true on success; false if no live tunnel or no service
+         *  instance or `establish()` failed (e.g. permission missing). */
+        @JvmStatic
+        fun enableTun(): Boolean {
+            val svc = instance ?: return false
+            val t   = liveTransport ?: return false
+            return svc.attachTunNow(t)
+        }
+
+        /** Drop the TUN at runtime: the LK tunnel + SOCKS5 listener
+         *  (if up) stay running, but the device's own traffic stops
+         *  routing through the tunnel. Idempotent. */
+        @JvmStatic
+        fun disableTun() {
+            liveTransport?.detachTun()
+        }
+
+        /** Currently-bound SOCKS5 port (0 = not running). Surfaced so the
+         *  UI can label the toggle with the active port. */
+        @Volatile var socks5Port: Int = 0
+
+        /** Enable the LAN-facing SOCKS5 listener on the live VPN tunnel.
+         *  Returns the bound port (matches `port` unless `0` was passed
+         *  for OS-assign), or `0` on failure / no live tunnel. Blocks
+         *  briefly on the QUIC handshake — callers should run from a
+         *  worker thread. */
+        @JvmStatic
+        fun enableSocks5(port: Int): Int {
+            val t = liveTransport ?: return 0
+            val bound = t.enableSocks5Server(port)
+            socks5Port = bound
+            return bound
+        }
+
+        /** Tear down the SOCKS5 listener. Idempotent. */
+        @JvmStatic
+        fun disableSocks5() {
+            liveTransport?.disableSocks5Server()
+            socks5Port = 0
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+    }
+
+    /** Build a VpnService TUN and hand its fd to the live tunnel.
+     *  Called from the companion `enableTun()` when the user toggles
+     *  the VPN switch on at runtime. Assumes VPN permission was
+     *  already granted via `VpnService.prepare(...)` in an Activity
+     *  context; if not, `establish()` returns null and we surface
+     *  false so MainActivity can re-prompt. */
+    private fun attachTunNow(transport: LkTunnel): Boolean {
+        val builder = Builder()
+            .setSession("Bale VPN")
+            .addAddress("10.8.0.2", 24)
+            .addRoute("::", 0)
+            .addDnsServer("8.8.8.8")
+            .addDnsServer("217.218.155.155")
+            .setMtu(1000)
+            .addDisallowedApplication(packageName)
+        for ((addr, prefix) in PUBLIC_IPV4_ROUTES) builder.addRoute(addr, prefix)
+        val fd = builder.establish() ?: run {
+            Log.e(TAG, "VPN: runtime TUN establish failed (permission not granted?)")
+            return false
+        }
+        Log.d(TAG, "VPN: runtime TUN up (10.8.0.2/24)")
+        transport.attachTun(fd.detachFd())
+        return true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -193,6 +273,56 @@ class BaleVpnService : VpnService() {
             }
             isConnected = true
 
+            // ── VPN / SOCKS5 mode selection ─────────────────────────────
+            //
+            // Two independent toggles, persisted by MainActivity. Both are
+            // read once at this point in startVpn — runtime toggles via the
+            // UI persist immediately but only take full effect on the NEXT
+            // Start cycle (TUN attach/detach at runtime would need a
+            // separate native API). SOCKS5 IS hot-toggleable via the
+            // companion `enableSocks5` / `disableSocks5` methods.
+            val cfg = getSharedPreferences("config", MODE_PRIVATE)
+            val vpnEnabled    = cfg.getBoolean("vpn_enabled",    true)
+            val socks5Enabled = cfg.getBoolean("socks5_enabled", false)
+            val socks5PortPref = cfg.getInt("socks5_port", 1080)
+            Log.d(TAG, "VPN: mode vpn=$vpnEnabled socks5=$socks5Enabled port=$socks5PortPref")
+
+            liveTransport = transport
+            socks5Port = 0
+            rxPkts = 0; rxBytes = 0; txPkts = 0; txBytes = 0
+
+            // The Rust core auto-warms the QUIC client when the LK
+            // tunnel transitions to Connected in client-role mode
+            // (no NAT / no QUIC server handle installed), so we
+            // don't need an explicit ensureQuicClient call here.
+            // First toggle of SOCKS5 will hit the already-up QUIC.
+
+            // Auto-enable SOCKS5 if the user toggled it on. Direct call
+            // — same code path as the runtime companion `enableSocks5`
+            // (we hold a strong ref to `transport` here).
+            if (socks5Enabled) {
+                val bound = transport.enableSocks5Server(socks5PortPref)
+                if (bound != 0) {
+                    socks5Port = bound
+                    Log.d(TAG, "VPN: SOCKS5 listening on $bound")
+                } else {
+                    Log.w(TAG, "VPN: SOCKS5 enable failed")
+                }
+            }
+
+            if (!vpnEnabled) {
+                // VPN OFF: no TUN, no Builder().establish(). The tunnel
+                // is up + SOCKS5 may be listening; the service just
+                // parks until the user taps Disconnect. Apps on this
+                // device hit the network directly (or via the SOCKS5
+                // listener if they're configured to use it).
+                Log.d(TAG, "VPN: TUN skipped (vpn_enabled=false) — tunnel-only mode")
+                // Skip the TUN establish block below by jumping to the
+                // post-attach path. We accomplish this by wrapping the
+                // TUN block in an `if (vpnEnabled)` — see below.
+            }
+
+            if (vpnEnabled) {
             // Establish TUN — tunnel is up and ready to carry packets.
             // Client mode is implied by `attachTun`; no separate call needed.
             //
@@ -258,9 +388,8 @@ class BaleVpnService : VpnService() {
             // native teardown.
             transport.attachTun(fd.detachFd())
             tunFd = null
-            rxPkts = 0; rxBytes = 0; txPkts = 0; txBytes = 0
-            liveTransport = transport
             Log.d(TAG, "VPN: native bridge attached")
+            } // end if (vpnEnabled)
 
             // Poll the native counters so MainActivity's 500 ms tick can read
             // them from the companion fields.
@@ -277,9 +406,6 @@ class BaleVpnService : VpnService() {
                     delay(500)
                 }
             }
-
-            // (SOCKS5-from-UI option removed; BaleSocks5Service still
-            // exists in the codebase but is never started from here.)
 
             // Park until cancelled. The native dispatcher is doing all the
             // per-packet work; we keep the service alive so the foreground
@@ -323,13 +449,9 @@ class BaleVpnService : VpnService() {
         liveTransport = null
         tunFd?.close(); tunFd = null
         scope.coroutineContext.cancelChildren()
-        // SOCKS5 server is meaningful only while VPN is up — its destination
-        // sockets route via the TUN by default; without VPN they'd silently
-        // fall back to the underlying network. Stop it explicitly.
-        if (BaleSocks5Service.isRunning) {
-            startService(Intent(this, BaleSocks5Service::class.java)
-                .setAction(BaleSocks5Service.ACTION_STOP))
-        }
+        // SOCKS5-over-QUIC is torn down by LkTunnel::disconnect() above
+        // (the native side aborts the listener task + drops the QUIC
+        // client). No extra Kotlin-side stop needed.
         // VPN no longer running; let reconcile re-apply the foreground rule
         // (so the WS comes back up if the user is still in the app).
         BaleConnection.reconcile()
@@ -337,7 +459,13 @@ class BaleVpnService : VpnService() {
     }
 
 
-    override fun onDestroy() { Log.d(TAG, "VpnService: onDestroy"); stopVpn(); scope.cancel(); super.onDestroy() }
+    override fun onDestroy() {
+        Log.d(TAG, "VpnService: onDestroy")
+        stopVpn()
+        scope.cancel()
+        instance = null
+        super.onDestroy()
+    }
 
     // ── IPv6 rejection ────────────────────────────────────────────────────────────
     // Send ICMPv6 Destination Unreachable (no route) so apps fail fast and use IPv4.

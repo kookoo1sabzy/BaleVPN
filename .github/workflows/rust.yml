@@ -22,9 +22,18 @@ jobs:
       matrix:
         # Linux is the fast path; macOS catches darwin-specific build
         # issues in webrtc-sys (CoreAudio / VideoToolbox link flags
-        # etc.) that don't surface on Linux.
-        os: [ubuntu-latest, macos-latest]
+        # etc.) that don't surface on Linux. Windows catches the
+        # cfg(unix) gating regressions in lktunnel's TUN / NAT code —
+        # the prebuilt webrtc-sys for Windows is well-supported, but
+        # our own crate has Unix-only paths that need to stay gated.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # `apply.sh` is bash; PowerShell (Windows-latest's default) can't
+    # parse it. git-bash is preinstalled on Windows runners — use it
+    # for every `run:` step so the workflow is OS-uniform.
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
