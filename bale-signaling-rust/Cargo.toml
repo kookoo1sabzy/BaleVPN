@@ -1,0 +1,37 @@
+# bale-signaling-rust — Bale-specific impl of the `lk-signaling`
+# trait. Owns:
+#   * the Bale `.proto` files (single source of truth — Android and
+#     Node previously each carried their own copies)
+#   * the WebSocket client to next-ws.bale.ai (protobuf-framed, NOT
+#     gRPC-web)
+#   * the gRPC-web client used for auth + a few side-channel RPCs
+#   * `BaleAuth`: SMS OTP + signup + cookie refresh, the irreducibly
+#     Bale-shaped flow that doesn't fit a generic trait
+#   * `BaleSignaling`: the full `lk_signaling::Signaling` impl
+[workspace]
+resolver = "2"
+members  = ["bale-signaling"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"
+
+# Mirror lktunnel-rust's vendored crate patches — bale-signaling
+# now path-deps on lktunnel and needs the same patched livekit /
+# libwebrtc / webrtc-sys / livekit-api. Cargo's `[patch]` table
+# does NOT propagate across separate workspaces; each consuming
+# workspace must redeclare it.
+#
+# To recreate vendor/: run `cd ../lktunnel-rust && ./patches/apply.sh`.
+# Both this and bale-vpn-rust point to the same vendor/ tree.
+[patch.crates-io]
+webrtc-sys  = { path = "../lktunnel-rust/vendor/webrtc-sys" }
+libwebrtc   = { path = "../lktunnel-rust/vendor/libwebrtc" }
+livekit     = { path = "../lktunnel-rust/vendor/livekit" }
+livekit-api = { path = "../lktunnel-rust/vendor/livekit-api" }

@@ -86,9 +86,7 @@ class ServerAdmissionActivity : BaseActivity() {
 
             // Fetch the display name asynchronously and update the label
             uiScope.launch {
-                val name = withContext(Dispatchers.IO) {
-                    BaleConnection.client?.loadUserName(id.toInt())
-                }
+                val name = BaleConnection.signaling?.fetchDisplayName(id.toString())
                 if (name != null) tv.text = "$name\n$id"
             }
         }

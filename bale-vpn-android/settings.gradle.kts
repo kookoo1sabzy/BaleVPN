@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "BaleProxy"
-include(":shared", ":androidApp")
+include(":androidApp")

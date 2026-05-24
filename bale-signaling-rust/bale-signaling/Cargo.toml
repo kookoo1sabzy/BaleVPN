@@ -1,0 +1,87 @@
+# bale-signaling — the Bale impl of `lk-signaling`.
+[package]
+name        = "bale-signaling"
+version     = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Bale impl of the lk-signaling Signaling trait — WS client, gRPC-web auth, RPC plumbing."
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+# The trait we implement. Path dep so the sibling workspaces build
+# together without publishing.
+lk-signaling = { path = "../../lk-signaling-rust/lk-signaling" }
+
+# LiveKit transport. Optional — enabling it lets `BaleSignaling`
+# own LK-tunnel construction (`place_call_with_tunnel` returns
+# `Arc<LkTunnel>`) and installs a process-wide LK observer that
+# auto-flips the WS rule engine's `call_active` flag.
+#
+# Why optional: enabling this transitively pulls libwebrtc into
+# whatever links bale-signaling. On Android there are TWO JNI
+# .so files in the same process (libbale_signaling.so +
+# liblktunnel.so); both linking libwebrtc trips fdsan on stdout
+# ownership (RTC_LOG fdopens fd 1 twice). The Android shim
+# leaves this feature OFF and uses explicit `set_call_active`
+# calls from Kotlin. The Rust binary (single .so) turns it ON.
+lktunnel = { path = "../../lktunnel-rust/lktunnel", optional = true }
+
+async-trait = "0.1"
+tokio       = { version = "1", features = [
+    "rt-multi-thread", "sync", "macros", "time", "io-util", "net",
+] }
+
+# HTTP/1.1 for gRPC-web (Bale's auth flow). `rustls-tls-webpki-roots`
+# mirrors what `lktunnel` uses — no OS trust store scan, CA list
+# baked at compile time. Works on Android and headless servers
+# without configuration.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots", "http2",
+    # `cookies` lets the auth client hold a `cookie::Jar`. The
+    # `/set-cookie/` exchange mirrors the web app's
+    # `credentials: "include"` fetch — the browser captures the
+    # `access_token` HttpOnly cookie across the redirect chain into
+    # its jar. Scraping `Set-Cookie` off a single response misses
+    # it whenever the endpoint 3xx-redirects; the jar doesn't.
+    "cookies",
+] }
+
+# Async WebSocket for the long-lived connection to next-ws.bale.ai.
+# `connect-rustls` activates the same TLS stack as reqwest.
+tokio-tungstenite = { version = "0.24", features = [
+    "rustls-tls-webpki-roots", "connect",
+] }
+
+# `rand` for the 16-byte deviceHash StartPhoneAuth requires.
+rand = "0.8"
+
+# Diagnostics. `log` macros; the consumer wires an env_logger /
+# tracing subscriber.
+log = "0.4"
+
+# Lock-free atomic counters + parking_lot mutexes for the WS
+# client's pending-RPC table and listener lists.
+parking_lot = "0.12"
+
+# `futures_util::{SinkExt, StreamExt}` for splitting the WS stream
+# and writing to it. Tiny dep, no async runtime tie-in.
+futures-util = { version = "0.3", default-features = false }
+
+[features]
+default  = []
+# Enable LK-aware methods: `place_call_with_tunnel`,
+# `wrap_incoming_session`, and the auto-installed global LK
+# observer in `BaleSignaling::new`. See the dep comment on
+# `lktunnel` above for why this isn't on by default.
+lktunnel = ["dep:lktunnel"]
+
+[dev-dependencies]
+env_logger = "0.11"
+# `test-util` enables tokio::time::pause / advance, which lets the
+# 30s timeout test in ws::tests complete instantly under virtual
+# time instead of actually sleeping.
+tokio       = { version = "1", features = [
+    "rt-multi-thread", "sync", "macros", "time", "io-util", "net", "test-util",
+] }

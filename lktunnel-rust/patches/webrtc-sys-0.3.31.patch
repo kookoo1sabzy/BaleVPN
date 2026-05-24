@@ -490,3 +490,43 @@ diff -urN a/src/raw_bytes_transformer.rs b/src/raw_bytes_transformer.rs
 +        self.observer.on_data(data);
 +    }
 +}
+
+--- a/src/video_encoder_factory.cpp	2006-07-24 03:21:28
++++ b/src/video_encoder_factory.cpp	2026-05-24 12:35:06
+@@ -143,7 +143,20 @@
+     webrtc::LibvpxVp9EncoderTemplateAdapter>;
+ 
+ VideoEncoderFactory::InternalFactory::InternalFactory() {
+-#ifdef __APPLE__
++  // Apple ObjC video factory disabled: the prebuilt libwebrtc
++  // ships an RTCVideoEncoderFactorySimulcast whose
++  // `supportedCodecs` calls `initWithNativeSdpVideoFormat:` on
++  // RTCVideoCodecInfo — a selector that's missing from this
++  // version of the dylib (internal version mismatch). The
++  // result is a hard crash inside `PeerConnectionFactory::Create`
++  // on the first call setup. We never publish video — only the
++  // LK data channel for IP packets — so the software template
++  // factories below (Vp8 / Vp9 etc.) are enough for
++  // PeerConnectionFactory to construct.
++  //
++  // Re-enable by un-#if-0-ing once the upstream selector
++  // mismatch is fixed.
++#if 0  // was: #ifdef __APPLE__
+   factories_.push_back(livekit_ffi::CreateObjCVideoEncoderFactory());
+ #endif
+ 
+--- a/src/video_decoder_factory.cpp	2006-07-24 03:21:28
++++ b/src/video_decoder_factory.cpp	2026-05-24 12:35:29
+@@ -42,7 +42,11 @@
+ namespace livekit_ffi {
+ 
+ VideoDecoderFactory::VideoDecoderFactory() {
+-#ifdef __APPLE__
++  // Apple ObjC video factory disabled — see the matching block
++  // in `video_encoder_factory.cpp` for the rationale. We never
++  // subscribe to video tracks; the software template decoders
++  // are sufficient for PeerConnectionFactory construction.
++#if 0  // was: #ifdef __APPLE__
+   factories_.push_back(livekit_ffi::CreateObjCVideoDecoderFactory());
+ #endif
+ 

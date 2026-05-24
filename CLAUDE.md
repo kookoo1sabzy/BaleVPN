@@ -4,24 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A reverse-engineering research project for the **Bale messenger** web app (`web.bale.ai`). It extracts protobuf service / message definitions from Bale's minified webpack bundles and ships two components that share a common Rust transport library (`lktunnel-rust/`):
+A reverse-engineering research project for the **Bale messenger** web app (`web.bale.ai`). It extracts protobuf service / message definitions from Bale's minified webpack bundles and ships:
 
-- **`bale-vpn-node/`** — a Node.js application that runs the VPN **server side only**. Bridges traffic from connected Bale peers to the internet, either through a kernel-managed TUN (Linux / macOS) or a fully userspace TCP / UDP NAT.
-- **`bale-vpn-android/`** — a Kotlin Multiplatform Android app that runs as either VPN **client** (device-wide TUN via `VpnService`, optional LAN-facing SOCKS5) or VPN **server** (userspace NAT, no root). Mode-toggle lives in the app's main screen.
+- **`bale-vpn-rust/`** — a single Rust binary that runs as either VPN **client** (local SOCKS5 listener over a QUIC channel) or VPN **server** (TUN-based or userspace NAT bridging traffic from admitted Bale peers to the internet). HTTP management UI on `127.0.0.1:3001`. CLI: `bale-vpn [--port 3001] [--mode client|server] [--nat-mode kernel|userspace] [--headless]`.
+- **`bale-vpn-android/`** — Android app that runs as either VPN **client** (device-wide TUN via `VpnService`, optional LAN-facing SOCKS5) or VPN **server** (userspace NAT, no root). Mode-toggle in the app's main screen.
 
-The Node and Android server modes are interchangeable: an Android client can connect to either, and the same wire protocol is used everywhere.
+Both apps consume the same Rust stack:
+- `lktunnel-rust/` — LiveKit-backed transport, QUIC channel, userspace NAT
+- `lk-signaling-rust/` — generic signaling trait
+- `bale-signaling-rust/` — Bale impl (WS client + RPCs + auth + contacts), single source of truth for the protocol
+
+The Rust and Android server modes are interchangeable: an Android client can connect to either, same wire protocol.
 
 ## Supported features
 
 | Role | Platform | Notes |
 |---|---|---|
-| Server | Node.js (Linux) | Kernel TUN (`bale0`) + iptables MASQUERADE — best throughput. One-time root setup. |
-| Server | Node.js (macOS) | Kernel TUN (`utunN`) + pf anchor — best throughput. Runs as root. |
-| Server | Node.js (any OS) | Userspace NAT — no root needed. Works on Linux, macOS, Windows. |
+| Server | Rust (Linux) | Kernel TUN + iptables MASQUERADE — best throughput. One-time root setup. (Userspace NAT path also works.) |
+| Server | Rust (macOS) | Kernel TUN (`utunN`) + pf anchor — best throughput. Runs as root. |
+| Server | Rust (Windows) | Userspace NAT — no root, no driver install. |
 | Server | Android | Userspace NAT — no root. APK install, no command line. |
-| Client | Android | Kernel TUN via `VpnService`. Optional LAN-facing SOCKS5 proxy lets other devices on the same WiFi use this Android as their proxy. |
-
-The Node app **does not currently support client mode** — for a client, use the Android app.
+| Client | Rust (any OS) | SOCKS5 listener on `127.0.0.1:1080` (configurable) over a QUIC channel. |
+| Client | Android | Kernel TUN via `VpnService`. Optional LAN-facing SOCKS5 lets other devices on the same WiFi use this Android as their proxy. |
 
 ## Three-Step Pipeline
 
@@ -35,39 +39,42 @@ Downloads the Bale web app JS bundles, HTML, and static files into `reverse_engi
 ```bash
 python3 reverse_engineering/extract_proto.py
 ```
-Writes `.proto` files to `bale-vpn-node/proto/` and regenerates `bale-vpn-node/src/index.js`.
+Writes `.proto` files to `bale-signaling-rust/bale-signaling/proto/`. The Rust side is the single source of truth for the protocol; Kotlin (Android) consumes the Rust stack via JNI.
 
-### 3. Build and run the Node server
+### 3. Build and run the Rust app
 ```bash
-cd bale-vpn-node
-npm install
-npm run build         # compiles .proto → src/messages.{js,d.ts}
-npm run build:native  # builds the Rust napi binding (lktunnel)
-npm run ui            # starts the server, management UI at http://localhost:3001
+cd bale-vpn-rust
+cargo build --release
+./target/release/bale-vpn                              # client mode, HTTP UI at :3001
+./target/release/bale-vpn --mode server --nat-mode userspace
 ```
+
+Open `http://localhost:3001` to sign in (SMS OTP), pick a peer (client mode), or manage admission (server mode). Config persists to `~/.config/bale-vpn/{config.toml, token}`.
 
 ### Command-line arguments
 
-The Node entry point is `node src/bale-proxy.js`. It accepts:
-
 | Argument | Default | Meaning |
 |---|---|---|
-| `<integer>` (positional) | `3001` | HTTP port for the management UI. |
-| `--nat-mode kernel\|userspace` | `kernel` on Linux/macOS, `userspace` on Windows | Selects how server-side forwarding works. `kernel` requires the one-time setup below; `userspace` runs with no privileges and works on any OS. |
+| `--port <int>` | `3001` | HTTP UI port. Bound to `127.0.0.1`. |
+| `--mode client\|server` | from `config.toml` (default `client`) | Role. |
+| `--nat-mode kernel\|userspace` | `kernel` on Unix, `userspace` on Windows | Server-mode forwarding. |
+| `--headless` | off | Skip opening a native webview (GUI builds only). |
 
-The mode is fixed at startup; switching between `kernel` and `userspace` requires a restart. If `--nat-mode=kernel` is selected but the required kernel privileges or `iptables` rule are missing, the process exits with an actionable error rather than silently degrading.
+The mode is fixed at startup. Switching between `client`/`server` or between `kernel`/`userspace` requires a restart.
 
 ### Server-mode one-time setup
 
 **Linux, kernel NAT mode**:
 ```bash
-sudo setcap cap_net_admin+eip $(which node)
+sudo setcap cap_net_admin+eip $(which bale-vpn)
 sudo sysctl -w net.ipv4.ip_forward=1
 echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-bale-vpn.conf
-sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
+# /16 covers every per-session 10.8.K.0/24 slot in the pool —
+# /24 only covers slot 0, so clients past the first get no NAT.
+sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/16 -j MASQUERADE
 ```
 
-**macOS, kernel NAT mode**: runs as root (`sudo node src/bale-proxy.js`). NAT (pf anchor `balevpn`) and IP forwarding are loaded automatically; the WAN interface is auto-detected.
+**macOS, kernel NAT mode**: runs as root (`sudo ./target/release/bale-vpn server`). NAT (pf anchor `balevpn`) and IP forwarding are loaded automatically; the WAN interface is auto-detected.
 
 **Userspace NAT mode** (any OS): no privileged setup needed.
 
@@ -75,15 +82,15 @@ sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
 
 Authentication uses Bale's `access_token` JWT cookie scoped to `.bale.ai`.
 
-- To get a token initially: run the Node app once and complete SMS OTP via the management UI, or sign in on the Android app and copy the resulting token.
+- To get a token initially: run the Rust app once and complete SMS OTP via the management UI at `http://localhost:3001`, or sign in on the Android app.
 - To refresh: Chrome DevTools → Application → Cookies → `https://web.bale.ai` → copy `access_token`, and paste into the management UI.
 - WS close code `4401` indicates the token expired and needs refreshing.
 
-The Node app stores its token (and the admission / blacklist / max-clients settings — see below) in `${RUNTIME_DIR}/.bale-vpn_config.json` (mode `0600`).
+`bale-vpn-rust` stores the token in `~/.config/bale-vpn/token` (mode `0600`); other settings live in `~/.config/bale-vpn/config.toml`. The Android app stores the same token in `SharedPreferences` (the `config` file under key `token`).
 
 ## Android app overview
 
-`bale-vpn-android/` is a Kotlin Multiplatform project. The shared Rust `lktunnel` library handles all TCP / UDP forwarding and the LiveKit transport; the Kotlin code is the UI, auth, and Bale call-signaling layer.
+`bale-vpn-android/` is a standard Android Gradle project. Two `cdylib` JNI shims under `bale-vpn-android/rust/` (`lktunnel-android` for the transport, `bale-signaling-android` for the Bale protocol) bridge into the same `lktunnel-rust/` + `bale-signaling-rust/` crates the Rust binary uses. Kotlin code is the UI, auth flow, and lifecycle plumbing.
 
 ### Auth flow
 
@@ -116,17 +123,17 @@ Two mutually-exclusive per-caller stores (persisted in `SharedPreferences`):
 
 Calls from callers in neither list land in a **pending** state with a notification: the user picks **Allow** (with optional "remember" → adds to allow-list), **Reject** (with optional "remember" → adds to blacklist), or lets it time out (60 s default → silent rejection, no blacklist).
 
-The Node side mirrors the same three controls in `.bale-vpn_config.json` (keys `admission`, `blacklist`, `maxClients`).
+`bale-vpn-rust` exposes the same admission controls through `/server/admission`, `/server/blacklist`, and `/server/max-clients` HTTP endpoints. Lists persist in `~/.config/bale-vpn/config.toml`.
 
 ## Architecture overview
 
-Both Node and Android peers join a LiveKit room established via a Bale call between two contacts; IP packets travel between the peers over the resulting encrypted link. The shared Rust library `lktunnel-rust/` owns the transport layer and the userspace NAT; the Node and Android wrappers are thin shims around it (napi binding on Node, JNI on Android).
+Both Rust and Android peers join a LiveKit room established via a Bale call between two contacts; IP packets travel between the peers over the resulting encrypted link. The transport (`lktunnel-rust/`) and the Bale protocol (`bale-signaling-rust/`) are shared crates; the `bale-vpn-rust` binary consumes them directly, the Android app via JNI shims under `bale-vpn-android/rust/`.
 
 **Client → server flow**: client's kernel TUN reads IP packets → ships them across the link → server-side NAT (kernel-TUN or userspace) forwards to the internet.
 
 **Server NAT modes**:
-- **Kernel TUN** (Linux / macOS Node only): server's kernel-managed TUN device receives the IP packets directly; the kernel forwards via MASQUERADE / pf. Highest throughput; requires one-time privileged setup.
-- **Userspace NAT** (Node any OS, Android server): per-flow Rust state machine proxies each TCP / UDP flow to a real host socket. No kernel privilege needed. Slower than kernel TUN under heavy load but fully featured (SACK, RACK, TLP, PRR, Window Scaling, Timestamps).
+- **Kernel TUN** (Linux / macOS only): server's kernel-managed TUN device receives the IP packets directly; the kernel forwards via MASQUERADE / pf. Highest throughput; requires one-time privileged setup.
+- **Userspace NAT** (any OS): per-flow Rust state machine proxies each TCP / UDP flow to a real host socket. No kernel privilege needed. Slower than kernel TUN under heavy load but fully featured (SACK, RACK, TLP, PRR, Window Scaling, Timestamps).
 
 Inbound packets to RFC1918 / loopback / link-local / cloud-metadata addresses are always blocked regardless of mode.
 

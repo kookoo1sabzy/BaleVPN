@@ -207,9 +207,7 @@ class ServerClientsActivity : BaseActivity() {
         for (entry in entries) {
             if (entry.callerId > 0 && nameCache[entry.callerId] == null) {
                 uiScope.launch {
-                    val name = withContext(Dispatchers.IO) {
-                        BaleConnection.client?.loadUserName(entry.callerId.toInt())
-                    }
+                    val name = BaleConnection.signaling?.fetchDisplayName(entry.callerId.toString())
                     if (name != null) nameCache[entry.callerId] = name
                 }
             }

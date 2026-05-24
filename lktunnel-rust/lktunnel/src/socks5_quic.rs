@@ -28,11 +28,10 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::task::AbortHandle;
 
 use crate::LkTunnel;
@@ -182,10 +181,18 @@ pub(crate) async fn enable_listener(
     tunnel: LkTunnel,
     port:   u16,
 ) -> Result<Socks5Handle, Socks5Error> {
-    let listener = TcpListener::bind(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
-        .await
-        .map_err(Socks5Error::Bind)?;
+    // Use TcpSocket so we can set SO_REUSEADDR before bind.
+    // Without it, a rapid disconnect→reconnect cycle hits
+    // EADDRINUSE because the OS hasn't released the previous
+    // listener's socket from TIME_WAIT / TCP-shutdown reap yet.
+    // Observed on every client mode reconnect: session 1's
+    // listener task gets aborted, but the bound socket lingers
+    // a few seconds and session 2's bind fails until then.
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    let socket = tokio::net::TcpSocket::new_v4().map_err(Socks5Error::Bind)?;
+    socket.set_reuseaddr(true).map_err(Socks5Error::Bind)?;
+    socket.bind(bind_addr).map_err(Socks5Error::Bind)?;
+    let listener = socket.listen(1024).map_err(Socks5Error::Bind)?;
     let local_addr = listener.local_addr().map_err(Socks5Error::Bind)?;
     log::info!("socks5: listening on {local_addr}");
 
@@ -259,11 +266,27 @@ pub(crate) fn spawn_server_acceptor(server: QuicServer) -> QuicServerHandle {
                         Err(quinn::ConnectionError::ApplicationClosed(_))
                         | Err(quinn::ConnectionError::ConnectionClosed(_))
                         | Err(quinn::ConnectionError::TimedOut)
-                        | Err(quinn::ConnectionError::LocallyClosed) => {
+                        | Err(quinn::ConnectionError::LocallyClosed)
+                        // EndpointStopping covers the case where
+                        // the LkTunnel is dropping its QUIC
+                        // endpoint as part of normal teardown
+                        // — the accept loop sees "endpoint
+                        // driver future was dropped" which is a
+                        // routine shutdown event, not a real
+                        // error.
+                        | Err(quinn::ConnectionError::Reset)
+                        | Err(quinn::ConnectionError::TransportError(_)) => {
                             log::info!("socks5/server: connection closed");
                             break;
                         }
-                        Err(e) => { log::warn!("socks5/server: accept_bi: {e}"); break; }
+                        Err(quinn::ConnectionError::VersionMismatch) => {
+                            log::warn!("socks5/server: accept_bi: version mismatch");
+                            break;
+                        }
+                        Err(e) => {
+                            log::debug!("socks5/server: accept_bi: {e}");
+                            break;
+                        }
                     };
                     crate::runtime().spawn(async move {
                         if let Err(e) = handle_quic_stream(send, recv).await {

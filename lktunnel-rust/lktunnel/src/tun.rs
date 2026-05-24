@@ -59,6 +59,22 @@ pub enum InjectStatus {
     QueueFull,
 }
 
+/// On-wire shape the TUN device hands out / expects. Different OSes
+/// frame IP packets differently; the bridge wraps + unwraps so the
+/// rest of the crate only sees raw IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunFormat {
+    /// Raw IP, no framing. Used by Linux `IFF_NO_PI` TUN devices and
+    /// Android's `VpnService.Builder.establish()` fd.
+    RawIp,
+    /// macOS `utun*` framing — every packet is prefixed with a
+    /// 4-byte big-endian address-family field (`AF_INET` = 2,
+    /// `AF_INET6` = 30). Read and write both include the prefix.
+    UtunAfHeader,
+}
+
+const UTUN_HEADER_LEN: usize = 4;
+
 /// Owns the TUN fd and the per-tunnel TX queue. Must live behind a
 /// `Box<Self>` (stable address) because the reactor's `EventHandler`
 /// trampoline holds a raw pointer into it.
@@ -68,8 +84,13 @@ pub struct TunBridge {
     counters:      Arc<Counters>,
     send_ip:       SendIp,
     wake_on_drain: WakeOnDrain,
+    /// Pending TX queue — entries are in **wire form** for the
+    /// configured [`TunFormat`]. For [`TunFormat::UtunAfHeader`]
+    /// each entry already has the 4-byte AF prefix; the writer
+    /// just hands the bytes to `libc::write`.
     pending:       VecDeque<Vec<u8>>,
     paused:        bool,
+    format:        TunFormat,
 }
 
 impl TunBridge {
@@ -78,11 +99,26 @@ impl TunBridge {
     /// closed when the returned `Box<TunBridge>` drops. Returns a
     /// boxed handle because the reactor's event trampoline needs a
     /// stable address into the bridge.
+    ///
+    /// Calls into this default to [`TunFormat::RawIp`] — see
+    /// [`Self::attach_with_format`] for macOS utun framing.
     pub fn attach(
         fd: i32,
         counters: Arc<Counters>,
         send_ip: SendIp,
         wake_on_drain: WakeOnDrain,
+    ) -> Box<Self> {
+        Self::attach_with_format(fd, counters, send_ip, wake_on_drain, TunFormat::RawIp)
+    }
+
+    /// As [`Self::attach`] but with an explicit on-wire format.
+    /// macOS callers use [`TunFormat::UtunAfHeader`].
+    pub fn attach_with_format(
+        fd: i32,
+        counters: Arc<Counters>,
+        send_ip: SendIp,
+        wake_on_drain: WakeOnDrain,
+        format: TunFormat,
     ) -> Box<Self> {
         // Construct first with a placeholder token; we need the
         // Box's address before we can register with the reactor.
@@ -90,6 +126,7 @@ impl TunBridge {
             fd, token: Token(0), counters, send_ip, wake_on_drain,
             pending: VecDeque::new(),
             paused:  false,
+            format,
         });
         let addr = &mut *boxed as *mut Self as usize;
         let token = dispatcher::register_source(
@@ -98,7 +135,8 @@ impl TunBridge {
             Box::new(TunDispatcher { addr }),
         );
         boxed.token = token;
-        log::info!(target: TAG, "tun fd={fd} attached (token={:?})", token);
+        log::info!(target: TAG, "tun fd={fd} attached (token={:?}, fmt={:?})",
+            token, format);
         boxed
     }
 
@@ -108,12 +146,16 @@ impl TunBridge {
     /// other write failures are handled internally — partial writes
     /// re-queue, hard errors tear the bridge down on the next
     /// event tick.
+    ///
+    /// Caller hands a raw IP packet; the bridge wraps in the
+    /// device's wire format if needed (e.g. prepends the 4-byte
+    /// AF header for macOS utun) before queuing.
     pub fn inject(&mut self, ip: &[u8]) -> InjectStatus {
         self.counters.bump_rx(ip.len());
         if self.pending.len() >= MAX_PENDING_TX_PKTS {
             return InjectStatus::QueueFull;
         }
-        self.pending.push_back(ip.to_vec());
+        self.pending.push_back(wrap_for_wire(ip, self.format));
         // Try an immediate drain — if the TUN is writable right now
         // we save a round-trip through the reactor.
         let _ = self.drain();
@@ -190,12 +232,19 @@ impl TunBridge {
             match tun_read(self.fd, &mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let pkt = &buf[..n];
+                    // Unwrap the on-wire framing (no-op for RawIp,
+                    // strips 4-byte AF prefix for macOS utun) so
+                    // everything past here sees raw IP.
+                    let pkt = unwrap_from_wire(&buf[..n], self.format);
+                    if pkt.is_empty() { continue; }
                     // IPv6 reject — write a Destination Unreachable
                     // back to the apps and skip the LK leg.
-                    if !pkt.is_empty() && (pkt[0] >> 4) == 6 {
+                    if (pkt[0] >> 4) == 6 {
                         if let Some(reply) = ipv6::build_icmpv6_dest_unreach(pkt) {
-                            let _ = tun_write(self.fd, &reply);
+                            // Route through inject so the wire-form
+                            // wrap (if any) + partial-write handling
+                            // stays in one place.
+                            let _ = self.inject(&reply);
                         }
                         continue;
                     }
@@ -271,4 +320,44 @@ fn tun_read(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
 fn tun_write(fd: i32, buf: &[u8]) -> io::Result<usize> {
     let n = unsafe { libc::write(fd, buf.as_ptr() as *const c_void, buf.len()) };
     if n >= 0 { Ok(n as usize) } else { Err(io::Error::last_os_error()) }
+}
+
+// ── Wire-format helpers ───────────────────────────────────────────
+
+/// Build the on-wire bytes for `format` from a raw IP packet.
+/// Returns a fresh `Vec` for both formats; the bridge pushes this
+/// straight into `pending`.
+fn wrap_for_wire(ip: &[u8], format: TunFormat) -> Vec<u8> {
+    match format {
+        TunFormat::RawIp => ip.to_vec(),
+        TunFormat::UtunAfHeader => {
+            let af = af_for_ip(ip);
+            let mut v = Vec::with_capacity(UTUN_HEADER_LEN + ip.len());
+            v.extend_from_slice(&af.to_be_bytes());
+            v.extend_from_slice(ip);
+            v
+        }
+    }
+}
+
+/// Unwrap on-wire bytes into the raw IP slice. Borrows from the
+/// input — no copy.
+fn unwrap_from_wire(wire: &[u8], format: TunFormat) -> &[u8] {
+    match format {
+        TunFormat::RawIp => wire,
+        TunFormat::UtunAfHeader => {
+            if wire.len() <= UTUN_HEADER_LEN { &[] } else { &wire[UTUN_HEADER_LEN..] }
+        }
+    }
+}
+
+/// IP version → AF constant. Falls back to `AF_INET` for unknown /
+/// empty inputs so the wire packet at least parses (the wrapped
+/// payload still gets dropped by the kernel if malformed).
+fn af_for_ip(ip: &[u8]) -> u32 {
+    match ip.first().map(|b| b >> 4) {
+        Some(4) => libc::AF_INET  as u32,
+        Some(6) => libc::AF_INET6 as u32,
+        _       => libc::AF_INET  as u32,
+    }
 }

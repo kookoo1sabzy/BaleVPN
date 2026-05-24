@@ -97,7 +97,14 @@ const SEND_QUEUE_CAP: usize = 64;
 /// when the peer pumps faster than the local NAT / TUN can drain.
 /// Drop-oldest: the kernel's TCP at the consumer is the retransmit
 /// authority for anything we drop.
-const INBOUND_QUEUE_CAP: usize = 1024;
+///
+/// Sized for kernel-TUN server bursts: opening a webpage / running
+/// a speedtest can deliver >1k packets in a single tick, and the
+/// dispatcher does per-packet TUN write syscalls (no batching), so
+/// 1024 saturated easily under load — observed drops climbed in
+/// powers of two within seconds. 8192 absorbs typical bursts;
+/// memory cost is ~12 MB worst case (8192 * 1500B Vec).
+const INBOUND_QUEUE_CAP: usize = 8192;
 
 // ── Public types ────────────────────────────────────────────────────
 
@@ -138,6 +145,37 @@ impl std::fmt::Display for ConnectError {
     }
 }
 impl std::error::Error for ConnectError {}
+
+// ── Process-wide lifecycle observer ─────────────────────────────────
+//
+// One slot — set once at app startup (e.g. by bale-signaling when
+// its WsClient comes up). Every [`LkTunnel::connect`] /
+// [`LkTunnel::connect_server`] chains this observer into its
+// `on_event` callback, so consumers of the LK transport
+// (bale-signaling's WS rule engine) auto-observe Connected /
+// Disconnected without explicit per-tunnel wiring.
+//
+// Cleared by passing `None` (mostly for tests). Replacing
+// silently overwrites — last writer wins.
+type GlobalObs = std::sync::Arc<dyn Fn(Event) + Send + Sync + 'static>;
+static GLOBAL_OBSERVER: parking_lot::RwLock<Option<GlobalObs>> =
+    parking_lot::RwLock::new(None);
+
+/// Install the process-wide lifecycle observer. Chained after the
+/// per-tunnel `on_event` for every subsequent connect. Idempotent
+/// — last call wins. Pass `None` to clear.
+pub fn set_global_observer(obs: Option<GlobalObs>) {
+    *GLOBAL_OBSERVER.write() = obs;
+}
+
+/// Internal — fire the global observer if installed. Called from
+/// the per-tunnel chain so already-connected tunnels also
+/// surface their events to the global observer.
+fn fire_global(ev: &Event) {
+    if let Some(obs) = GLOBAL_OBSERVER.read().clone() {
+        obs(ev.clone());
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendError {
@@ -247,6 +285,13 @@ struct TunnelInner {
     /// the SOCKS5 listener so the QUIC handshake completes at tunnel
     /// startup, not at first SOCKS5 toggle.
     quic_client: Mutex<Option<Arc<quic_tunnel::QuicClient>>>,
+    /// Serialises concurrent [`LkTunnel::ensure_quic_client`] calls.
+    /// Without it the auto-warm (spawned at peer-joined) and the
+    /// explicit `enable_socks5_server` path can race; whichever loses
+    /// the race-to-set `quic_rx_tx` fails with `AlreadyExists` and
+    /// the caller has to retry. Async because we hold it across an
+    /// `.await` (the QUIC handshake).
+    connect_lock: tokio::sync::Mutex<()>,
     /// Client-side SOCKS5 listener handle. Set by
     /// `enable_socks5_server`; cleared by `disable_socks5_server`.
     socks5_handle: Mutex<Option<socks5_quic::Socks5Handle>>,
@@ -254,6 +299,32 @@ struct TunnelInner {
     /// `start_server` so the peer side can route incoming SOCKS5
     /// streams to host TCP without a separate JS/Kotlin toggle.
     quic_server_handle: Mutex<Option<socks5_quic::QuicServerHandle>>,
+    /// Tunnel role, set at construction. Drives the auto-warm
+    /// decision on peer-joined (only client tunnels auto-warm the
+    /// QUIC client) and guards `start_server` / `attach_tun` from
+    /// being called against the wrong role.
+    role: TunnelRole,
+}
+
+/// Tunnel role, decided at construction time.
+/// - [`TunnelRole::Client`]: caller plans to attach a TUN
+///   ([`LkTunnel::attach_tun`]) or use SOCKS5
+///   ([`LkTunnel::enable_socks5_server`]). QUIC client connection
+///   auto-warms on peer-joined so the first SOCKS5 toggle is
+///   instantaneous.
+/// - [`TunnelRole::Server`]: caller will call
+///   [`LkTunnel::start_server`] after [`LkTunnel::await_connected`].
+///   QUIC client auto-warm is suppressed — `start_server` claims
+///   the QUIC role for the stream-acceptor side.
+///
+/// The wrong-role guards in `start_server` / `attach_tun` are
+/// cheap insurance; the real win is eliminating the
+/// auto-warm-vs-start-server race that used to leave the tunnel
+/// half-configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelRole {
+    Client,
+    Server,
 }
 
 static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -306,8 +377,10 @@ fn build_loopback_inner() -> (Arc<TunnelInner>, tokio::sync::mpsc::Receiver<Vec<
         on_ip_override: Mutex::new(None),
         quic_rx_tx:    Mutex::new(None),
         quic_client:   Mutex::new(None),
+        connect_lock:  tokio::sync::Mutex::new(()),
         socks5_handle: Mutex::new(None),
         quic_server_handle: Mutex::new(None),
+        role: TunnelRole::Client,
     });
     (inner, send_rx)
 }
@@ -388,6 +461,34 @@ impl LkTunnel {
         token:    impl Into<String> + Send + 'static,
         on_event: impl Fn(Event) + Send + Sync + 'static,
     ) -> Self {
+        Self::connect_with_role(url, token, TunnelRole::Client, on_event)
+    }
+
+    /// As [`Self::connect`] but for server-mode use. Caller must
+    /// call [`Self::start_server`] after [`Self::await_connected`].
+    /// The QUIC client auto-warm is suppressed for this role —
+    /// `start_server` claims the QUIC role for its stream
+    /// acceptor; without the distinction the two race for the
+    /// `quic_rx_tx` slot and the tunnel ends up half-configured.
+    pub fn connect_server(
+        url:      impl Into<String> + Send + 'static,
+        token:    impl Into<String> + Send + 'static,
+        on_event: impl Fn(Event) + Send + Sync + 'static,
+    ) -> Self {
+        Self::connect_with_role(url, token, TunnelRole::Server, on_event)
+    }
+
+    /// Internal constructor — `connect` / `connect_server` are the
+    /// public API. Keeping the role on the inner ctor (instead of
+    /// an `is_server: bool`) lets the auto-warm path read it
+    /// directly and lets `start_server` / `attach_tun` guard
+    /// against wrong-role calls.
+    fn connect_with_role(
+        url:      impl Into<String> + Send + 'static,
+        token:    impl Into<String> + Send + 'static,
+        role:     TunnelRole,
+        on_event: impl Fn(Event) + Send + Sync + 'static,
+    ) -> Self {
         let id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
         let (send_tx, send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(SEND_QUEUE_CAP);
         let (state_tx, _state_rx) = tokio::sync::watch::channel(TunnelState::Connecting);
@@ -412,8 +513,10 @@ impl LkTunnel {
             on_ip_override: Mutex::new(None),
             quic_rx_tx:    Mutex::new(None),
             quic_client:   Mutex::new(None),
+            connect_lock:  tokio::sync::Mutex::new(()),
             socks5_handle: Mutex::new(None),
             quic_server_handle: Mutex::new(None),
+            role,
         });
 
         // Inbound IP routing — same bounded per-tunnel queue pattern.
@@ -606,11 +709,21 @@ impl LkTunnel {
         *self.inner.on_ip_override.lock() = cb;
     }
 
+    /// The role this tunnel was constructed with. Cheap accessor —
+    /// the role is set once at [`Self::connect`] / [`Self::connect_server`]
+    /// and never changes.
+    pub fn role(&self) -> TunnelRole { self.inner.role }
+
     /// Promote this tunnel to **server mode** — install a userspace
     /// NAT that bridges client IP packets to host sockets. Inbound IP
     /// from this point on is routed through the NAT. Fails if a TUN
-    /// is already attached, or if server mode is already active.
+    /// is already attached, or if server mode is already active, or
+    /// if the tunnel was constructed for client role.
     pub fn start_server(&self) -> Result<(), &'static str> {
+        if self.inner.role != TunnelRole::Server {
+            return Err("start_server called on client-role tunnel — \
+                        construct via LkTunnel::connect_server instead");
+        }
         if !self.inner.connected.load(Ordering::Relaxed) { return Err("not connected"); }
         let id = self.inner.id;
         let emit = self.nat_emit();
@@ -641,43 +754,80 @@ impl LkTunnel {
         *nat = Some(d);
         drop(nat);
 
-        // Auto-bring-up the QUIC stream acceptor so the peer-side
-        // SOCKS5-over-QUIC mode works without a separate JS/Kotlin
-        // knob. Idempotent — if a previous start_server installed one
-        // we leave it alone. Failures (cert build / endpoint create)
-        // are logged but don't abort start_server: IP-tunnel mode is
-        // independent of QUIC and should keep working.
-        if self.inner.quic_server_handle.lock().is_none() {
-            match self.enable_quic_server() {
-                Ok(server) => {
-                    let handle = socks5_quic::spawn_server_acceptor(server);
-                    *self.inner.quic_server_handle.lock() = Some(handle);
-                    log::info!("quic stream acceptor up on tunnel {id}");
-                }
-                Err(e) => {
-                    log::warn!("quic stream acceptor setup failed: {e} — \
-                                socks5-over-quic mode will not be available");
-                }
-            }
-        }
+        // SOCKS5-over-QUIC: independent of the IP-frame path.
+        self.ensure_quic_acceptor();
         Ok(())
     }
 
-    /// Promote this tunnel to **client mode** — attach a TUN fd. The
-    /// bridge takes ownership of `fd` (closes on detach / drop).
-    /// Inbound IP from this point on is written to the TUN. Fails if
-    /// the tunnel is already in server mode or already has a TUN.
-    /// Unix-only — Windows has no kernel TUN.
+    /// Bring up the QUIC stream acceptor for SOCKS5-over-QUIC if
+    /// not already up. Idempotent. Failures are logged but
+    /// non-fatal — the IP-tunnel path (kernel TUN or userspace
+    /// NAT) is independent of QUIC and should keep working.
+    ///
+    /// Server role only — peer-side SOCKS5 client speaks QUIC to
+    /// our server-side acceptor. Called from both `start_server`
+    /// (userspace NAT path) and `attach_tun_with_format` (kernel
+    /// TUN path) so the two NAT modes are equivalent w.r.t.
+    /// SOCKS5 handling. Without this, kernel-TUN mode silently
+    /// dropped every SOCKS5-bound `'Q'` frame.
+    fn ensure_quic_acceptor(&self) {
+        if self.inner.role != TunnelRole::Server { return; }
+        if self.inner.quic_server_handle.lock().is_some() { return; }
+        let id = self.inner.id;
+        match self.enable_quic_server() {
+            Ok(server) => {
+                let handle = socks5_quic::spawn_server_acceptor(server);
+                *self.inner.quic_server_handle.lock() = Some(handle);
+                log::info!("quic stream acceptor up on tunnel {id}");
+            }
+            Err(e) => {
+                log::warn!("quic stream acceptor setup failed: {e} — \
+                            socks5-over-quic mode will not be available");
+            }
+        }
+    }
+
+    /// Attach a TUN fd. The bridge takes ownership of `fd` (closes
+    /// on detach / drop). Inbound IP from this point on is written
+    /// to the TUN. Fails if the tunnel is already running a
+    /// userspace NAT (`start_server`) or already has a TUN. Unix-only.
+    ///
+    /// Valid for both client and server roles:
+    ///   * Client role: TUN holds the host's outbound IP, e.g.
+    ///     Android `VpnService` or the Rust binary's `--client-tun`.
+    ///   * Server role: TUN is a per-session `bale<K>` device the
+    ///     kernel forwards via MASQUERADE/pf — the kernel-TUN
+    ///     server NAT path. Mutually exclusive with `start_server`
+    ///     (userspace NAT) on the same tunnel.
+    ///
+    /// Uses [`tun::TunFormat::RawIp`] framing — correct for Linux
+    /// `IFF_NO_PI` and Android `VpnService` fds. For macOS `utun*`
+    /// fds use [`Self::attach_tun_with_format`] with
+    /// [`tun::TunFormat::UtunAfHeader`].
     #[cfg(unix)]
     pub fn attach_tun(&self, fd: i32) -> Result<(), &'static str> {
+        self.attach_tun_with_format(fd, tun::TunFormat::RawIp)
+    }
+
+    /// As [`Self::attach_tun`] but with an explicit on-wire format.
+    /// Callers on macOS pass [`tun::TunFormat::UtunAfHeader`] so the
+    /// bridge transparently strips / prepends the 4-byte AF header
+    /// macOS utun devices use.
+    #[cfg(unix)]
+    pub fn attach_tun_with_format(
+        &self,
+        fd:     i32,
+        format: tun::TunFormat,
+    ) -> Result<(), &'static str> {
         if !self.inner.connected.load(Ordering::Relaxed) { return Err("not connected"); }
         if fd < 0 { return Err("invalid fd"); }
         // Quick pre-checks before we hop — bail fast on user errors.
         if self.inner.nat.lock().is_some() { return Err("already in server mode"); }
         if self.inner.tun.lock().is_some() { return Err("TUN already attached"); }
-        // `TunBridge::attach` calls `dispatcher::register_source`,
-        // which must run on the dispatcher thread. Hop with a
-        // oneshot so the caller sees the result synchronously.
+        // `TunBridge::attach_with_format` calls
+        // `dispatcher::register_source`, which must run on the
+        // dispatcher thread. Hop with a oneshot so the caller sees
+        // the result synchronously.
         let send = self.tun_send();
         let wake = self.tun_wake_on_drain();
         let counters = Arc::clone(&self.inner.counters);
@@ -688,11 +838,22 @@ impl LkTunnel {
             let mut tun = inner.tun.lock();
             if nat.is_some() { let _ = tx.send(Err("already in server mode")); return; }
             if tun.is_some() { let _ = tx.send(Err("TUN already attached"));   return; }
-            *tun = Some(TunBridge::attach(fd, counters, send, wake));
+            *tun = Some(TunBridge::attach_with_format(fd, counters, send, wake, format));
             drop(nat); drop(tun);
             let _ = tx.send(Ok(()));
         }));
-        rx.recv().unwrap_or(Err("dispatcher not running"))
+        let res = rx.recv().unwrap_or(Err("dispatcher not running"));
+        if res.is_ok() {
+            log::info!("VPN: enabled (TUN attached, fd={fd})");
+            // Server-role TUN attach also needs the QUIC stream
+            // acceptor so SOCKS5 clients can connect over the
+            // same tunnel. Without this, kernel-TUN server mode
+            // silently dropped every 'Q' frame and SOCKS5
+            // clients hung in `ensure_quic_client`'s retry loop
+            // forever. No-op for client-role tunnels.
+            self.ensure_quic_acceptor();
+        }
+        res
     }
 
     /// Drop the TUN bridge installed by [`Self::attach_tun`]. The
@@ -715,6 +876,7 @@ impl LkTunnel {
             let _ = tx.send(());
         }));
         let _ = rx.recv();
+        log::info!("VPN: disabled (TUN detached)");
         Ok(())
     }
 
@@ -757,14 +919,59 @@ impl LkTunnel {
     pub async fn ensure_quic_client(&self)
         -> Result<(), quic_tunnel::QuicEndpointError>
     {
+        // Fast path: already up. Cheap lock — no setup work to
+        // serialise so we don't bother acquiring connect_lock.
         if self.inner.quic_client.lock().is_some() { return Ok(()); }
-        let client = self.connect_quic_to_peer().await?;
+
+        // Slow path: serialise with any other in-flight ensure
+        // call (e.g. the auto-warm spawned at peer-joined racing
+        // the explicit enable_socks5_server call from startVpn).
+        // The loser of the race awaits here, then sees the
+        // already-installed quic_client and returns Ok.
+        let _g = self.inner.connect_lock.lock().await;
+        if self.inner.quic_client.lock().is_some() { return Ok(()); }
+
+        // Retry the handshake for as long as the tunnel is alive.
+        // The client's `transport.connect` returns when *we* join
+        // the LK room, but the *peer* (server) may not yet have
+        // called `start_server()` to bring up its QUIC acceptor.
+        // The slow-server path used to time out at 30 s, leaving
+        // the user to retry by toggling SOCKS5 off-on — that
+        // re-handshake in turn caused the LK-ICE / DuplicateIdentity
+        // churn we saw on the server. Retry forever instead: any
+        // SOCKS5 / TUN toggle is then a no-op against the warm
+        // client. The loop terminates when the tunnel disconnects
+        // (`connected` flag flips false), via the early-exit check
+        // at the top of each iteration.
+        use std::time::Duration;
+        let mut backoff = Duration::from_millis(250);
+        let client = loop {
+            if !self.inner.connected.load(Ordering::Relaxed) {
+                log::info!("ensure_quic_client: tunnel disconnected — giving up");
+                return Err(quic_tunnel::QuicEndpointError::Io(
+                    std::io::Error::new(std::io::ErrorKind::NotConnected,
+                        "tunnel disconnected during quic handshake")));
+            }
+            match self.connect_quic_to_peer().await {
+                Ok(c) => break c,
+                Err(e) => {
+                    log::debug!("ensure_quic_client: handshake attempt failed: {e} — retry in {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                    // Cap at 5 s so the bringup latency from a slow
+                    // server-side start_server stays bounded.
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            }
+        };
+
         *self.inner.quic_client.lock() = Some(Arc::new(client));
-        // Spawn the keeper. Holds a Weak so it exits naturally on
-        // tunnel teardown (no extra lifecycle plumbing needed).
+        // Spawn the keeper with a Weak ref only — must NOT
+        // capture a strong LkTunnel or the explicit disconnect
+        // path can't drop Inner until the keeper next iterates,
+        // contending with the stats poller's @Synchronized JNI
+        // calls and ANR'ing the Service.
         let weak = Arc::downgrade(&self.inner);
-        let tunnel_for_keeper = self.clone();
-        runtime().spawn(quic_tunnel::keeper_task(weak, tunnel_for_keeper));
+        runtime().spawn(quic_tunnel::keeper_task(weak));
         Ok(())
     }
 
@@ -797,6 +1004,7 @@ impl LkTunnel {
             }
             *slot = Some(handle);
         }
+        log::info!("SOCKS5: enabled at {addr}");
         Ok(addr)
     }
 
@@ -805,12 +1013,18 @@ impl LkTunnel {
     pub fn disable_socks5_server(&self) {
         if let Some(h) = self.inner.socks5_handle.lock().take() {
             h.listener_abort.abort();
-            log::info!("socks5: listener at {} torn down", h.local_addr);
+            log::info!("SOCKS5: disabled (listener at {} torn down)", h.local_addr);
         }
     }
 
     /// Bring up a QUIC endpoint in **client** mode and dial the peer.
     /// Internal — same rationale as [`Self::enable_quic_server`].
+    ///
+    /// Clears `quic_rx_tx` on every failure path so a retry (or a
+    /// concurrent caller serialised behind `connect_lock`) can
+    /// install a fresh sender. Without the cleanup, a single
+    /// failed handshake would leave the slot permanently leaked
+    /// and every subsequent attempt would error `AlreadyExists`.
     pub(crate) async fn connect_quic_to_peer(&self)
         -> Result<quic_tunnel::QuicClient, quic_tunnel::QuicEndpointError>
     {
@@ -825,15 +1039,32 @@ impl LkTunnel {
             }
             *slot = Some(tx);
         }
-        let client_config = quic_tunnel::make_client_config()?;
-        let mut endpoint = quic_tunnel::build_endpoint(self.clone(), rx, None)?;
+
+        // Closure-style cleanup: any early return below releases
+        // the `quic_rx_tx` slot we just claimed.
+        let cleanup = || {
+            *self.inner.quic_rx_tx.lock() = None;
+        };
+
+        let client_config = match quic_tunnel::make_client_config() {
+            Ok(c)  => c,
+            Err(e) => { cleanup(); return Err(e.into()); }
+        };
+        let mut endpoint = match quic_tunnel::build_endpoint(self.clone(), rx, None) {
+            Ok(e)  => e,
+            Err(e) => { cleanup(); return Err(e); }
+        };
         endpoint.set_default_client_config(client_config);
         // "lktunnel" matches the SAN in the self-signed cert built
         // by `make_server_config`.
-        let connection = endpoint
-            .connect(quic_tunnel::peer_sentinel_addr(), "lktunnel")?
-            .await?;
-        Ok(quic_tunnel::QuicClient { endpoint, connection })
+        let connecting = match endpoint.connect(quic_tunnel::peer_sentinel_addr(), "lktunnel") {
+            Ok(c)  => c,
+            Err(e) => { cleanup(); return Err(e.into()); }
+        };
+        match connecting.await {
+            Ok(connection) => Ok(quic_tunnel::QuicClient { endpoint, connection }),
+            Err(e)         => { cleanup(); Err(e.into()) }
+        }
     }
 
     #[cfg(unix)]
@@ -939,6 +1170,20 @@ impl TunnelInner {
         // running and would otherwise transition to Connected.
         let _ = self.state_tx.send(TunnelState::Disconnected);
         if already_done { return; }
+        // Fire a synthetic Disconnected event to the process-wide
+        // observer. The run loop normally emits one when the LK
+        // SDK reports disconnect, but an explicit `disconnect()`
+        // or `Drop` (e.g., last Arc going away when run_client is
+        // cancelled mid-call) aborts the run loop's task before
+        // it can emit — without this synthetic emit, the
+        // signaling lib's `call_active` never flips false, and
+        // the WS rule engine doesn't spawn the run loop again.
+        // Idempotent in the rule engine — set_call_active(false)
+        // on already-false is a no-op.
+        fire_global(&Event {
+            kind: EventKind::Disconnected,
+            info: "tunnel torn down".into(),
+        });
         self.connected.store(false, Ordering::Relaxed);
         if let Some(h) = self.task.lock().take()        { h.abort(); }
         if let Some(h) = self.sender_task.lock().take() { h.abort(); }
@@ -1221,10 +1466,25 @@ async fn run_tunnel_loop(
                     }
                     RoomEvent::Disconnected { reason } => {
                         let msg = format!("{reason:?}");
+                        log::info!("LkTunnel: disconnected during peer-wait — reason={msg}");
                         if let Some(inner) = weak.upgrade() {
                             let _ = inner.state_tx.send(TunnelState::Failed(msg.clone()));
                         }
                         emit_event(&on_event, EventKind::Disconnected, msg);
+                        return;
+                    }
+                    // Same policy as the main loop: don't ride out the
+                    // SDK's reconnect. Close + bail so the caller fails
+                    // fast instead of stalling out the storm.
+                    RoomEvent::Reconnecting => {
+                        log::info!("LkTunnel: reconnecting during peer-wait — closing");
+                        let r = Arc::clone(&room);
+                        tokio::spawn(async move { r.close().await.ok(); });
+                        let msg = "reconnecting during peer-wait";
+                        if let Some(inner) = weak.upgrade() {
+                            let _ = inner.state_tx.send(TunnelState::Failed(msg.into()));
+                        }
+                        emit_event(&on_event, EventKind::Disconnected, msg.into());
                         return;
                     }
                     _ => {}
@@ -1254,24 +1514,30 @@ async fn run_tunnel_loop(
     log::info!("LkTunnel: connected (peer present)");
 
     // Auto-warm the QUIC client connection as soon as the peer is
-    // in, **only on the client side**. We detect "client side" by
-    // the absence of a NAT (server mode installs it via
-    // `start_server`) and the absence of a QUIC server handle
-    // (auto-installed by `start_server` too). Pre-warming here
-    // means platform shims (Android, Node) don't have to explicitly
-    // call `ensure_quic_client` — toggling SOCKS5 on later is
-    // instantaneous because the handshake already completed.
+    // in — only for client-role tunnels. The role is fixed at
+    // construction (`LkTunnel::connect` vs `LkTunnel::connect_server`),
+    // so no race between the auto-warm and `start_server`'s
+    // `enable_quic_server`: the latter never runs on a client-role
+    // tunnel, and the auto-warm never runs on a server-role one.
+    //
+    // Pre-warming means client-mode platform shims (Android, Node)
+    // don't have to explicitly call `ensure_quic_client` — toggling
+    // SOCKS5 on later is instantaneous because the handshake
+    // already completed.
     if let Some(inner) = weak.upgrade() {
-        let is_client_role = inner.nat.lock().is_none()
-            && inner.quic_server_handle.lock().is_none();
-        if is_client_role {
-            let tunnel = LkTunnel { inner: inner.clone() };
-            runtime().spawn(async move {
-                if let Err(e) = tunnel.ensure_quic_client().await {
-                    log::warn!("auto ensure_quic_client failed: {e} — \
-                                SOCKS5 will retry on first enable");
-                }
-            });
+        match inner.role {
+            TunnelRole::Client => {
+                let tunnel = LkTunnel { inner: inner.clone() };
+                runtime().spawn(async move {
+                    if let Err(e) = tunnel.ensure_quic_client().await {
+                        log::warn!("auto ensure_quic_client failed: {e} — \
+                                    SOCKS5 will retry on first enable");
+                    }
+                });
+            }
+            TunnelRole::Server => {
+                log::debug!("LkTunnel: server-role — skipping client auto-warm");
+            }
         }
     }
 
@@ -1302,8 +1568,22 @@ async fn run_tunnel_loop(
                         attach_rtp_receiver(&weak, track, &on_ip);
                     }
                     RoomEvent::Disconnected { reason } => {
-                        emit_event(&on_event, EventKind::Disconnected,
-                            format!("{reason:?}"));
+                        let msg = format!("{reason:?}");
+                        log::info!("LkTunnel: room disconnected — reason={msg}");
+                        emit_event(&on_event, EventKind::Disconnected, msg);
+                        break;
+                    }
+                    // We don't ride out the SDK's auto-reconnect. Its
+                    // resume/restart storm runs ~30-50s while the roster
+                    // is unreliable, and our 2s probe + the peer thrash
+                    // against it. Bail on the first Reconnecting signal:
+                    // closing the room aborts the engine's reconnect, and
+                    // the Disconnected event lets the daemon redial fresh.
+                    RoomEvent::Reconnecting => {
+                        log::info!("LkTunnel: room reconnecting — tearing down (reconnect disabled)");
+                        let r = Arc::clone(&room);
+                        tokio::spawn(async move { r.close().await.ok(); });
+                        emit_event(&on_event, EventKind::Disconnected, "reconnecting".into());
                         break;
                     }
                     _ => {}
@@ -1311,7 +1591,7 @@ async fn run_tunnel_loop(
             },
             _ = probe.tick() => {
                 if room.remote_participants().is_empty() {
-                    log::info!("LkTunnel: room empty — closing");
+                    log::info!("LkTunnel: room empty — closing (peer left without firing Disconnected)");
                     let r = Arc::clone(&room);
                     tokio::spawn(async move { r.close().await.ok(); });
                     // Push Disconnected ourselves and exit — the m144
@@ -1336,7 +1616,9 @@ fn emit_event(
     kind:     EventKind,
     info:     String,
 ) {
-    on_event(Event { kind, info });
+    let ev = Event { kind, info };
+    on_event(ev.clone());
+    fire_global(&ev);
 }
 
 /// Parse one wire payload and route to the matching consumer.
@@ -1353,13 +1635,18 @@ fn dispatch_payload(
     on_quic: &Arc<dyn Fn(&[u8]) + Send + Sync>,
 ) {
     static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+    static IP_COUNT:   AtomicU64 = AtomicU64::new(0);
+    static QUIC_COUNT: AtomicU64 = AtomicU64::new(0);
     let n = DISPATCHED.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
-        log::debug!("rtp dispatch checkpoint: {n} payloads (last len={})", payload.len());
+        log::debug!("rtp dispatch checkpoint: {n} payloads (last len={}) ip={} quic={}",
+            payload.len(),
+            IP_COUNT.load(Ordering::Relaxed),
+            QUIC_COUNT.load(Ordering::Relaxed));
     }
     match payload.first() {
-        Some(&FRAME_TYPE_IP)   => on_ip(&payload[1..]),
-        Some(&FRAME_TYPE_QUIC) => on_quic(&payload[1..]),
+        Some(&FRAME_TYPE_IP)   => { IP_COUNT.fetch_add(1, Ordering::Relaxed); on_ip(&payload[1..]) }
+        Some(&FRAME_TYPE_QUIC) => { QUIC_COUNT.fetch_add(1, Ordering::Relaxed); on_quic(&payload[1..]) }
         Some(&other)           => log::debug!(
             "unknown frame type 0x{other:02x} (len={}) — dropping", payload.len()),
         None                   => {}

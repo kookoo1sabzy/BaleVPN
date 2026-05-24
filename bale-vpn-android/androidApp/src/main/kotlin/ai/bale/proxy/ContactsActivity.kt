@@ -1,12 +1,8 @@
 package ai.bale.proxy
 
-import ai.bale.proxy.bale.ContactRepository
-import ai.bale.proxy.bale.UserEntity
-import ai.bale.proxy.net.AppHttp
 import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
-import android.util.Log
 import android.view.LayoutInflater
 import android.view.Menu
 import android.view.MenuItem
@@ -18,58 +14,57 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import androidx.appcompat.widget.SearchView
 import androidx.core.content.edit
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.floatingactionbutton.FloatingActionButton
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 class ContactsActivity : BaseActivity() {
 
     companion object {
-        /** Intent extra: "pick" (default — tap selects a peer for client mode and
-         *  finishes) or "manage" (tap opens a remove-contact dialog; nothing is
-         *  written to peer prefs). */
+        /** Intent extra: `"pick"` (default — tap selects a peer
+         *  for client mode and finishes) or `"manage"` (tap opens
+         *  a remove-contact dialog; nothing is written to peer
+         *  prefs). */
         const val EXTRA_MODE   = "mode"
         const val MODE_PICK    = "pick"
         const val MODE_MANAGE  = "manage"
-        /** LoadUsers batch size — small enough to feel responsive (each batch
-         *  is one HTTPS round trip), large enough to amortise overhead. */
-        private const val BATCH_SIZE     = 30
-        /** Distance (in rows) before the next placeholder at which we trigger
-         *  the next batch. Higher = more pre-fetch, fewer scroll stalls. */
+        /** Page size requested from the signaling layer. Large
+         *  enough to amortise RPC overhead; small enough to feel
+         *  responsive on first paint. */
+        private const val PAGE_SIZE      = 50
+        /** Distance (in rows) before the bottom at which we kick
+         *  off the next page fetch. */
         private const val PREFETCH_AHEAD = 10
     }
 
     private lateinit var recycler:    RecyclerView
-    private lateinit var searchView:  SearchView
+    private lateinit var searchView:  androidx.appcompat.widget.SearchView
     private lateinit var fabAdd:      FloatingActionButton
     private lateinit var loadingBox:  View
     private lateinit var loadingMore: View
     private lateinit var adapter:     ContactAdapter
 
-    private val prefs  by lazy { getSharedPreferences("config", MODE_PRIVATE) }
-    private val scope  = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private lateinit var repo: ContactRepository
+    private val prefs by lazy { getSharedPreferences("config", MODE_PRIVATE) }
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    private var allContacts  = listOf<UserEntity>()
-    private var searchMode   = false
-    private var manageMode   = false
-
-    /** Peer refs not yet resolved to a full UserEntity (lazy-load queue).
-     *  Drained as the user scrolls. */
-    private var pendingPeers = mutableListOf<ai.bale.proxy.bale.UserPeerRef>()
-    /** Guards loadMoreBatch() against overlapping fires from the scroll listener. */
-    private var loadingBatch = false
+    /** Last known peer list (display order). */
+    private var rows: MutableList<ContactRow> = mutableListOf()
+    private var nextCursor: String? = null
+    private var searchMode: Boolean = false
+    private var manageMode: Boolean = false
+    /** Guards the next-page fetch against overlapping scroll fires. */
+    private var loadingPage: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_contacts)
 
-        val token = prefs.getString("token", "") ?: ""
-        repo      = ContactRepository(AppHttp.client, token)
         manageMode = intent.getStringExtra(EXTRA_MODE) == MODE_MANAGE
         if (manageMode) supportActionBar?.title = "Contacts"
 
@@ -81,87 +76,61 @@ class ContactsActivity : BaseActivity() {
 
         adapter = ContactAdapter(
             showRemove = manageMode,
-            onSelect   = { user -> if (manageMode) confirmRemove(user) else selectPeer(user) },
-            onRemove   = { user -> confirmRemove(user) },
+            onSelect   = { row -> if (manageMode) confirmRemove(row) else selectPeer(row) },
+            onRemove   = { row -> confirmRemove(row) },
         )
         recycler.layoutManager = LinearLayoutManager(this)
         recycler.adapter       = adapter
-        // Lazy-load: when the user scrolls within PREFETCH_AHEAD of the next
-        // unresolved placeholder, kick off a LoadUsers batch. Cheap to evaluate
-        // — only fires on actual scroll events.
         recycler.addOnScrollListener(object : RecyclerView.OnScrollListener() {
             override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
-                if (dy <= 0 || loadingBatch || pendingPeers.isEmpty()) return
+                if (dy <= 0 || loadingPage || nextCursor == null || searchMode) return
                 val lm = rv.layoutManager as LinearLayoutManager
                 val last = lm.findLastVisibleItemPosition()
-                val firstUnloaded = allContacts.indexOfFirst { !it.loaded }
-                if (firstUnloaded >= 0 && last >= firstUnloaded - PREFETCH_AHEAD) {
-                    loadMoreBatch()
-                }
+                if (last >= rows.size - PREFETCH_AHEAD) loadNextPage()
             }
         })
 
-        // FAB behavior diverges per mode:
-        //  - client mode: opens the search bar to find any user (by phone) and tap
-        //    to select as VPN peer. Phone search auto-imports.
-        //  - manage mode: opens an explicit "Add by phone" dialog; the main list
-        //    shows all contacts with a Remove button, no search bar.
+        // FAB behaviour:
+        //  - pick mode (client picker): tap → open search bar
+        //    to look up any user by phone and select as VPN peer.
+        //  - manage mode: tap → explicit "Add by phone" dialog;
+        //    main list is the contact list with Remove buttons.
         fabAdd.setOnClickListener { if (manageMode) showAddDialog() else enterSearchMode() }
 
-        searchView.setOnQueryTextListener(object : SearchView.OnQueryTextListener {
+        searchView.setOnQueryTextListener(object : androidx.appcompat.widget.SearchView.OnQueryTextListener {
             override fun onQueryTextSubmit(q: String?) = q?.trim()?.let { search(it) }.let { true }
             override fun onQueryTextChange(q: String?) = false
         })
         searchView.setOnCloseListener { exitSearchMode(); true }
 
-        // Back press exits search mode instead of closing the screen
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (searchMode) exitSearchMode() else finish()
             }
         })
 
-        loadContacts()
+        loadFirstPage()
     }
 
-    // ── Contacts mode ─────────────────────────────────────────────────────────
+    // ── Listing ───────────────────────────────────────────────────────────────
 
-    private fun loadContacts() {
-        // Show centered spinner only if there are no cache hits yet — otherwise
-        // we have rows to render immediately and a centered overlay would just
-        // hide them.
+    private fun loadFirstPage() {
         loadingBox.visibility = View.VISIBLE
+        nextCursor = null
+        rows.clear()
+        adapter.submit(rows)
         scope.launch {
             try {
-                val res = repo.getContactPeers()
-                // Inline-users path (rare): full entities came back in one shot.
-                if (res.inlineUsers.isNotEmpty()) {
-                    UserCache.putAll(res.inlineUsers)
-                    allContacts = res.inlineUsers
-                    pendingPeers = mutableListOf()
-                    adapter.submit(allContacts)
+                val sig = BaleConnection.signaling
+                if (sig == null) {
+                    Toast.makeText(this@ContactsActivity, "Signaling not initialised", Toast.LENGTH_SHORT).show()
                     return@launch
                 }
-                // Lazy-load path. For each peer ref:
-                //   - cache hit AND accessHash matches → render cached entity (loaded=true)
-                //   - cache miss OR accessHash mismatch → placeholder + queue for fetch
-                val initial = ArrayList<UserEntity>(res.peers.size)
-                val toFetch = ArrayList<ai.bale.proxy.bale.UserPeerRef>()
-                for (p in res.peers) {
-                    val cached = UserCache[p.uid]
-                    if (cached != null && cached.accessHash == p.accessHash) {
-                        initial += cached
-                    } else {
-                        initial += UserEntity(id = p.uid, name = "", accessHash = p.accessHash, loaded = false)
-                        toFetch += p
-                    }
-                }
-                allContacts  = initial
-                pendingPeers = toFetch
-                adapter.submit(allContacts)
-                // Centered spinner hides in the finally block; the footer
-                // takes over for the per-batch fetches kicked off below.
-                if (pendingPeers.isNotEmpty()) loadMoreBatch()
+                val page = sig.listContacts(query = null, cursor = null, limit = PAGE_SIZE)
+                rows.addAll(page.peerIds.map { ContactRow(peerId = it, displayName = sig.peerDisplayName(it)) })
+                nextCursor = page.nextCursor
+                adapter.submit(rows)
+                kickDisplayNameFetches()
             } catch (e: Exception) {
                 Toast.makeText(this@ContactsActivity, "Load failed: ${e.message}", Toast.LENGTH_SHORT).show()
             } finally {
@@ -170,55 +139,53 @@ class ContactsActivity : BaseActivity() {
         }
     }
 
-    private fun loadMoreBatch() {
-        if (loadingBatch || pendingPeers.isEmpty()) return
-        loadingBatch = true
+    private fun loadNextPage() {
+        if (loadingPage || nextCursor == null) return
+        loadingPage = true
         loadingMore.visibility = View.VISIBLE
         scope.launch {
             try {
-                val batch = pendingPeers.take(BATCH_SIZE).toList()
-                val users = repo.loadUsersBatch(batch)
-                pendingPeers = pendingPeers.drop(batch.size).toMutableList()
-                UserCache.putAll(users)
-                val byId = users.associateBy { it.id }
-                // For uids in `batch` that LoadUsers didn't return (deleted
-                // account, blocked, server-side miss), synthesise a "loaded but
-                // empty" entity so the row renders the uid number instead of
-                // spinning forever. Cache them too — Bale won't return more
-                // info on a future call either.
-                val unresolved = batch.filter { !byId.containsKey(it.uid) }
-                val unresolvedFillers = unresolved.map {
-                    UserEntity(id = it.uid, name = "", accessHash = it.accessHash, loaded = true)
-                }
-                if (unresolvedFillers.isNotEmpty()) {
-                    Log.w("ContactsActivity", "LoadUsers didn't return ${unresolvedFillers.size}/${batch.size} uids: ${unresolved.map { it.uid }}")
-                    UserCache.putAll(unresolvedFillers)
-                }
-                val byIdFiller = unresolvedFillers.associateBy { it.id }
-                allContacts = allContacts.map { c ->
-                    when {
-                        c.loaded                       -> c
-                        byId.containsKey(c.id)         -> byId.getValue(c.id)
-                        byIdFiller.containsKey(c.id)   -> byIdFiller.getValue(c.id)
-                        else                           -> c
-                    }
-                }
-                adapter.submit(allContacts)
+                val sig = BaleConnection.signaling ?: return@launch
+                val page = sig.listContacts(query = null, cursor = nextCursor, limit = PAGE_SIZE)
+                val newRows = page.peerIds.map { ContactRow(peerId = it, displayName = sig.peerDisplayName(it)) }
+                rows.addAll(newRows)
+                nextCursor = page.nextCursor
+                adapter.submit(rows)
+                kickDisplayNameFetches()
             } catch (e: Exception) {
                 Toast.makeText(this@ContactsActivity, "Load more failed: ${e.message}", Toast.LENGTH_SHORT).show()
             } finally {
-                loadingBatch = false
+                loadingPage = false
                 loadingMore.visibility = View.GONE
             }
         }
     }
 
-    // ── Search / add mode ─────────────────────────────────────────────────────
+    /** Resolve display names asynchronously for every row that
+     *  doesn't have one yet. One coroutine per row — the
+     *  signaling layer caches results so subsequent calls hit
+     *  the in-memory cache. */
+    private fun kickDisplayNameFetches() {
+        val sig = BaleConnection.signaling ?: return
+        for ((idx, row) in rows.withIndex()) {
+            if (row.displayName != null) continue
+            val peerId = row.peerId
+            scope.launch {
+                val name = try { sig.fetchDisplayName(peerId) } catch (_: Exception) { null }
+                if (name != null) {
+                    rows[idx] = rows[idx].copy(displayName = name)
+                    adapter.notifyItemChanged(idx)
+                }
+            }
+        }
+    }
+
+    // ── Search ────────────────────────────────────────────────────────────────
 
     private fun enterSearchMode() {
         searchMode = true
         searchView.visibility = View.VISIBLE
-        searchView.queryHint = "+98912…"
+        searchView.queryHint  = "+98912…"
         searchView.requestFocus()
         fabAdd.hide()
         adapter.submit(emptyList())
@@ -229,13 +196,13 @@ class ContactsActivity : BaseActivity() {
         searchView.visibility = View.GONE
         searchView.setQuery("", false)
         fabAdd.show()
-        adapter.submit(allContacts)
+        adapter.submit(rows)
     }
 
-    // Only reached in client mode (manage mode hides the searchView and uses the
-    // explicit add-by-phone dialog instead). Phone-number search only — name search
-    // is intentionally not offered here; type something that looks like a phone or
-    // nothing happens.
+    /** Pick-mode search box. Phone-shaped queries hit
+     *  searchContactByPhone (which also imports — see the Bale
+     *  trait docs); anything else is silently ignored to match
+     *  the pre-migration behaviour. */
     private fun search(query: String) {
         if (!query.matches(Regex("[+\\d][\\d\\s\\-]{4,}"))) {
             Toast.makeText(this, "Enter a phone number (e.g. +98912…)", Toast.LENGTH_SHORT).show()
@@ -243,9 +210,18 @@ class ContactsActivity : BaseActivity() {
         }
         scope.launch {
             try {
-                val results = repo.searchByPhone(query)
-                UserCache.putAll(results)
+                val sig = BaleConnection.signaling ?: return@launch
+                val ids = sig.searchContactByPhone(query)
+                val results = ids.map { ContactRow(peerId = it, displayName = sig.peerDisplayName(it)) }
                 adapter.submit(results)
+                // Kick name fetches for the visible search hits.
+                for ((idx, row) in results.withIndex()) {
+                    val pid = row.peerId
+                    scope.launch {
+                        val name = try { sig.fetchDisplayName(pid) } catch (_: Exception) { null }
+                        if (name != null) adapter.updateName(idx, name)
+                    }
+                }
             } catch (e: Exception) {
                 Toast.makeText(this@ContactsActivity, "Search failed: ${e.message}", Toast.LENGTH_SHORT).show()
             }
@@ -254,19 +230,19 @@ class ContactsActivity : BaseActivity() {
 
     // ── Peer selection ────────────────────────────────────────────────────────
 
-    private fun selectPeer(user: UserEntity) {
+    private fun selectPeer(row: ContactRow) {
         prefs.edit(commit = true) {
-            putString("peerId",   user.id.toString())
-            putString("peerType", user.peerType.toString())
-            putString("peerName", user.displayName)
+            putString("peerId",   row.peerId)
+            putString("peerType", "1")
+            putString("peerName", row.displayName ?: row.peerId)
         }
         finish()
     }
 
-    // ── Manage mode: add a contact by phone ───────────────────────────────────
+    // ── Manage mode: add by phone ─────────────────────────────────────────────
 
     private fun showAddDialog() {
-        val dp = resources.displayMetrics.density
+        val dp  = resources.displayMetrics.density
         val pad = (24 * dp).toInt()
         val et  = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_PHONE
@@ -291,38 +267,46 @@ class ContactsActivity : BaseActivity() {
     private fun doAddByPhone(phone: String) {
         scope.launch {
             try {
-                // ImportContacts has dual purpose: it both finds the user and adds them.
-                // We discard the returned list — the main loadContacts() call below will
-                // re-fetch and show the new contact in place.
-                val added = repo.searchByPhone(phone)
-                val msg = if (added.isEmpty()) "No user found for $phone"
-                          else "Added ${added.first().displayName}"
+                val sig = BaleConnection.signaling ?: return@launch
+                // Bale's `searchContactByPhone` already adds the
+                // contact as a side effect (its ImportContacts
+                // RPC conflates lookup and add). `addToContacts`
+                // is a no-op on Bale; we call it anyway so the
+                // intent is explicit at the call site for
+                // future impls without the conflated semantics.
+                val ids = sig.searchContactByPhone(phone)
+                ids.firstOrNull()?.let { sig.addToContacts(it) }
+                val msg = if (ids.isEmpty()) "No user found for $phone" else "Added"
                 Toast.makeText(this@ContactsActivity, msg, Toast.LENGTH_SHORT).show()
-                loadContacts()
+                loadFirstPage()
             } catch (e: Exception) {
                 Toast.makeText(this@ContactsActivity, "Add failed: ${e.message}", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    // ── Manage mode: remove a contact ─────────────────────────────────────────
+    // ── Manage mode: remove ───────────────────────────────────────────────────
 
-    private fun confirmRemove(user: UserEntity) {
+    private fun confirmRemove(row: ContactRow) {
+        val label = row.displayName ?: row.peerId
         AlertDialog.Builder(this)
             .setTitle("Remove contact")
-            .setMessage("Remove ${user.displayName} from your contacts?")
-            .setPositiveButton("Remove") { _, _ -> doRemove(user) }
+            .setMessage("Remove $label from your contacts?")
+            .setPositiveButton("Remove") { _, _ -> doRemove(row) }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun doRemove(user: UserEntity) {
+    private fun doRemove(row: ContactRow) {
         scope.launch {
             try {
-                repo.removeContact(user)
-                Toast.makeText(this@ContactsActivity, "Removed ${user.displayName}", Toast.LENGTH_SHORT).show()
-                // Reload from server so the list reflects the removal.
-                loadContacts()
+                val sig = BaleConnection.signaling ?: return@launch
+                if (sig.removeContact(row.peerId)) {
+                    Toast.makeText(this@ContactsActivity, "Removed", Toast.LENGTH_SHORT).show()
+                    loadFirstPage()
+                } else {
+                    Toast.makeText(this@ContactsActivity, "Remove failed", Toast.LENGTH_SHORT).show()
+                }
             } catch (e: Exception) {
                 Toast.makeText(this@ContactsActivity, "Remove failed: ${e.message}", Toast.LENGTH_SHORT).show()
             }
@@ -333,7 +317,7 @@ class ContactsActivity : BaseActivity() {
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.menu_contacts, menu)
-        super.onCreateOptionsMenu(menu)   // adds About / TCP debug / View app logs
+        super.onCreateOptionsMenu(menu)
         return true
     }
 
@@ -351,17 +335,32 @@ class ContactsActivity : BaseActivity() {
     override fun onDestroy() { super.onDestroy(); scope.cancel() }
 }
 
+/** One row in the contacts UI. `displayName` is `null` until the
+ *  signaling layer resolves it — the row shows the peerId until
+ *  then. */
+data class ContactRow(
+    val peerId:      String,
+    val displayName: String?,
+)
+
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
 class ContactAdapter(
     private val showRemove: Boolean = false,
-    private val onSelect:   (UserEntity) -> Unit,
-    private val onRemove:   (UserEntity) -> Unit = {},
+    private val onSelect:   (ContactRow) -> Unit,
+    private val onRemove:   (ContactRow) -> Unit = {},
 ) : RecyclerView.Adapter<ContactAdapter.VH>() {
 
-    private var items = listOf<UserEntity>()
+    private var items = listOf<ContactRow>()
 
-    fun submit(list: List<UserEntity>) { items = list; notifyDataSetChanged() }
+    fun submit(list: List<ContactRow>) { items = list; notifyDataSetChanged() }
+    fun updateName(index: Int, name: String) {
+        if (index !in items.indices) return
+        val cur = items[index]
+        if (cur.displayName == name) return
+        items = items.toMutableList().also { it[index] = cur.copy(displayName = name) }
+        notifyItemChanged(index)
+    }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
         VH(LayoutInflater.from(parent.context).inflate(R.layout.item_contact, parent, false))
@@ -375,50 +374,19 @@ class ContactAdapter(
         private val tvPhone   = v.findViewById<TextView>(R.id.tvPhone)
         private val tvId      = v.findViewById<TextView>(R.id.tvId)
         private val btnRemove = v.findViewById<com.google.android.material.button.MaterialButton>(R.id.btnRemove)
-        fun bind(u: UserEntity) {
-            if (!u.loaded) {
-                // Placeholder row — full entity hasn't been LoadUsers-fetched
-                // yet. Dim the row, show "Loading…", swallow taps so the user
-                // doesn't pick a peer with no name yet.
-                tvName.text        = "Loading…"
-                tvNick.visibility  = View.GONE
-                tvPhone.visibility = View.GONE
-                tvId.text          = "ID: ${u.id}"
-                itemView.alpha     = 0.5f
-                itemView.setOnClickListener(null)
-                btnRemove.visibility = View.GONE
-                return
-            }
-            itemView.alpha = 1f
-            // Each piece of info on its own light-gray line below the name:
-            //   tvName  : name (or @nick / id fallback) — bold, full opacity
-            //   tvNick  : @nickname (when present, and primary isn't already it)
-            //   tvPhone : +989121234567 (when known)
-            //   tvId    : ID: 12345 (always — for log/notification correlation)
-            tvName.text = if (u.name.isNotBlank()) u.name
-                          else if (u.nick.isNotBlank()) "@${u.nick}"
-                          else u.id.toString()
-
-            val showNick = u.nick.isNotBlank() && u.name.isNotBlank()
-            tvNick.text       = "@${u.nick}"
-            tvNick.visibility = if (showNick) View.VISIBLE else View.GONE
-
-            tvPhone.text       = formatPhone(u.phone)
-            tvPhone.visibility = if (u.phone.isNotEmpty()) View.VISIBLE else View.GONE
-
-            tvId.text = "ID: ${u.id}"
-            itemView.setOnClickListener { onSelect(u) }
-            // Per-row Remove button visible only in manage mode. Tapping it goes
-            // straight to the confirm dialog without first selecting the row.
+        fun bind(row: ContactRow) {
+            // Phone + nick are no longer in the trait surface;
+            // the row just shows display name + peer ID. The
+            // pre-migration UI had richer info via Bale's
+            // LoadFullUsers RPC, but that route is gone now.
+            tvName.text       = row.displayName ?: row.peerId
+            tvNick.visibility = View.GONE
+            tvPhone.visibility = View.GONE
+            tvId.text         = "ID: ${row.peerId}"
+            itemView.alpha    = if (row.displayName == null) 0.7f else 1f
+            itemView.setOnClickListener { onSelect(row) }
             btnRemove.visibility = if (showRemove) View.VISIBLE else View.GONE
-            btnRemove.setOnClickListener { onRemove(u) }
+            btnRemove.setOnClickListener { onRemove(row) }
         }
     }
-
-    // Bale sometimes returns the phone as bare digits ("989121234567") instead
-    // of E.164 ("+989121234567"). Prepend '+' if it looks like an international
-    // number that's missing it. Anything starting with '+' or non-digit is
-    // returned as-is.
-    private fun formatPhone(p: String): String =
-        if (p.isNotEmpty() && p.all { it.isDigit() }) "+$p" else p
 }

@@ -135,7 +135,8 @@ class MainActivity : BaseActivity() {
         }
 
         btnWs.setOnClickListener {
-            if (BaleConnection.client != null) {
+            val sig = BaleConnection.signaling ?: return@setOnClickListener
+            if (BaleConnection.isConnectRequested || BaleConnection.isReady) {
                 // Disconnect path needs pre-cleanup: send discardCall to every
                 // connected/pending peer over the still-alive WS so they tear down
                 // immediately instead of waiting out the callAccepted timeout on
@@ -145,14 +146,18 @@ class MainActivity : BaseActivity() {
                     try {
                         if (BaleServerService.isRunning) BaleServerService.disconnectAllClients()
                     } finally {
-                        BaleConnection.userInitiatedDisconnect = true
-                        BaleConnection.reconcile()
+                        // sig.disconnect() sets `user_disconnect=true`
+                        // in the Rust rule engine — sticky, so the WS
+                        // stays down across ticks until the user hits
+                        // Connect again.
+                        sig.disconnect()
                         btnWs.isEnabled = true
                     }
                 }
             } else {
-                BaleConnection.userInitiatedDisconnect = false
-                BaleConnection.reconcile()
+                // sig.connect() clears user_disconnect and pushes the
+                // token; rule engine evaluates and brings WS up.
+                uiScope.launch { sig.connect() }
             }
         }
         btnVpn.setOnClickListener {
@@ -203,7 +208,13 @@ class MainActivity : BaseActivity() {
                     enableTunWithUiUpdate()
                 }
             } else {
-                BaleVpnService.disableTun()
+                // disableTun → LkTunnel.detachTun (@Synchronized
+                // JNI). Can block under stats-poller contention;
+                // run it on a worker so the UI thread keeps
+                // pumping events.
+                uiScope.launch {
+                    withContext(Dispatchers.Default) { BaleVpnService.disableTun() }
+                }
             }
         }
 
@@ -235,8 +246,16 @@ class MainActivity : BaseActivity() {
                     }
                 }
             } else {
-                BaleVpnService.disableSocks5()
+                // disableSocks5 is JNI under @Synchronized — can
+                // block under stats-poller / keeper contention.
+                // Hide the status row immediately; do the native
+                // teardown on a worker.
                 tvSocks5Status.visibility = View.GONE
+                uiScope.launch {
+                    withContext(Dispatchers.Default) {
+                        BaleVpnService.disableSocks5()
+                    }
+                }
             }
         }
         etSocks5Port.setOnFocusChangeListener { _, hasFocus ->
@@ -274,10 +293,14 @@ class MainActivity : BaseActivity() {
         } else {
             if (BaleServerService.isRunning) stopServer()
         }
-        // Mode pref is already updated by the toggle listener; reconcile applies the
-        // new mode's WS rule (client→up while foreground, server→up unless sticky
-        // disconnect).
-        BaleConnection.reconcile()
+        // Mode switching no longer pushes anything directly to
+        // the WS rule engine — the engine derives semantics from
+        // `server_active`, which BaleServerService.onStartCommand /
+        // stopServer push themselves. Here we only ensure the WS
+        // intent is on (sig.connect is idempotent).
+        BaleConnection.signaling?.let { sig ->
+            uiScope.launch { sig.connect() }
+        }
         showModeLayout(mode)
     }
 
@@ -286,7 +309,6 @@ class MainActivity : BaseActivity() {
     // because that @Volatile flag can stay true after the OS kills the service without
     // calling onDestroy. Android dedups startService for an already-running service
     // (it just re-fires onStartCommand, which we made idempotent).
-    // WS state is handled by BaleConnection.reconcile() at the caller.
     private fun ensureServerRunning() {
         val token = prefs.getString("token", "").orEmpty()
         if (token.isEmpty()) return
@@ -388,18 +410,30 @@ class MainActivity : BaseActivity() {
         val serviceRunning = BaleVpnService.isRunning || BaleServerService.isRunning
 
         tvWsStatus.text = "WebSocket: " + when {
-            wsReady                       -> "Connected"
-            BaleConnection.client != null -> "Connecting…"
-            else                          -> "Disconnected"
+            wsReady                              -> "Connected"
+            // When a VPN call is active the rule engine
+            // intentionally pauses the WS — show that explicitly
+            // rather than "Connecting…" which would be misleading.
+            BaleVpnService.isRunning             -> "Paused (in call)"
+            // True only while the run loop is mid-handshake or
+            // mid-reconnect — distinct from intent-to-connect
+            // (which can stay true while the rule deliberately
+            // doesn't spawn the loop).
+            BaleConnection.isAttemptingConnect   -> "Connecting…"
+            else                                 -> "Disconnected"
         }
         tvWsStatus.visibility = View.VISIBLE
 
-        // Logged-in account name — populated by BaleWsClient.loadSelf() once
-        // the WS handshakes. Falls back to "User #<id>" if Bale didn't return
-        // a display name (self isn't usually in your own contact list).
-        val self = BaleConnection.client?.self
+        // Logged-in account name. The signaling layer caches it
+        // after WS handshake (load_self on the Rust side); we
+        // surface it sync via BaleConnection.selfInfo, which a
+        // background coroutine refreshes every 2s. Falls back to
+        // "User #<id>" when Bale didn't return a display name
+        // (self isn't usually in your own contact list).
+        val self = BaleConnection.selfInfo
         if (self != null) {
-            val display = self.name?.takeIf { it.isNotBlank() } ?: "User #${self.id}"
+            val (peerId, name) = self
+            val display = name?.takeIf { it.isNotBlank() } ?: "User #$peerId"
             tvSelfName.text       = "Signed in as $display"
             tvSelfName.visibility = View.VISIBLE
         } else {
@@ -412,7 +446,7 @@ class MainActivity : BaseActivity() {
         // VPN reconnects, so a manual button would just be a footgun.
         if (mode == "server") {
             btnWs.visibility = View.VISIBLE
-            btnWs.text       = if (BaleConnection.client != null) "Disconnect" else "Connect"
+            btnWs.text       = if (BaleConnection.isConnectRequested || BaleConnection.isReady) "Disconnect" else "Connect"
         } else {
             btnWs.visibility = View.GONE
         }
@@ -498,7 +532,7 @@ class MainActivity : BaseActivity() {
         val running     = BaleServerService.isRunning
         val infos       = BaleServerService.getClientInfos()
         val pending     = BaleServerService.getPendingCalls()
-        val wsAttached  = BaleConnection.client != null
+        val wsAttached  = BaleConnection.isConnectRequested || BaleConnection.isReady
 
         // Without the WS the server can't receive incoming-call updates. Distinguish
         // "user manually disconnected" (no client at all) from "client exists but is

@@ -1,6 +1,8 @@
 package ai.bale.proxy
 
-import ai.bale.proxy.bale.CallEntity
+import ai.bale.proxy.bale.BaleEvent
+import ai.bale.proxy.bale.BaleIncomingHandler
+import ai.bale.proxy.bale.CallDecision
 import ai.bale.proxy.tunnel.LiveKitStats
 import ai.bale.proxy.tunnel.PacketStats
 import android.app.*
@@ -8,6 +10,7 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collect
 import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG                = "BaleProxy"
@@ -35,12 +38,25 @@ class BaleServerService : Service() {
         val packetStats:  PacketStats? = null,
     )
 
+    /** UI-visible pending-call record. The real "pending" state
+     *  lives in the in-flight [BaleIncomingHandler.decide]
+     *  coroutines via [PendingDecision.deferred]; this is just
+     *  the snapshot the UI iterates. */
     data class PendingCall(
         val callId:     Long,
         val callerId:   Long,
-        val entity:     CallEntity?,
         val callerName: String? = null,
         val receivedAt: Long    = System.currentTimeMillis(),
+    )
+
+    /** In-flight admission decision. Held in [pendingDecisions]
+     *  keyed by callerId. Action handlers (Allow / Reject /
+     *  timeout) complete the `deferred` and the
+     *  [BaleIncomingHandler] coroutine resumes with the result. */
+    private data class PendingDecision(
+        val callerId: Long,
+        val deferred: CompletableDeferred<CallDecision>,
+        val receivedAt: Long = System.currentTimeMillis(),
     )
 
     // Recreated whenever the service is (re)started — once cancelled, a CoroutineScope
@@ -65,8 +81,11 @@ class BaleServerService : Service() {
         @Volatile var resolvedName: String? = null,
     )
 
-    private val clients     = ConcurrentHashMap<Long, Client>()
-    private val pendingMap  = ConcurrentHashMap<Long, PendingCall>()
+    private val clients           = ConcurrentHashMap<Long, Client>()
+    /** UI-visible snapshot keyed by callerId. */
+    private val pendingMap        = ConcurrentHashMap<Long, PendingCall>()
+    /** In-flight admission deferreds keyed by callerId. */
+    private val pendingDecisions  = ConcurrentHashMap<Long, PendingDecision>()
 
     companion object {
         const val ACTION_STOP = "ai.bale.proxy.SERVER_STOP"
@@ -183,26 +202,37 @@ class BaleServerService : Service() {
         BlacklistStore.init(prefs)
         debug           = prefs.getBoolean("packet_debug",     false)
 
-        // Always re-register; idempotent and ensures the latest lambda is in place
-        // even if onStartCommand is called multiple times for the same instance.
-        BaleConnection.onCallReceived = { callId, call ->
-            // Route through the live `instance`, not the captured one — if this
-            // service has been stopped and replaced, the captured `scope` would be
-            // dead and the launch would silently no-op.
+        // Install the admission policy on the signaling layer.
+        // The handler is called per incoming call; its async
+        // decision (Accept / Reject / SilentlyIgnore) drives
+        // BaleSignaling's internal acceptCall / discardCall RPCs.
+        // Successful Accepts surface back via the SessionReady
+        // event collected below.
+        BaleConnection.signaling?.setIncomingHandler(BaleIncomingHandler { peerIdStr, displayName ->
             val live = instance
             if (live == null || !live.scope.isActive) {
-                Log.w(TAG, "Server: callReceived $callId arrived but service scope is gone (instance=${live != null})")
-            } else {
-                live.scope.launch { live.checkAndHandleCall(callId, call) }
+                Log.w(TAG, "Server: incoming from $peerIdStr but service scope is gone (instance=${live != null})")
+                return@BaleIncomingHandler CallDecision.SilentlyIgnore
             }
-        }
-        // The peer may hang up before the LiveKit ParticipantDisconnected event arrives
-        // (or before the user has even decided on a pending call). React to the WS
-        // callEnded so stale clients/notifications get cleaned up immediately.
-        BaleConnection.onCallEnded = { callId ->
-            val live = instance
-            if (live != null && live.scope.isActive) {
-                live.scope.launch { live.onCallEndedRemote(callId) }
+            val callerId = peerIdStr.toLongOrNull() ?: return@BaleIncomingHandler CallDecision.SilentlyIgnore
+            live.decideIncoming(callerId, displayName)
+        })
+        // Tell the WS rule engine we're in server semantics — WS
+        // stays up unconditionally (modulo token + user_disconnect)
+        // so we can receive incoming callReceived pushes.
+        BaleConnection.signaling?.setServerActive(true)
+
+        // Subscribe to signaling events for accepted-session
+        // lifecycle. SessionReady fires once the impl has run
+        // acceptCall and has LK creds; SessionEnded/CallEnded
+        // fire when the call terminates from the peer side.
+        scope.launch {
+            BaleConnection.signaling?.events?.collect { ev ->
+                when (ev) {
+                    is BaleEvent.SessionReady -> handleSessionReady(ev)
+                    is BaleEvent.CallEnded    -> onCallEndedRemote(ev.peerId.toLongOrNull() ?: 0L)
+                    else -> Unit
+                }
             }
         }
 
@@ -212,146 +242,156 @@ class BaleServerService : Service() {
             scope.launch { statsLoop() }
         }
 
-        // Bring up the WS if the rules allow (i.e., the user hasn't pressed Disconnect
-        // in server mode). Goes through reconcile() so we don't override the sticky flag.
-        BaleConnection.reconcile()
+        // Bring up the WS. sig.connect() clears the user_disconnect
+        // sticky and installs the token; Rust rule engine evaluates
+        // (server mode → WS up modulo user_disconnect, which we just
+        // cleared). Idempotent if already connected.
+        BaleConnection.signaling?.let { sig -> scope.launch { sig.connect() } }
 
         return START_STICKY
     }
 
-    private suspend fun checkAndHandleCall(callId: Long, call: CallEntity?) {
-        val callerId = call?.callerId ?: 0L
-        Log.d(TAG, "Server: incoming call $callId callerId=$callerId allowed=${AdmissionStore.isAllowed(callerId)}")
+    /** Suspend admission decision for a fresh incoming call.
+     *  Mirrors the pre-migration `checkAndHandleCall` policy
+     *  but returns a [CallDecision] for [BaleIncomingHandler]
+     *  to consume. Pending decisions block on a
+     *  [CompletableDeferred] completed by the notification's
+     *  Allow/Reject buttons (or the sweep loop timeout). */
+    private suspend fun decideIncoming(callerId: Long, displayName: String?): CallDecision {
+        Log.d(TAG, "Server: incoming callerId=$callerId allowed=${AdmissionStore.isAllowed(callerId)}")
 
-        // Bale fans out two updates per incoming call: callReceived (52810, sometimes
-        // with an empty participants list → callerId=0) and callStarted (52807, with
-        // adminUid). The order isn't guaranteed. If we get the callerId=0 variant
-        // first, defer — creating a pending entry now would surface as "unknown
-        // caller" in the UI. The follow-up will carry the real caller id.
-        if (callerId == 0L) {
-            Log.d(TAG, "Server: callId=$callId arrived without callerId — deferring (waiting for paired update)")
-            return
-        }
-
-        // Blocked callers are rejected silently — no notification, no pending entry.
-        // Their last-known disconnect already showed up in the UI; this is just the
-        // gate that enforces "we said we were done with you".
+        // Blocked callers: silent reject. Their last-known
+        // disconnect already showed in the UI; this is the gate
+        // that enforces "we said we were done with you".
         if (BlacklistStore.isBlocked(callerId)) {
-            Log.d(TAG, "Server: rejecting blacklisted callerId=$callerId (callId=$callId)")
-            BaleConnection.client?.discardCall(callId)
-            return
+            Log.d(TAG, "Server: rejecting blacklisted callerId=$callerId")
+            return CallDecision.SilentlyIgnore
         }
 
-        // Capacity gate. Applies to allowed and not-yet-allowed callers alike — a
-        // pending entry queued past the cap would just stall waiting for a slot
-        // that may never open. Rejection is silent (no blacklist) so the caller is
-        // free to re-call once a slot frees up.
+        // Capacity gate. Applies to allowed and not-yet-allowed
+        // alike — a pending decision queued past the cap would
+        // just stall. Rejection is silent so the caller is free
+        // to re-call once a slot frees up.
         val maxClients = getMaxClients(getSharedPreferences("config", MODE_PRIVATE))
         if (clients.size >= maxClients) {
             Log.d(TAG, "Server: rejecting callerId=$callerId — at capacity ${clients.size}/$maxClients")
-            BaleConnection.client?.discardCall(callId)
-            return
+            return CallDecision.SilentlyIgnore
         }
 
-        if (AdmissionStore.isAllowed(callerId)) {
-            // New call from the same caller always wins — handleCall replaces any
-            // existing client locally. Clear any leftover pending entry first so
-            // the UI doesn't show a stale "pending" row for an already-accepted
-            // client (can happen if admission state changed mid-flight).
-            if (pendingMap.remove(callId) != null) {
-                pendingSnapshot = pendingMap.values.toList()
-                cancelPendingNotificationIfEmpty()
-                updateNotification()
-            }
-            handleCall(callId, call)
-        } else {
-            // If there's already a pending request from the same caller, replace it.
-            val dup = pendingMap.values.firstOrNull { it.callerId == callerId }
-            if (dup != null) {
-                Log.d(TAG, "Server: replacing duplicate pending call ${dup.callId} from callerId=$callerId")
-                pendingMap.remove(dup.callId)
-                BaleConnection.client?.discardCall(dup.callId)
-            }
-            // Resolve the caller name synchronously before posting so the
-            // notification reads "Joe wants to connect" on first appearance.
-            // Cached after first hit; only the first new caller per service
-            // lifetime pays the contact-list HTTP fetch.
-            val resolvedName = if (callerId != 0L) {
-                try { BaleConnection.client?.loadUserName(callerId.toInt()) } catch (_: Exception) { null }
-            } else null
-            Log.d(TAG, "Server: pending callerId=$callerId resolved='${resolvedName ?: "<null>"}'")
-            val pending = PendingCall(callId, callerId, call, callerName = resolvedName)
-            pendingMap[callId] = pending
+        if (AdmissionStore.isAllowed(callerId)) return CallDecision.Accept
+
+        // Otherwise: enter the pending state. A duplicate from
+        // the same caller cancels the previous deferred.
+        pendingDecisions.remove(callerId)?.deferred?.complete(CallDecision.SilentlyIgnore)
+        val deferred = CompletableDeferred<CallDecision>()
+        pendingDecisions[callerId] = PendingDecision(callerId, deferred)
+        // UI-visible mirror — callId field gets the callerId for
+        // notification action routing (one-to-one in the new model).
+        pendingMap[callerId] = PendingCall(callerId, callerId, displayName)
+        pendingSnapshot = pendingMap.values.toList()
+        updateNotification()
+        showPendingNotification(callerId, callerName = displayName)
+        return deferred.await()
+    }
+
+    /** Called when the impl has produced LK creds for an accepted
+     *  call. Builds the LkTunnel, records the Client, posts the
+     *  notification. Replaces the pre-migration handleCall +
+     *  acceptAndStart pair. */
+    private fun handleSessionReady(ev: BaleEvent.SessionReady) {
+        val callerId = ev.peerId.toLongOrNull() ?: 0L
+        val callId   = callerId       // peer-uid doubles as the local call key
+        Log.d(TAG, "Server: SessionReady for $callerId")
+
+        // Clear matching pending entry now that the call is up.
+        pendingMap.remove(callerId)?.let {
             pendingSnapshot = pendingMap.values.toList()
-            updateNotification()
-            showPendingNotification(callerId, callerName = resolvedName)
-        }
-    }
-
-    private suspend fun doAcceptPending(callId: Long, addToList: Boolean) {
-        val pending = pendingMap.remove(callId) ?: return
-        pendingSnapshot = pendingMap.values.toList()
-        // Re-check capacity at accept time. The caller might have been queued
-        // at the limit; in the time since, other slots may have filled up.
-        val maxClients = getMaxClients(getSharedPreferences("config", MODE_PRIVATE))
-        if (clients.size >= maxClients) {
-            Log.d(TAG, "Server: cannot accept pending $callId — at capacity ${clients.size}/$maxClients")
             cancelPendingNotificationIfEmpty()
-            updateNotification()
-            BaleConnection.client?.discardCall(callId)
-            return
         }
-        if (addToList && pending.callerId != 0L) AdmissionStore.add(pending.callerId)
-        cancelPendingNotificationIfEmpty()
-        updateNotification()
-        handleCall(callId, pending.entity)
-    }
+        pendingDecisions.remove(callerId)
 
-    private suspend fun doRejectPending(callId: Long, addToBlacklist: Boolean = false) {
-        val pending = pendingMap.remove(callId) ?: return
-        pendingSnapshot = pendingMap.values.toList()
-        cancelPendingNotificationIfEmpty()
-        updateNotification()
-        Log.d(TAG, "Server: rejecting call $callId callerId=${pending.callerId} block=$addToBlacklist")
-        BaleConnection.client?.discardCall(callId)
-        // Only the user's explicit Reject in the pending notification flows in
-        // here with addToBlacklist=true. Sweep timeout and bulk-WS-teardown
-        // paths leave the caller out of the blacklist — those aren't user
-        // rejections, just side effects.
-        if (addToBlacklist && pending.callerId != 0L) BlacklistStore.add(pending.callerId)
-    }
+        // Dedup: an old client for the same caller (e.g.
+        // reconnect before previous callEnded landed) — tear it
+        // down locally.
+        clients.values.firstOrNull { it.callerId == callerId }?.let { existing ->
+            Log.d(TAG, "Server: replacing existing client ${existing.callId} from callerId=$callerId")
+            cleanupClientLocal(existing.callId)
+        }
 
-    private suspend fun handleCall(callId: Long, incomingCall: CallEntity?) {
-        Log.d(TAG, "Server: handling call $callId hasEntity=${incomingCall != null}")
-        val ws = BaleConnection.client ?: return
+        scope.launch {
+            // Resolve caller name once — postClientEvent uses it
+            // for both connect AND disconnect labels.
+            val callerName: String? = BaleConnection.signaling?.fetchDisplayName(callerId.toString())
 
-        val accepted = ws.acceptCall(callId) ?: run { Log.w(TAG, "Server: acceptCall failed for $callId"); return }
-        val isLivekit = incomingCall?.isLivekit == true || accepted.isLivekit
-        Log.d(TAG, "Server: acceptCall done isLivekit=$isLivekit token.len=${accepted.token.length}")
-        if (!isLivekit || accepted.token.isEmpty()) { Log.w(TAG, "Server: no LK creds for $callId"); return }
+            val transport = LkTunnel()
+            val client    = Client(callId, callerId, transport, resolvedName = callerName)
 
-        val callerId = incomingCall?.callerId ?: 0L
-        // Dedup by callerId: if the same caller already has an active client
-        // (e.g., reconnected before we received the previous callEnded, or the
-        // LiveKit ParticipantDisconnected hasn't fired yet), tear the old one
-        // down. Local cleanup only — Bale's discardCall scopes at the
-        // caller↔callee session level and would kill the new call too.
-        if (callerId != 0L) {
-            val existing = clients.values.firstOrNull { it.callerId == callerId }
-            if (existing != null) {
-                Log.d(TAG, "Server: replacing existing client ${existing.callId} from callerId=$callerId (local cleanup only)")
-                cleanupClientLocal(existing.callId)
+            transport.onDisconnected = {
+                Log.d(TAG, "Server: client $callId disconnected")
+                val removed = clients.remove(callId)?.also { it.transport.disconnect() }
+                clientCount = clients.size
+                rebuildSnapshot()
+                updateNotification()
+                postClientEvent(callerId, "disconnected", removed?.resolvedName ?: callerName)
+            }
+
+            clients[callId] = client
+            clientCount = clients.size
+            rebuildSnapshot()
+            updateNotification()
+            postClientEvent(callerId, "connected", callerName)
+
+            try {
+                // Server-role tunnel — auto-warm of the client
+                // QUIC is suppressed inside the native core, so
+                // [startServer] claims the QUIC role uncontested.
+                transport.connectAsServer(ev.url, ev.token)
+                transport.startServer()
+            } catch (e: Exception) {
+                Log.w(TAG, "Server: transport.connect failed for $callId: ${e::class.simpleName}: ${e.message}")
+                try { transport.disconnect() } catch (_: Exception) {}
+                clients.remove(callId)
+                clientCount = clients.size
+                rebuildSnapshot()
+                updateNotification()
+                postClientEvent(callerId, "disconnected", callerName)
             }
         }
+    }
 
-        // Resolve caller name now so both connect AND disconnect events show
-        // the same label. loadUserName caches after first hit, so subsequent
-        // calls are effectively free.
-        val callerName: String? = if (callerId != 0L) {
-            try { ws.loadUserName(callerId.toInt()) } catch (_: Exception) { null }
-        } else null
+    private fun doAcceptPending(callId: Long, addToList: Boolean) {
+        // In the new model the `callId` notification arg is the
+        // callerId — they're 1:1.
+        val callerId = callId
+        val pending = pendingDecisions.remove(callerId) ?: return
+        pendingMap.remove(callerId)
+        pendingSnapshot = pendingMap.values.toList()
+        cancelPendingNotificationIfEmpty()
+        updateNotification()
+        // Capacity re-check at accept time.
+        val maxClients = getMaxClients(getSharedPreferences("config", MODE_PRIVATE))
+        val decision = if (clients.size >= maxClients) {
+            Log.d(TAG, "Server: cannot accept pending $callerId — at capacity")
+            CallDecision.SilentlyIgnore
+        } else {
+            if (addToList && callerId != 0L) AdmissionStore.add(callerId)
+            CallDecision.Accept
+        }
+        pending.deferred.complete(decision)
+    }
 
-        acceptAndStart(callId, callerId, callerName, accepted.url, accepted.token)
+    private fun doRejectPending(callId: Long, addToBlacklist: Boolean = false) {
+        val callerId = callId
+        val pending = pendingDecisions.remove(callerId) ?: return
+        pendingMap.remove(callerId)
+        pendingSnapshot = pendingMap.values.toList()
+        cancelPendingNotificationIfEmpty()
+        updateNotification()
+        Log.d(TAG, "Server: rejecting callerId=$callerId block=$addToBlacklist")
+        pending.deferred.complete(
+            if (addToBlacklist) CallDecision.Reject else CallDecision.SilentlyIgnore
+        )
+        if (addToBlacklist && callerId != 0L) BlacklistStore.add(callerId)
     }
 
     /** Builds the Client / transport / NAT-side tunnel for an accepted call.
@@ -385,7 +425,8 @@ class BaleServerService : Service() {
         // joined within Rust's PEER_WAIT_MS, etc.) we tear the call down
         // cleanly so we don't leak the tunnel or leave UI stale.
         try {
-            transport.connect(url, token)
+            // Server-role tunnel — see handleCall for the why.
+            transport.connectAsServer(url, token)
             // LK is up — pick server mode on the underlying tunnel so the
             // Rust shim wires the NAT dispatcher for this call.
             transport.startServer()
@@ -396,7 +437,9 @@ class BaleServerService : Service() {
             clientCount = clients.size
             rebuildSnapshot()
             updateNotification()
-            try { BaleConnection.client?.discardCall(callId) } catch (_: Exception) {}
+            // No explicit discardCall — closing the LkTunnel
+            // above already triggers Bale's callEnded for the
+            // peer; the trait doesn't surface discardCall.
             postClientEvent(callerId, "disconnected", callerName)
         }
     }
@@ -407,24 +450,39 @@ class BaleServerService : Service() {
         while (true) {
             delay(PENDING_CHECK_MS)
             val now    = System.currentTimeMillis()
-            val expired = pendingMap.values.filter { now - it.receivedAt > PENDING_TIMEOUT_MS }
+            // Iterate the in-flight decisions (the deferreds are
+            // the source of truth). Auto-complete with
+            // SilentlyIgnore for any that have been waiting past
+            // PENDING_TIMEOUT_MS — caller has likely given up.
+            val expired = pendingDecisions.values.filter { now - it.receivedAt > PENDING_TIMEOUT_MS }
             for (p in expired) {
-                Log.d(TAG, "Server: pending call ${p.callId} timed out — auto-rejecting")
-                doRejectPending(p.callId)
+                Log.d(TAG, "Server: pending callerId=${p.callerId} timed out — auto-rejecting")
+                pendingDecisions.remove(p.callerId)
+                pendingMap.remove(p.callerId)
+                p.deferred.complete(CallDecision.SilentlyIgnore)
+            }
+            if (expired.isNotEmpty()) {
+                pendingSnapshot = pendingMap.values.toList()
+                cancelPendingNotificationIfEmpty()
+                updateNotification()
             }
         }
     }
 
-    // Called when the WS reports that a call ended (peer hung up, network drop, etc.).
-    // Tear down the matching client or pending entry so we don't leak state until the
-    // 5-minute idle sweep or a LiveKit-side event finally fires.
-    private suspend fun onCallEndedRemote(callId: Long) {
+    /** Called when the signaling layer reports that a call
+     *  ended (peer hung up, network drop, late rejection). Tears
+     *  down the matching client or pending entry so we don't
+     *  leak state. */
+    private fun onCallEndedRemote(callId: Long) {
+        if (callId == 0L) return
         if (clients.containsKey(callId)) {
             Log.d(TAG, "Server: callEnded $callId — tearing down active client")
-            doDisconnect(callId)
+            scope.launch { doDisconnect(callId) }
         }
-        if (pendingMap.containsKey(callId)) {
+        // Pending entry — caller hung up before user decided.
+        pendingDecisions.remove(callId)?.let { p ->
             Log.d(TAG, "Server: callEnded $callId — dropping pending entry (caller hung up)")
+            p.deferred.complete(CallDecision.SilentlyIgnore)
             pendingMap.remove(callId)
             pendingSnapshot = pendingMap.values.toList()
             cancelPendingNotificationIfEmpty()
@@ -464,11 +522,11 @@ class BaleServerService : Service() {
     private suspend fun doDisconnect(callId: Long) {
         clients.remove(callId)?.also {
             Log.d(TAG, "Server: forcibly disconnecting $callId")
-            BaleConnection.client?.discardCall(callId)
-            // transport.disconnect() closes the LkTunnel handle, whose
-            // Drop tears down the NAT session AND the LK side in one
-            // shot. Order matters for the inverse case (cleanup-after-
-            // crash) but not here.
+            // Closing the LkTunnel signals participant-disconnect
+            // to the peer; Bale then fires callEnded, which the
+            // events collector picks up. We don't issue an
+            // explicit discardCall — the trait surface doesn't
+            // expose it and the LK-side teardown is enough.
             it.transport.disconnect()
             clientCount = clients.size
             rebuildSnapshot()
@@ -493,28 +551,30 @@ class BaleServerService : Service() {
 
     private fun stopServer() {
         Log.d(TAG, "BaleServerService: stopping")
+        // Flip server_active off immediately so the WS rule
+        // engine reverts to client semantics. Done up-front so
+        // any subsequent state changes (foreground/background,
+        // call_active resets) are evaluated under the right
+        // semantics.
+        BaleConnection.signaling?.setServerActive(false)
         isRunning       = false
         clientCount     = 0
         clientSnapshot  = emptyList()
         pendingSnapshot = emptyList()
         loopsStarted    = false
-        // Only clear the global callback registration if `this` is still the
-        // active instance — otherwise a concurrent onStartCommand for a successor
-        // service may have already installed its lambdas, and nulling them here
-        // would silently break the new service.
         if (instance === this) {
-            instance        = null
-            BaleConnection.onCallReceived = null
-            BaleConnection.onCallEnded    = null
+            instance = null
+            // No global callback to clear in the new model — the
+            // IncomingHandler installed on BaleSignaling stays
+            // tied to the dropped service instance. A successor
+            // onStartCommand will reinstall its own.
         }
-        // Notify all connected and pending clients that the call is ended so their VPNs stop.
-        val ws = BaleConnection.client
-        val allCallIds = clients.keys.toList() + pendingMap.keys.toList()
-        if (ws != null && allCallIds.isNotEmpty()) {
-            CoroutineScope(Dispatchers.IO).launch {
-                allCallIds.forEach { id -> try { ws.discardCall(id) } catch (_: Exception) {} }
-            }
-        }
+        // Complete all in-flight admission decisions as SilentlyIgnore
+        // so the signaling layer drops the calls. Closing LkTunnels
+        // signals participant-disconnect on accepted sessions; Bale
+        // fires the matching callEnded events to peer clients.
+        pendingDecisions.values.forEach { it.deferred.complete(CallDecision.SilentlyIgnore) }
+        pendingDecisions.clear()
         clients.values.forEach { it.transport.disconnect() }
         clients.clear()
         pendingMap.clear()
@@ -548,7 +608,7 @@ class BaleServerService : Service() {
         // The WS is the only way incoming-call updates reach the server. If it's
         // down, surface that — otherwise the body just shows the live state when
         // there's something interesting to report (clients connected or pending).
-        val wsAttached = BaleConnection.client != null
+        val wsAttached = BaleConnection.isConnectRequested || BaleConnection.isReady
         val wsReady    = BaleConnection.isReady
         val text = when {
             !wsAttached -> "WebSocket disconnected — no incoming calls"
@@ -610,7 +670,7 @@ class BaleServerService : Service() {
     private fun postClientEvent(callerId: Long, event: String, knownName: String? = null) {
         scope.launch {
             val name = knownName ?: if (callerId != 0L) {
-                try { BaleConnection.client?.loadUserName(callerId.toInt()) } catch (_: Exception) { null }
+                try { BaleConnection.signaling?.fetchDisplayName(callerId.toString()) } catch (_: Exception) { null }
             } else null
             val label = name?.takeIf { it.isNotBlank() }
                 ?: if (callerId != 0L) "ID $callerId" else "unknown caller"

@@ -1,7 +1,7 @@
 package ai.bale.proxy
 
-import ai.bale.proxy.bale.BaleAuthClient
-import ai.bale.proxy.net.AppHttp
+import ai.bale.proxy.bale.BaleAuth
+import ai.bale.proxy.bale.BaleAuthOutcome
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
@@ -28,9 +28,9 @@ class OtpActivity : BaseActivity() {
     private lateinit var btnVerify:  MaterialButton
     private lateinit var progress:   View
 
-    private val scope  = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val client = BaleAuthClient(AppHttp.client)
-    private val prefs  by lazy { getSharedPreferences("config", MODE_PRIVATE) }
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val auth  = BaleAuth()
+    private val prefs by lazy { getSharedPreferences("config", MODE_PRIVATE) }
 
     private lateinit var txHash:       String
     private var          isRegistered  = true
@@ -62,8 +62,13 @@ class OtpActivity : BaseActivity() {
         btnVerify.isEnabled = false; progress.visibility = View.VISIBLE
         scope.launch {
             try {
-                val authResp = if (isRegistered) {
-                    client.validateCode(txHash, code)
+                // Registered flow: a single submitOtp call returns
+                // Authenticated. Unregistered flow: submitOtp may
+                // return NeedsSignupName, in which case we call
+                // submitSignupName with the user's chosen display
+                // name.
+                val outcome: BaleAuthOutcome = if (isRegistered) {
+                    auth.submitOtp(txHash, code)
                 } else {
                     val name = etName.text.toString().trim()
                     if (name.isEmpty()) {
@@ -71,13 +76,21 @@ class OtpActivity : BaseActivity() {
                         btnVerify.isEnabled = true; progress.visibility = View.GONE
                         return@launch
                     }
-                    // ValidateCode first, then SignUp if needed
-                    val v = client.validateCode(txHash, code)
-                    if (v.jwt != null) v else client.signUp(txHash, name)
+                    when (val v = auth.submitOtp(txHash, code)) {
+                        is BaleAuthOutcome.Authenticated   -> v
+                        is BaleAuthOutcome.NeedsSignupName -> auth.submitSignupName(v.transactionHash, name)
+                        BaleAuthOutcome.Failed             -> v
+                    }
                 }
 
-                val token = authResp.jwt
-                    ?: throw Exception("No token in response")
+                val token = when (outcome) {
+                    is BaleAuthOutcome.Authenticated   -> outcome.accessToken
+                    // A registered phone that still resolves to
+                    // NeedsSignupName means the code was wrong/expired
+                    // (no JWT came back) — not an actual signup.
+                    is BaleAuthOutcome.NeedsSignupName -> throw Exception("Incorrect or expired code")
+                    BaleAuthOutcome.Failed             -> throw Exception("Sign-in failed")
+                }
 
                 prefs.edit(commit = true) { putString("token", token) }
                 // Bring the WS up here, not via the lifecycle observer — the observer's

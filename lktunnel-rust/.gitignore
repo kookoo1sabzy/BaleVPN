@@ -1,0 +1,15 @@
+# Vendored copies of webrtc-sys / libwebrtc / livekit / livekit-api are
+# regenerated from a pristine cargo-registry copy by
+# `patches/apply.sh`. Run that script once after cloning (or after a
+# version bump) — `cargo build` then picks them up via the
+# `[patch.crates-io]` block in Cargo.toml. The vendor/ tree itself is
+# never committed; the source of truth is `patches/*.patch`.
+vendor/
+
+# Cache of upstream crate tarballs downloaded by apply.sh when the
+# cargo registry isn't already populated. Keeps re-runs fast without
+# bloating the repo.
+patches/.cache/
+
+# Cargo build output.
+target/

@@ -5,7 +5,7 @@
 # `liblktunnel.so` artefact loaded by Kotlin — lives here.
 [workspace]
 resolver = "2"
-members = ["lktunnel-android"]
+members = ["lktunnel-android", "bale-signaling-android", "jni-shared"]
 
 [workspace.package]
 edition = "2021"

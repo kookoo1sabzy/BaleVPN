@@ -1,7 +1,8 @@
 package ai.bale.proxy
 
-import ai.bale.proxy.bale.BaleWsClient
-import ai.bale.proxy.tunnel.BaleClientSignaling
+import ai.bale.proxy.bale.BaleEvent
+import ai.bale.proxy.bale.EndReason
+import ai.bale.proxy.bale.PlaceCallResult
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,27 +12,36 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
-import android.system.Os
 import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
-import java.io.FileDescriptor
 
 private const val TAG = "BaleProxy"
 
 class BaleVpnService : VpnService() {
 
     private var tunFd:     ParcelFileDescriptor? = null
-    /** The signaling strategy that owns the call-setup leg (Bale RPC handshake
-     *  vs. direct URL+token). Resolved from intent extras in onStartCommand and
-     *  injected into [startVpn]; nulled by [stopVpn]. */
-    private var signaling: BaleClientSignaling?       = null
-    /** The LiveKit data-channel transport. Always present once startVpn has
-     *  begun setup, regardless of which BaleClientSignaling produced the room. */
+    /** Peer id we dialled — stored so reconnect logic and the
+     *  stats UI can correlate the live session to a contact. */
+    private var dialedPeerId: String? = null
+    /** The LiveKit data-channel transport. Present once
+     *  startVpn has begun setup. */
     private var transport: LkTunnel?            = null
+    /** Per-session subscriber on [BaleSignaling.events] for the
+     *  narrow CallEnded(Rejected) early-teardown path. Cancelled
+     *  in [stopVpn] so the next session's startVpn installs a
+     *  fresh collector against the correct `peerId`. */
+    private var eventsJob: Job?                  = null
     private var wakeLock:  PowerManager.WakeLock? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    /** Independent scope for teardown work. Kept outside [scope]
+     *  so `stopVpn()`'s internal `scope.cancelChildren()` can't
+     *  self-cancel the coroutine that called it. Currently
+     *  no-op (stopVpn is fully sync) but adding any suspend
+     *  call inside stopVpn would immediately turn the self-
+     *  cancel into a wedge — keep the scopes separate. */
+    private val teardownScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     @Volatile private var stopped = false
 
     companion object {
@@ -163,114 +173,145 @@ class BaleVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             Log.d(TAG, "VpnService: received STOP action (stopped=$stopped isRunning=$isRunning)")
-            stopVpn()
-            // Re-entrancy guard: stopVpn() returns early if `stopped` was
-            // already set by a prior call (e.g. startVpn's finally block,
-            // onPermanentDisconnect). When the user later presses the
-            // Disconnect button, the STOP intent must still tear the
-            // service down and clear the UI flags — otherwise the button
-            // appears to "do nothing" because the service is in a
-            // half-shut state. Force-clear flags and stopSelf() here
-            // unconditionally so the UI poll observes the off state and
-            // the system actually destroys the service.
+            // Update the UI-visible flags inline so a poll right
+            // after pressing Disconnect observes the off state
+            // immediately. The actual teardown (transport JNI
+            // disconnect + scope cancel) runs on a background
+            // dispatcher so Android's 30s onStartCommand budget
+            // isn't blocked by the LkTunnel `Drop` chain (which
+            // contends with the stats-poller JNI on the
+            // LkTunnel-instance @Synchronized lock). Without
+            // this we'd ANR — observed in the wild after the
+            // QUIC keeper started holding a strong Inner ref.
             isRunning = false
             isConnected = false
+            teardownScope.launch { stopVpn() }
             stopSelf()
             return START_NOT_STICKY
         }
 
-        val signaling = signalingFromIntent(intent) ?: run {
-            Log.d(TAG, "VpnService: no signaling available, aborting")
+        val peerId = peerIdFromIntent(intent) ?: run {
+            Log.d(TAG, "VpnService: no peer to dial, aborting")
             return START_NOT_STICKY
         }
+        dialedPeerId = peerId
 
         isRunning = true
         startForeground(NOTIF_ID, buildNotification())
         val pm = getSystemService(PowerManager::class.java)
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BaleProxy:VpnWakeLock").also { it.acquire() }
-        scope.launch { startVpn(signaling) }
+        scope.launch { startVpn(peerId) }
         return START_STICKY
     }
 
-    /** Build the Bale [BaleClientSignaling] strategy from intent extras / prefs.
-     *  Returns null if there's no peer to dial, which short-circuits the
-     *  service startup. */
-    private fun signalingFromIntent(intent: Intent?): BaleClientSignaling? {
-        val prefs    = getSharedPreferences("config", MODE_PRIVATE)
-        val peerId   = intent?.getIntExtra(EXTRA_PEER_ID, 0)?.takeIf { it != 0 }
-            ?: prefs.getString("peerId", "")?.toIntOrNull()
-            ?: return null
-        val peerType = intent?.getIntExtra(EXTRA_PEER_TYPE, 1)
-            ?: prefs.getString("peerType", "1")?.toIntOrNull() ?: 1
-        Log.d(TAG, "VpnService: injecting BaleClientSignaling peer=$peerId type=$peerType")
-        return BaleClientSignaling(
-            getBale       = ::resolveWs,
-            peerId        = peerId,
-            peerType      = peerType,
-            log           = { msg -> Log.d(TAG, msg) },
-            onTunnelReady = { BaleConnection.reconcile() },
-        )
+    /** Resolve the peer to dial from intent extras / prefs. The
+     *  peer is the Bale `uid` as a decimal string — matches the
+     *  shape `BaleSignaling.placeCall` consumes. */
+    private fun peerIdFromIntent(intent: Intent?): String? {
+        val prefs = getSharedPreferences("config", MODE_PRIVATE)
+        val fromIntent = intent?.getIntExtra(EXTRA_PEER_ID, 0)?.takeIf { it != 0 }
+        val fromPrefs  = prefs.getString("peerId", "")?.toIntOrNull()
+        return (fromIntent ?: fromPrefs)?.toString()
     }
 
-    // Lazy WS resolver — brings the BaleConnection back up if the lifecycle
-    // observer has torn it down (e.g., app was backgrounded). Used by
-    // BaleClientSignaling; not relevant for DirectSignaling.
-    //
-    // Bypasses reconcile because reconcile's rule says "client mode + VPN
-    // running → WS down", which is exactly the state we're in. We need WS
-    // briefly for signaling, then onTunnelReady → reconcile drops it again.
-    private suspend fun resolveWs(): BaleWsClient? {
-        if (BaleConnection.client == null) {
-            val token = getSharedPreferences("config", MODE_PRIVATE).getString("token", "").orEmpty()
-            if (token.isEmpty()) { Log.e(TAG, "VPN: no saved token"); return null }
-            BaleConnection.userInitiatedDisconnect = false
-            BaleConnection.connect(token)
+    /** Ensure the WS is up before placing a call. We need it briefly
+     *  for `place_call`; once the LK side is up the Rust rule engine's
+     *  call_active gate (auto-flipped by the global LK observer) pauses
+     *  the WS again. */
+    private suspend fun ensureWsUp(): Boolean {
+        val sig = BaleConnection.signaling ?: run {
+            Log.e(TAG, "VPN: BaleSignaling not initialised")
+            return false
         }
-        return BaleConnection.client
+        val token = getSharedPreferences("config", MODE_PRIVATE)
+            .getString("token", "").orEmpty()
+        if (token.isEmpty()) { Log.e(TAG, "VPN: no saved token"); return false }
+        // sig.connect() clears user_disconnect and installs the token;
+        // the Rust rule engine evaluates and brings the WS up.
+        if (!sig.isConnected) sig.connect()
+        // Wait up to 10s for the WS handshake to complete.
+        var retries = 0
+        while (!sig.isConnected && retries++ < 20) delay(500)
+        return sig.isConnected
     }
 
-    /** VPN bring-up. The injected [signaling] handles the call-setup leg
-     *  (Bale RPC handshake); everything from the native session id and TUN
-     *  forward is identical regardless of how the call was established. */
-    private suspend fun startVpn(signaling: BaleClientSignaling) {
-        this.signaling = signaling
+    /** VPN bring-up. Places the call via `signaling.placeCall(peerId)`,
+     *  hands the resulting LK creds to the transport, and parks until
+     *  cancelled. The permanent-disconnect surface is `LkTunnel`'s
+     *  own `onDisconnected` callback — WS-side terminal pushes are
+     *  intentionally ignored so transient WS errors can't drop the
+     *  live call. */
+    private suspend fun startVpn(peerId: String) {
         try {
-            Log.d(TAG, "VPN: starting (${signaling::class.simpleName})")
+            Log.d(TAG, "VPN: starting dial → $peerId")
 
-            // Pre-flight the WS so a stuck handshake aborts silently instead of
-            // tripping the permanent-disconnect alert from signaling.connect.
-            // The user already sees the WS status indicator in the UI.
-            val ws = resolveWs() ?: return
-            if (!ws.ready) {
-                var retries = 0
-                while (!ws.ready && retries++ < 20) delay(500)
-                if (!ws.ready) { Log.e(TAG, "VPN: WS not ready after 10s"); return }
+            val sig = BaleConnection.signaling ?: run {
+                Log.e(TAG, "VPN: BaleSignaling not initialised"); return
+            }
+            // No setMode push — the rule engine's server-vs-client
+            // semantics are driven by `server_active`, which is
+            // false here (we're starting the client VPN, not the
+            // server service). Default is client semantics.
+
+            // Pre-flight the WS so a stuck handshake aborts
+            // silently instead of stalling the dial.
+            if (!ensureWsUp()) {
+                Log.e(TAG, "VPN: WS not ready after 10s")
+                return
             }
             Log.d(TAG, "VPN: WS ready")
 
             val transport = LkTunnel()
             this.transport = transport
 
-            signaling.onPermanentDisconnect = { rejected ->
-                Log.d(TAG, "VPN: permanent disconnect — stopping service (rejected=$rejected)")
-                // High-importance notification (audible) — the user may have
-                // backgrounded the app. Tap routes back to MainActivity so they
-                // can reconnect.
-                val title = if (rejected) "Bale VPN — rejected"
-                            else          "Bale VPN — disconnected"
-                val text  = if (rejected) "The server rejected the connection."
-                            else          "Could not reach the server. Tap to reconnect."
-                showAlert(title, text)
-                scope.launch { stopVpn() }
+            // LK room-close hook — fires when the server peer
+            // leaves the room (LkTunnel detects the empty room
+            // and emits "disconnected"). Without this, the only
+            // teardown signal is Bale's CallEnded over the WS,
+            // which arrives 30s+ late (server-side push pipeline
+            // is slow / racy under cardinality-violation
+            // re-subscribes). The LK side knows immediately, so
+            // hook directly to flip the UI without waiting.
+            transport.onDisconnected = {
+                Log.d(TAG, "VPN: LkTunnel disconnected — server left room")
+                onPermanentDisconnect(rejected = false)
             }
 
-            // Dial the call BEFORE touching TUN — if we establish TUN first,
-            // apps route into a half-up VPN whose tunnel isn't ready yet,
-            // packets queue, TCP SYNs time out. The signaling impl already
-            // fired onPermanentDisconnect on failure, so we just return.
-            if (!signaling.connect(transport)) {
-                Log.e(TAG, "VPN: signaling.connect returned false"); return
+            // WS-event listener for any CallEnded targeting our
+            // peer. Server-side reject pushes CallEnded with
+            // discard_reason — we don't have a confirmed mapping
+            // to EndReason.Rejected yet (map_discard_reason in
+            // Rust returns Other(code) for everything), so we
+            // can't filter by reason. The peer-match guard alone
+            // is enough: a CallEnded for the specific peer we
+            // dialled is the server's authoritative "this call
+            // is over" signal. Reason is used only for UI
+            // labelling.
+            eventsJob = scope.launch {
+                sig.events.collect { ev ->
+                    if (ev is BaleEvent.CallEnded && ev.peerId == peerId) {
+                        val rejected = ev.reason == EndReason.Rejected
+                        Log.d(TAG, "VPN: WS callEnded for our peer (reason=${ev.reason}) — tearing down")
+                        onPermanentDisconnect(rejected = rejected)
+                    }
+                }
             }
+
+            // Dial the call BEFORE touching TUN — if TUN comes up
+            // first, apps route into a half-up VPN whose tunnel
+            // isn't ready yet and TCP SYNs time out.
+            val placed = sig.placeCall(peerId)
+            val (lkUrl, lkToken) = when (placed) {
+                is PlaceCallResult.Ok -> placed.url to placed.token
+                PlaceCallResult.Rejected -> {
+                    Log.w(TAG, "VPN: placeCall rejected"); onPermanentDisconnect(rejected = true); return
+                }
+                PlaceCallResult.NoPeer, PlaceCallResult.NotAuthenticated, PlaceCallResult.Transport -> {
+                    Log.w(TAG, "VPN: placeCall failed: $placed"); onPermanentDisconnect(rejected = false); return
+                }
+            }
+
+            transport.connect(lkUrl, lkToken)
             isConnected = true
 
             // ── VPN / SOCKS5 mode selection ─────────────────────────────
@@ -297,10 +338,14 @@ class BaleVpnService : VpnService() {
             // don't need an explicit ensureQuicClient call here.
             // First toggle of SOCKS5 will hit the already-up QUIC.
 
-            // Auto-enable SOCKS5 if the user toggled it on. Direct call
-            // — same code path as the runtime companion `enableSocks5`
-            // (we hold a strong ref to `transport` here).
+            // Auto-enable SOCKS5 if the user toggled it on. The
+            // QUIC handshake to the peer's acceptor may race the
+            // peer's `start_server` call; Rust's `ensure_quic_client`
+            // retries with backoff for up to 30s so this call
+            // succeeds even when the server side comes up slightly
+            // after we do.
             if (socks5Enabled) {
+                Log.d(TAG, "VPN: enabling SOCKS5 on port $socks5PortPref")
                 val bound = transport.enableSocks5Server(socks5PortPref)
                 if (bound != 0) {
                     socks5Port = bound
@@ -425,6 +470,29 @@ class BaleVpnService : VpnService() {
         }
     }
 
+    /** Single point that the events-collect coroutine + each
+     *  `placeCall` failure path call into. Posts the alert and
+     *  bounces the VPN. Mirrors the pre-migration
+     *  `signaling.onPermanentDisconnect` lambda. */
+    private fun onPermanentDisconnect(rejected: Boolean) {
+        Log.d(TAG, "VPN: permanent disconnect — stopping service (rejected=$rejected)")
+        val title = if (rejected) "Bale VPN — rejected"
+                    else          "Bale VPN — disconnected"
+        val text  = if (rejected) "The server rejected the connection."
+                    else          "Could not reach the server. Tap to reconnect."
+        showAlert(title, text)
+        // Flip the UI-visible flags inline (same pattern as the
+        // ACTION_STOP handler). Without this, MainActivity's 500ms
+        // tick keeps seeing isRunning=true until the queued
+        // stopVpn coroutine actually lands — which can be delayed
+        // by dispatcher contention or an in-flight LkTunnel Drop,
+        // and the user perceives the disconnect as "stuck" until
+        // they manually press Disconnect.
+        isRunning = false
+        isConnected = false
+        teardownScope.launch { stopVpn() }
+    }
+
     @Synchronized
     private fun stopVpn() {
         // Idempotent: stopVpn is called from at least three places that can
@@ -444,17 +512,24 @@ class BaleVpnService : VpnService() {
         // shot (closes the TUN fd, aborts the per-tunnel task, fires
         // Room::close). The local tunFd is only non-null in the
         // window before detachFd transferred ownership.
-        signaling?.stop();      signaling = null
+        dialedPeerId = null
+        eventsJob?.cancel(); eventsJob = null
         transport?.disconnect(); transport = null
         liveTransport = null
         tunFd?.close(); tunFd = null
+        // SOCKS5 listener was aborted by transport.disconnect
+        // (via the native socks5_handle drop). Reset the UI-
+        // visible port flag so MainActivity.tick renders
+        // "stopped" immediately instead of waiting for a poll
+        // path to clear it.
+        socks5Port = 0
         scope.coroutineContext.cancelChildren()
         // SOCKS5-over-QUIC is torn down by LkTunnel::disconnect() above
         // (the native side aborts the listener task + drops the QUIC
-        // client). No extra Kotlin-side stop needed.
-        // VPN no longer running; let reconcile re-apply the foreground rule
-        // (so the WS comes back up if the user is still in the app).
-        BaleConnection.reconcile()
+        // client). No extra Kotlin-side stop needed. The WS auto-restores
+        // when the LK tunnel emits Disconnected (Rust global LK observer
+        // flips call_active back to false → rule engine re-spawns the
+        // run loop).
         stopSelf()
     }
 
@@ -463,91 +538,10 @@ class BaleVpnService : VpnService() {
         Log.d(TAG, "VpnService: onDestroy")
         stopVpn()
         scope.cancel()
+        teardownScope.cancel()
         instance = null
         super.onDestroy()
     }
-
-    // ── IPv6 rejection ────────────────────────────────────────────────────────────
-    // Send ICMPv6 Destination Unreachable (no route) so apps fail fast and use IPv4.
-
-    private fun rejectIpv6(pkt: ByteArray, len: Int, tunFd: FileDescriptor) {
-        if (len < 40) return
-        // Never reply to an ICMPv6 error (types 0–127) to avoid error loops.
-        val nextHdr = pkt[6].toInt() and 0xFF
-        if (nextHdr == 58 && len > 40 && (pkt[40].toInt() and 0xFF) < 128) return
-        val srcIp      = ipv6Str(pkt, 8)
-        val dstIp      = ipv6Str(pkt, 24)
-        val excerptLen = minOf(len, 1232)
-        val icmpLen    = 8 + excerptLen
-        val icmp       = ByteArray(icmpLen)
-        icmp[0] = 1   // type: Destination Unreachable
-        icmp[1] = 0   // code: no route to destination
-        pkt.copyInto(icmp, 8, 0, excerptLen)
-        val pseudo = pseudoV6(dstIp, srcIp, 58, icmpLen)
-        putU16(icmp, 2, checksum(pseudo + icmp))
-        val reply = ipv6Header(dstIp, srcIp, 58, icmpLen) + icmp
-        try { Os.write(tunFd, reply, 0, reply.size) } catch (_: Exception) {}
-    }
-
-    private fun ipv6Header(src: String, dst: String, nextHdr: Int, payLen: Int): ByteArray {
-        val hdr = ByteArray(40)
-        hdr[0] = 0x60.toByte()
-        putU16(hdr, 4, payLen)
-        hdr[6] = nextHdr.toByte()
-        hdr[7] = 64
-        putIpv6(hdr, 8, src)
-        putIpv6(hdr, 24, dst)
-        return hdr
-    }
-
-    private fun pseudoV6(src: String, dst: String, proto: Int, len: Int): ByteArray {
-        val p = ByteArray(40)
-        putIpv6(p, 0, src); putIpv6(p, 16, dst)
-        putU32(p, 32, len); p[39] = proto.toByte()
-        return p
-    }
-
-    private fun checksum(data: ByteArray): Int {
-        var sum = 0
-        for (i in 0 until data.size - 1 step 2)
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
-        if (data.size % 2 != 0) sum += (data.last().toInt() and 0xFF) shl 8
-        while (sum shr 16 != 0) sum = (sum and 0xFFFF) + (sum shr 16)
-        return sum.inv() and 0xFFFF
-    }
-
-    private fun ipv6Str(buf: ByteArray, off: Int): String {
-        val g = (0 until 16 step 2).map { i ->
-            ((buf[off + i].toInt() and 0xFF) shl 8) or (buf[off + i + 1].toInt() and 0xFF)
-        }
-        var bestStart = -1; var bestLen = 0; var curStart = -1; var curLen = 0
-        for (i in g.indices) {
-            if (g[i] == 0) { if (curStart < 0) { curStart = i; curLen = 0 }; curLen++
-                if (curLen > bestLen) { bestLen = curLen; bestStart = curStart }
-            } else { curStart = -1; curLen = 0 }
-        }
-        if (bestLen < 2) return g.joinToString(":") { it.toString(16) }
-        val left  = g.subList(0, bestStart).joinToString(":") { it.toString(16) }
-        val right = g.subList(bestStart + bestLen, 8).joinToString(":") { it.toString(16) }
-        return when { left.isEmpty() && right.isEmpty() -> "::"; left.isEmpty() -> "::$right"; right.isEmpty() -> "$left::"; else -> "$left::$right" }
-    }
-
-    private fun putIpv6(buf: ByteArray, off: Int, ip: String) {
-        if (ip == "::") return
-        val groups: List<String> = if ("::" in ip) {
-            val (l, r) = ip.split("::", limit = 2)
-            val lg = if (l.isEmpty()) emptyList() else l.split(":")
-            val rg = if (r.isEmpty()) emptyList() else r.split(":")
-            lg + List(8 - lg.size - rg.size) { "0" } + rg
-        } else ip.split(":")
-        groups.forEachIndexed { i, g ->
-            val v = g.ifEmpty { "0" }.toInt(16)
-            buf[off + i * 2] = (v shr 8).toByte(); buf[off + i * 2 + 1] = v.toByte()
-        }
-    }
-
-    private fun putU16(buf: ByteArray, off: Int, v: Int) { buf[off] = (v shr 8).toByte(); buf[off + 1] = v.toByte() }
-    private fun putU32(buf: ByteArray, off: Int, v: Int) { putU16(buf, off, v shr 16); putU16(buf, off + 2, v) }
 
     // ── Notification ──────────────────────────────────────────────────────────────
 

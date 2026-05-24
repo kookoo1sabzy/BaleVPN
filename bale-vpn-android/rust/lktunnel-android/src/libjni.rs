@@ -24,10 +24,6 @@ const TAG: &str = "lktunnel";
 //      tokio-runtime callback that wants to touch JNI (hardware
 //      codec / AAudio path init). The Android JVM-context lives in
 //      webrtc-sys globals after this call.
-/// JavaVM handle stashed during `JNI_OnLoad` so off-thread Rust code
-/// (the error-queue drainer, future callbacks) can attach back to
-/// the JVM without re-discovering the VM each call.
-static JVM: OnceCell<JavaVM> = OnceCell::new();
 /// GlobalRef to `ai.bale.proxy.NativeJni`. Bound in `JNI_OnLoad`,
 /// never cleared (process-lifetime). The error-drain JNI fn looks
 /// `onNativeError` up by name on each batch — cheap, since the path
@@ -63,7 +59,10 @@ pub extern "C" fn JNI_OnLoad(vm: JavaVM, _: *mut c_void) -> jint {
             }
         }
     }
-    let _ = JVM.set(vm);
+    // Stash the JavaVM in the shared cache so the off-thread Rust
+    // code (error queue drainer, callback dispatchers) can attach
+    // back to the JVM without re-discovering it.
+    jni_shared::set_vm(vm);
     JNI_VERSION_1_6 as jint
 }
 
@@ -144,10 +143,7 @@ unsafe impl Sync for ObserverDispatch {}
 
 impl ObserverDispatch {
     fn fire_on_event(&self, ev: &lktunnel::Event) {
-        let vm = match JVM.get() {
-            Some(vm) => vm,
-            None => return,
-        };
+        let vm = jni_shared::vm();
         let mut env = match vm.attach_current_thread_as_daemon() {
             Ok(e) => e,
             Err(_) => return,
@@ -186,29 +182,30 @@ impl ObserverDispatch {
     }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeConnect<'l>(
-    mut env: JNIEnv<'l>,
-    _cls: JClass<'l>,
-    url:      JString<'l>,
-    token:    JString<'l>,
-    observer: JObject<'l>,
+/// Shared body for both `nativeConnect` and `nativeConnectServer`.
+/// Marshals JNI args, builds the ObserverDispatch, then dials via
+/// the role-appropriate `LkTunnel` constructor. Returns the
+/// registry handle or 0 on marshaling failure.
+fn connect_impl<'l>(
+    env: &mut JNIEnv<'l>,
+    url: JString<'l>, token: JString<'l>, observer: JObject<'l>,
+    server_role: bool,
 ) -> jlong {
     let url:   String = env.get_string(&url).map(|s| s.into()).unwrap_or_default();
     let token: String = env.get_string(&token).map(|s| s.into()).unwrap_or_default();
 
     let observer_cls = match env.get_object_class(&observer) {
         Ok(c) => c,
-        Err(e) => { log::warn!("nativeConnect: get_object_class failed: {e}"); return 0; }
+        Err(e) => { log::warn!("connect_impl: get_object_class failed: {e}"); return 0; }
     };
     let on_event_mid = match env.get_method_id(&observer_cls, "onEvent",
         "(Ljava/lang/String;Ljava/lang/String;)V") {
         Ok(m) => m,
-        Err(e) => { log::warn!("nativeConnect: onEvent method id: {e}"); return 0; }
+        Err(e) => { log::warn!("connect_impl: onEvent method id: {e}"); return 0; }
     };
     let obs_global = match env.new_global_ref(&observer) {
         Ok(g) => g,
-        Err(e) => { log::warn!("nativeConnect: NewGlobalRef failed: {e}"); return 0; }
+        Err(e) => { log::warn!("connect_impl: NewGlobalRef failed: {e}"); return 0; }
     };
 
     let dispatch = std::sync::Arc::new(ObserverDispatch {
@@ -219,29 +216,63 @@ pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeConnect<'l>(
     let d_ev = std::sync::Arc::clone(&dispatch);
     let on_event = move |ev: lktunnel::Event| { d_ev.fire_on_event(&ev); };
 
-    // `LkTunnel::connect` is non-blocking — it returns the handle as
-    // soon as it's spawned the connect work. Kotlin waits on the
-    // observer's "connected" event (or "error" / "disconnected") to
-    // know when the room is fully joined.
-    let lk = lktunnel::LkTunnel::connect(url, token, on_event);
-    Box::into_raw(Box::new(lk)) as jlong
+    // Both constructors are non-blocking — the handle is usable as
+    // soon as the connect work is spawned. Kotlin waits on the
+    // observer's "connected" event to know when the room is up.
+    let lk = if server_role {
+        lktunnel::LkTunnel::connect_server(url, token, on_event)
+    } else {
+        lktunnel::LkTunnel::connect(url, token, on_event)
+    };
+    REG.insert_value(lk) as jlong
 }
 
+#[no_mangle]
+pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeConnect<'l>(
+    mut env: JNIEnv<'l>,
+    _cls: JClass<'l>,
+    url:      JString<'l>,
+    token:    JString<'l>,
+    observer: JObject<'l>,
+) -> jlong {
+    connect_impl(&mut env, url, token, observer, false)
+}
+
+/// Parallel to `nativeConnect` but constructs the tunnel in
+/// server role — the client-QUIC auto-warm is suppressed so the
+/// caller's later `nativeStartServer` claims the QUIC role
+/// uncontested.
+#[no_mangle]
+pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeConnectServer<'l>(
+    mut env: JNIEnv<'l>,
+    _cls: JClass<'l>,
+    url:      JString<'l>,
+    token:    JString<'l>,
+    observer: JObject<'l>,
+) -> jlong {
+    connect_impl(&mut env, url, token, observer, true)
+}
+
+/// Process-wide handle registry — `jlong` Kotlin handles map to
+/// `Arc<LkTunnel>`. The shared [`jni_shared::HandleRegistry`]
+/// gives the same per-call Arc-clone semantics + atomic
+/// remove_and_take that the bale-signaling shim uses; concurrent
+/// JNI calls are safe even if `nativeDisconnect` runs in
+/// parallel, which is why the Kotlin side doesn't need
+/// `@Synchronized` on each native call.
+static REG: jni_shared::RegistryHandle<lktunnel::LkTunnel> =
+    jni_shared::once_cell::sync::Lazy::new(jni_shared::HandleRegistry::new);
+
 /// Borrow the `LkTunnel` behind a JNI handle for the duration of a
-/// closure. Returns `None` for a zero handle. The closure-bounded
-/// shape prevents the borrow from escaping the JNI fn — important
-/// because the only thing keeping the pointer valid is Kotlin's
-/// per-instance lock around `nativeDisconnect`.
+/// closure. Returns `None` for a zero or removed handle. The
+/// closure receives a real `Arc<LkTunnel>` clone so the
+/// underlying Inner stays alive even if `nativeDisconnect` runs
+/// concurrently from another thread.
 fn with_tunnel<F, R>(handle: jlong, f: F) -> Option<R>
 where F: FnOnce(&lktunnel::LkTunnel) -> R
 {
-    if handle == 0 { return None; }
-    // SAFETY: caller (Kotlin) holds its per-instance monitor while
-    // dispatching this JNI call, and `nativeDisconnect` takes the
-    // same monitor before `Box::from_raw`. So while we're inside
-    // this function the heap allocation is stable.
-    let t = unsafe { &*(handle as *const lktunnel::LkTunnel) };
-    Some(f(t))
+    let arc = REG.lookup(handle as u64)?;
+    Some(f(&arc))
 }
 
 #[no_mangle]
@@ -387,13 +418,14 @@ pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeDisconnect<'l>(
     _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong,
 ) {
     if handle == 0 { return; }
-    // Explicit `disconnect()` first — aborts the per-tunnel tasks and
-    // posts the NAT/TUN drop. Then drop the Box, releasing the last
-    // strong handle. Closures inside NAT/TUN hold only `Weak`
-    // references to Inner, so they don't pin it past this point.
-    unsafe {
-        let lk = Box::from_raw(handle as *mut lktunnel::LkTunnel);
-        lk.disconnect();
-        // `lk` drops here.
+    // Atomically pop the entry out of the registry and call
+    // disconnect on the taken Arc. Single Mutex acquisition →
+    // no concurrent `with_tunnel` can observe a handle that's
+    // about to be removed. In-flight JNI calls that already
+    // cloned the Arc keep their reference; Inner drops once
+    // they release. The keeper task holds a Weak and exits on
+    // the next upgrade-fail tick.
+    if let Some(arc) = REG.remove_and_take(handle as u64) {
+        arc.disconnect();
     }
 }

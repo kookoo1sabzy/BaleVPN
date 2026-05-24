@@ -490,9 +490,15 @@ pub struct QuicClient {
 /// Spawned by [`crate::LkTunnel::ensure_quic_client`] on first
 /// successful connect.
 pub(crate) async fn keeper_task(
-    weak:   std::sync::Weak<crate::TunnelInner>,
-    tunnel: crate::LkTunnel,
+    weak: std::sync::Weak<crate::TunnelInner>,
 ) {
+    // Weak-only — must NOT hold a strong `LkTunnel` across
+    // awaits or the explicit `disconnect()` path can't drop
+    // `Inner` (the keeper's strong ref would keep it alive
+    // until the keeper's next iteration, contending with the
+    // stats poller on the LkTunnel-instance @Synchronized lock
+    // on the Kotlin side and causing the Service onStartCommand
+    // path to ANR).
     use std::time::Duration;
     loop {
         // Get the current connection's `closed()` future. The
@@ -500,17 +506,15 @@ pub(crate) async fn keeper_task(
         // connection enters Closed / Drained.
         let conn = {
             let Some(inner) = weak.upgrade() else { return };
-            // Clone the Option<Arc<…>> out of the mutex first, then
-            // drop the lock guard, then extract `connection`. Doing
-            // `lock().as_ref().map(…)` would borrow across the
-            // close-of-block and the compiler can't prove the temp
-            // outlives the lock.
             let client = inner.quic_client.lock().clone();
             client.map(|c| c.connection.clone())
         };
         let Some(conn) = conn else { return };
 
         let reason = conn.closed().await;
+        // Drop the connection clone before any further work so
+        // `quic_client.take()` is the last strong ref.
+        drop(conn);
         log::warn!("quic: connection closed ({reason}) — reconnecting");
 
         // Drop the stale client / channel so connect_quic_to_peer
@@ -527,8 +531,17 @@ pub(crate) async fn keeper_task(
         // clears.
         let mut backoff = Duration::from_millis(500);
         loop {
-            if weak.upgrade().is_none() { return; }
-            match tunnel.connect_quic_to_peer().await {
+            // Upgrade-then-construct an LkTunnel for the
+            // duration of the connect call. The upgrade pins
+            // the inner for that call only; the strong ref is
+            // dropped before the next sleep so an explicit
+            // disconnect can free Inner immediately.
+            let Some(inner) = weak.upgrade() else { return };
+            let tunnel = crate::LkTunnel { inner };
+            let connect_result = tunnel.connect_quic_to_peer().await;
+            drop(tunnel);
+
+            match connect_result {
                 Ok(client) => {
                     let Some(inner) = weak.upgrade() else { return };
                     *inner.quic_client.lock() = Some(std::sync::Arc::new(client));
@@ -537,8 +550,6 @@ pub(crate) async fn keeper_task(
                 }
                 Err(e) => {
                     log::warn!("quic: reconnect failed: {e} — retry in {backoff:?}");
-                    // Clear the partial state so the next attempt
-                    // can install its own quic_rx_tx slot.
                     if let Some(inner) = weak.upgrade() {
                         *inner.quic_rx_tx.lock() = None;
                     }

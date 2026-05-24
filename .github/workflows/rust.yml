@@ -65,8 +65,11 @@ jobs:
             ~/.cargo/bin
             lktunnel-rust/patches/.cache
             lktunnel-rust/target
-            bale-vpn-node/rust/target
-          key: rust-test-${{ runner.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'bale-vpn-node/rust/lktunnel-node/Cargo.toml', 'lktunnel-rust/patches/*.patch') }}
+            lk-signaling-rust/target
+            bale-signaling-rust/target
+            bale-vpn-rust/target
+            bale-vpn-android/rust/target
+          key: rust-test-${{ runner.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'lktunnel-rust/patches/*.patch', 'lk-signaling-rust/Cargo.toml', 'bale-signaling-rust/Cargo.toml', 'bale-vpn-rust/Cargo.toml') }}
           restore-keys: |
             rust-test-${{ runner.os }}-
 
@@ -74,11 +77,11 @@ jobs:
         working-directory: lktunnel-rust
         run: ./patches/apply.sh
 
-      # Core workspace — what every consumer (CLI, Android shim, Node
-      # binding) ultimately links against. Test runs first because
-      # it's the only step that actually catches behaviour
-      # regressions; `cargo build` would still succeed on a broken
-      # unit test.
+      # Core workspace — what every consumer (CLI, Android
+      # shim, bale-vpn-rust binary) ultimately links against.
+      # Test runs first because it's the only step that catches
+      # behaviour regressions; `cargo build` would still succeed
+      # on a broken unit test.
       - name: cargo test --workspace
         working-directory: lktunnel-rust
         run: cargo test --workspace --release
@@ -96,10 +99,35 @@ jobs:
         # for visibility, don't gate the build on it.
         run: cargo clippy --workspace --release --no-deps
 
-      # The Node-side workspace pulls in the same lktunnel crate as
-      # a path dep plus the napi-rs binding. Building it confirms the
-      # FFI surface (#[napi] macro expansion, cdylib link) is healthy
-      # before the node-binaries workflow tries to ship a release.
-      - name: cargo build (node binding workspace)
-        working-directory: bale-vpn-node/rust
+      # bale-vpn-rust — the single Rust binary replacing the
+      # deleted Node app. Builds for host, exercises the HTTP
+      # UI + axum routes + signaling wiring at compile time.
+      - name: cargo build (bale-vpn-rust)
+        working-directory: bale-vpn-rust
         run: cargo build --workspace --release
+
+      # ── Signaling stack ──────────────────────────────────────
+      #
+      # `lk-signaling-rust/` is the generic trait crate; cheap
+      # pure-Rust (async-trait + tokio). `bale-signaling-rust/`
+      # is the Bale impl on top — also pure Rust (reqwest /
+      # tokio-tungstenite / rustls). Both ship their own unit
+      # tests (~100 in total covering proto codec, gRPC-web,
+      # WS framing, RPC pending machinery, contact parsing,
+      # trait dispatch). Fast — finishes in under 30s per OS.
+
+      - name: cargo test (lk-signaling)
+        working-directory: lk-signaling-rust
+        run: cargo test --workspace --release
+
+      - name: cargo test (bale-signaling)
+        working-directory: bale-signaling-rust
+        run: cargo test --workspace --release
+
+      # The Android JNI shim depends on bale-signaling + jni;
+      # confirms the FFI shape compiles for the host target.
+      # The full Android build (cargo-ndk → arm64) is exercised
+      # by android.yml when a release tag is pushed.
+      - name: cargo build (android jni shim)
+        working-directory: bale-vpn-android/rust
+        run: cargo build -p bale-signaling-android --release

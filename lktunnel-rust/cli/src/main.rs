@@ -48,6 +48,7 @@ fn main() {
         lktunnel::nat::set_debug(true);
     }
 
+    #[cfg(unix)]
     raise_nofile_limit();
 
     lktunnel::dispatcher::init();
@@ -118,6 +119,10 @@ async fn run_nat_server(url: String, token: String) {
 /// We don't try to raise the *hard* limit (that needs root on macOS
 /// — `launchctl limit maxfiles`). Just raising the soft limit to the
 /// existing hard limit usually buys 5-10× more headroom.
+///
+/// Unix-only — Windows has no `rlimit` concept; its fd table is
+/// effectively unbounded for our purposes.
+#[cfg(unix)]
 fn raise_nofile_limit() {
     unsafe {
         let mut rl: libc::rlimit = std::mem::zeroed();

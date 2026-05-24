@@ -53,18 +53,40 @@ RSYNC_FLAGS = -rltzv --delete -e "$(SSH_CMD)" \
     --exclude='*.swp' \
     --exclude='*.swo'
 
-.PHONY: sync sync-dry help
+.PHONY: sync sync-dry help build build-headless apply-patches
 
 help:
-	@echo "Targets:"
-	@echo "  sync REMOTE=user@host:/path [SSH_KEY=~/.ssh/id_ed25519]"
+	@echo "Build targets (run from anywhere):"
+	@echo "  make build              — apply patches if needed, then build the GUI binary"
+	@echo "  make build-headless     — same, with --no-default-features (no tao/wry)"
+	@echo "  make apply-patches      — just regenerate vendor/ from patched crates"
+	@echo ""
+	@echo "Sync targets:"
+	@echo "  make sync REMOTE=user@host:/path [SSH_KEY=~/.ssh/id_ed25519]"
 	@echo "      rsync to remote (deletes extras on the far side)"
-	@echo "  sync-dry REMOTE=user@host:/path [SSH_KEY=…]"
+	@echo "  make sync-dry REMOTE=user@host:/path [SSH_KEY=…]"
 	@echo "      dry-run, show what would change"
 	@echo ""
-	@echo "Generated artefacts (vendor/, target/, node_modules/, build/) are"
-	@echo "excluded — the remote regenerates them via patches/apply.sh +"
-	@echo "cargo build + npm install."
+	@echo "Generated artefacts (vendor/, target/, build/) are excluded from"
+	@echo "sync — the remote regenerates them via apply-patches + cargo build."
+
+# Re-emit lktunnel-rust/vendor/ from the registry + patches. Idempotent.
+# Cheap to re-run; `apply.sh` blows away vendor/ before applying.
+apply-patches:
+	cd lktunnel-rust && ./patches/apply.sh
+
+# `vendor/` is gitignored, so a fresh checkout must run apply.sh
+# before `cargo build` will resolve the [patch.crates-io] paths.
+# Make that automatic: target depends on vendor/, which exists only
+# after apply.sh has run.
+lktunnel-rust/vendor: lktunnel-rust/patches/apply.sh $(wildcard lktunnel-rust/patches/*.patch)
+	cd lktunnel-rust && ./patches/apply.sh
+
+build: lktunnel-rust/vendor
+	cd bale-vpn-rust && cargo build --release
+
+build-headless: lktunnel-rust/vendor
+	cd bale-vpn-rust && cargo build --release --no-default-features
 
 sync:
 ifeq ($(REMOTE),)

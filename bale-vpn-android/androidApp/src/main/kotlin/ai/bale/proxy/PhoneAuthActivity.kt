@@ -1,7 +1,6 @@
 package ai.bale.proxy
 
-import ai.bale.proxy.bale.BaleAuthClient
-import ai.bale.proxy.net.AppHttp
+import ai.bale.proxy.bale.BaleAuth
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
@@ -24,9 +23,9 @@ class PhoneAuthActivity : BaseActivity() {
     private lateinit var etToken:          TextInputEditText
     private lateinit var btnUseToken:      MaterialButton
 
-    private val prefs  by lazy { getSharedPreferences("config", MODE_PRIVATE) }
-    private val scope  = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val client = BaleAuthClient(AppHttp.client)
+    private val prefs by lazy { getSharedPreferences("config", MODE_PRIVATE) }
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val auth  = BaleAuth()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,7 +67,7 @@ class PhoneAuthActivity : BaseActivity() {
         btnSend.isEnabled = false; progress.visibility = View.VISIBLE
         scope.launch {
             try {
-                val resp = client.startPhoneAuth(phone)
+                val resp = auth.startPhoneAuth(phone)
                 val intent = Intent(this@PhoneAuthActivity, OtpActivity::class.java).apply {
                     putExtra(OtpActivity.EXTRA_PHONE, phone)
                     putExtra(OtpActivity.EXTRA_TX_HASH, resp.transactionHash)

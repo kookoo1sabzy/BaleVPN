@@ -36,6 +36,8 @@ The LiveKit data channel is encrypted with **DTLS**, so traffic is opaque to pas
 - Bale can see **which destinations you connect to** (IP and port, plus the hostname embedded in the TLS SNI of any HTTPS request).
 - Bale can read the **contents of any traffic that isn't itself end-to-end encrypted**. If you only browse `https://` sites, the payload is opaque to them; if you access plaintext HTTP / DNS / FTP / etc. through the tunnel, they can read it.
 
+**SOCKS5 mode (QUIC) note.** When you use SOCKS5 instead of full VPN, the tunnel carries client↔server traffic inside a QUIC channel that adds its own TLS-1.3 encryption on top of the LK data channel. **This is end-to-end encrypted between the two BaleVPN peers** and would in principle shield the contents from Bale's SFU. **But there is no certificate authority** — both ends generate self-signed certificates at startup and accept whatever the peer presents. Anyone who can inject themselves into the QUIC handshake path (which includes whoever operates the SFU you're routing through — Bale) can perform a transparent MITM by handing each side their own cert. The QUIC layer protects against passive eavesdropping by other tenants on the SFU; it does **not** protect against an active adversary at the relay. Treat the threat model as identical to the VPN-mode case above: rely on app-level TLS (HTTPS, etc.) for actual confidentiality, not on the QUIC layer.
+
 Treat this tunnel like a corporate VPN whose operator you don't fully trust — fine for IP-level reachability (uncensoring), **not adequate as an anonymity or end-to-end privacy layer**. Use TLS at the application level (HTTPS, encrypted DNS, etc.).
 
 ### 📌 Recommendation from the author
@@ -65,6 +67,8 @@ A few notes:
 - بله می‌تواند ببیند **چه کسی برای چه کسی رله می‌کند** — هر جلسهٔ تونل یک تماس صوتی بله بین دو حساب است، پس سوابق تماس بله گرافِ اجتماعی را افشا می‌کند (چه حسابی از چه رله‌ای، چه زمانی، چقدر استفاده کرده).
 - بله می‌تواند ببیند **شما به چه مقصدی وصل می‌شوید** (IP و پورت، به‌علاوهٔ نام میزبانی که در فیلد SNI درخواست‌های HTTPS قرار می‌گیرد).
 - بله می‌تواند **محتوای هر ترافیکی را که خودش رمزنگاری انتها به انتها نشده** بخواند. اگر فقط روی `https://` بگردید، محتوا برایشان مبهم است؛ اما اگر از پروتکل‌های متنی (HTTP/DNS/FTP/…) استفاده کنید، قابل خواندن خواهد بود.
+
+**نکته در مورد حالت SOCKS5 (QUIC).** وقتی به‌جای VPN کامل از SOCKS5 استفاده می‌کنید، ترافیک کلاینت↔سرور داخل یک کانال QUIC حمل می‌شود که روی کانال دادهٔ LK یک لایهٔ TLS 1.3 اضافه می‌گذارد. **این لایه میان دو نقطهٔ BaleVPN انتها به انتها رمزنگاری شده است** و در ظاهر باید محتوا را از دید SFU بله پنهان کند. **اما هیچ مرجع گواهی (CA) در کار نیست** — هر دو طرف در زمان راه‌اندازی یک گواهی self-signed تولید می‌کنند و هرچه طرف مقابل ارائه دهد را می‌پذیرند. هر کسی که بتواند خود را در مسیر دست‌دهی QUIC قرار دهد (که شامل گردانندهٔ SFU‌ای که از طریق آن مسیریابی می‌شوید نیز می‌شود — یعنی بله) می‌تواند با ارائهٔ گواهی خودش به هر طرف، یک MITM شفاف انجام دهد. لایهٔ QUIC در برابر شنود غیرفعال سایر کاربران SFU محافظت می‌کند؛ اما **در برابر یک مهاجم فعال در رله محافظت نمی‌کند**. مدل تهدید را همان حالت VPN در نظر بگیرید: برای محرمانگی واقعی به TLS سطح برنامه (HTTPS و…) تکیه کنید، نه به لایهٔ QUIC.
 
 این تونل را مثل VPN شرکتی‌ای ببینید که گرداننده‌اش را کاملاً نمی‌شناسید — برای دسترسی IP (دور زدن مسدودی) خوب است، **اما برای ناشناسی یا حریم خصوصی انتها به انتها کافی نیست**. در سطح برنامه از TLS (HTTPS، DNS رمزنگاری‌شده و…) استفاده کنید.
 
@@ -117,29 +121,16 @@ The tunnel rides on Bale's LiveKit infrastructure. Heavy traffic from a "voice c
 |---|---|---|
 | Client | Android | System `VpnService` (kernel TUN). Optional LAN-facing SOCKS5 listener in **Advanced** settings lets other devices on the local network share the tunnel. |
 | Server | Android | In-process userspace TCP/IP NAT; no root, no kernel TUN, no `iptables`. |
-| Server | Node.js — Linux | **Kernel TUN** mode (best throughput) needs `setcap cap_net_admin` + `iptables` MASQUERADE — one-time setup. **Userspace NAT** mode runs unprivileged. |
-| Server | Node.js — macOS | **Kernel TUN** mode (best throughput) runs as root; `pf` anchor + IP forwarding auto-set. **Userspace NAT** mode runs unprivileged. |
-| Server | Node.js — Windows | Userspace NAT mode only. |
-
-The Node application currently runs as **server only** — for the client side, use the Android app.
+| Client | Rust — Linux / macOS / Windows | Local SOCKS5 listener over a QUIC channel (no privilege needed). Optional system TUN (`--client-tun`, Linux/macOS only) for full host routing. |
+| Server | Rust — Linux | **Kernel TUN** mode (best throughput) needs `setcap cap_net_admin` + `iptables` MASQUERADE — one-time setup. **Userspace NAT** mode runs unprivileged. |
+| Server | Rust — macOS | **Kernel TUN** mode (best throughput) runs as root; `pf` anchor + IP forwarding auto-set. **Userspace NAT** mode runs unprivileged. |
+| Server | Rust — Windows | Userspace NAT mode only. |
 
 > **Easiest start: Android server + Android client.** Two phones, install the APK on both, sign in with your Bale account in the BaleVPN app, flip the toggle. No root, no command line, no firewall rules.
 >
-> **Most efficient: Linux or macOS Node kernel-TUN server + Android client.** The kernel does the IP forwarding (TUN device) and the NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS) — substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
+> **Most efficient: Linux or macOS Rust kernel-TUN server + Android client.** The kernel does the IP forwarding (TUN device) and the NAT (`iptables` MASQUERADE on Linux, `pf` anchor on macOS) — substantially faster than the userspace alternatives. The Android client connects via the standard `VpnService` for a fully-integrated system VPN.
 
-The Node server's forwarding mode is selectable at startup via `--nat-mode kernel|userspace`. `kernel` requires the one-time setup linked above; `userspace` runs with no privilege on any OS. See the [Node guide](docs/node-en.md) for details.
-
-<div dir="rtl">
-
-نسخهٔ Node در حال حاضر فقط **حالت سرور** را پشتیبانی می‌کند — برای سمت کلاینت از اپلیکیشن اندرویدی استفاده کنید.
-
-> **شروع آسان: سرور اندرویدی + کلاینت اندرویدی.** فقط دو گوشی؛ APK را روی هر دو نصب کنید، با حساب بلهٔ خود در اپ BaleVPN وارد شوید، و کلید حالت را جابه‌جا کنید. نه روت، نه خط فرمان، نه قواعد دیوارهٔ آتش.
->
-> **پربازده‌ترین: سرور TUN-هسته روی Node لینوکسی یا macOS + کلاینت اندرویدی.** هستهٔ سیستم‌عامل فوروارد IP را انجام می‌دهد (دستگاه TUN) و NAT را هم (روی لینوکس با قاعدهٔ `iptables` MASQUERADE، روی macOS با اَنکر `pf`) اعمال می‌کند — به‌مراتب سریع‌تر از جایگزین‌های فضای کاربری. کلاینت اندرویدی هم از طریق `VpnService` استاندارد به یک VPN کاملاً یکپارچهٔ سیستمی وصل می‌شود.
-
-حالت فوروارد سرور Node در زمان اجرا با آرگومان `--nat-mode kernel|userspace` انتخاب می‌شود. حالت `kernel` به همان تنظیمات یک‌بارهٔ بالا نیاز دارد؛ حالت `userspace` بدون دسترسی ویژه روی هر سیستم‌عاملی کار می‌کند. جزئیات در [راهنمای Node](docs/node-fa.md).
-
-</div>
+The Rust server's forwarding mode is selectable at startup via `--nat-mode kernel|userspace`. `kernel` requires the one-time setup linked above; `userspace` runs with no privilege on any OS.
 
 ---
 
@@ -150,40 +141,67 @@ Per-platform setup, manuals, and screenshots:
 | Platform | English | فارسی |
 |---|---|---|
 | **Android** (client and userspace-TCP/IP server) | [Android user guide](docs/android-en.md) | [راهنمای کاربری اپلیکیشن اندروید](docs/android-fa.md) |
-| **Node.js** — Linux / macOS / Windows (server only — kernel TUN on Linux/macOS, userspace NAT on any OS) | [Node.js application guide](docs/node-en.md) | [راهنمای نسخهٔ Node](docs/node-fa.md) |
+| **Rust** — Linux / macOS / Windows (client + server; kernel TUN on Linux/macOS, userspace NAT on any OS) | [Rust application guide](docs/rust-en.md) | [راهنمای نسخهٔ Rust](docs/rust-fa.md) |
 
-For protocol internals, wire formats, and architecture details: [CLAUDE.md](CLAUDE.md).
+For contributors:
+- [`docs/architecture.md`](docs/architecture.md) — repo layout, crate dependency graph, runtime data flow, build steps per component, CI workflows.
+- [`CLAUDE.md`](CLAUDE.md) — protocol internals, wire formats, and Bale-specific decisions.
 
 ---
 
 ## Architecture
 
 ```
-   ┌──────────────────────────────────────────────────────────────┐
-   │     Bale signaling WS  ·  wss://next-ws.bale.ai/ws/          │
-   │     (call setup, presence, push events)                      │
-   └────┬─────────────────────────────────────────────────┬───────┘
-        │ signaling                                signaling
-        ▼                                                 ▼
- ┌─────────────────┐                            ┌─────────────────┐               ┌──────────┐
- │     client      │                            │     server      │ ── egress ───►│   open   │
- │    (Android)    │                            │  (Android, or   │      NAT      │ internet │
- │                 │                            │   Node any-OS)  │               └──────────┘
- └────────┬────────┘                            └────────┬────────┘
-          │                                              │
-          │     ── DTLS-encrypted WebRTC data channel ── │
-          └──────────────┐                  ┌────────────┘
-                         ▼                  ▼
-            ┌────────────────────────────────────────┐
-            │    LiveKit SFU  ·  livekit.bale.ai     │
-            │    (relays the data channel)           │
-            └────────────────────────────────────────┘
+        ┌──────────────────────────────────────────────────────────────┐
+        │   Bale signaling WS  ·  wss://next-ws.bale.ai/ws/            │
+        │   call setup (StartCall / AcceptCall / DiscardCall),         │
+        │   presence, callReceived / callEnded push events             │
+        └────┬─────────────────────────────────────────────────┬───────┘
+             │ signaling                                signaling
+             │ (paused while a client call is active)          │
+             ▼                                                 ▼
+    ┌─────────────────┐                              ┌─────────────────┐
+    │     client      │                              │     server      │
+    │  Rust  /  Android                              │  Rust  /  Android
+    │                 │                              │                 │
+    │  apps → SOCKS5  │                              │ kernel TUN OR   │
+    │  apps → TUN     │                              │ userspace NAT   │
+    └────────┬────────┘                              └────────┬────────┘
+             │                                                │
+             │   DTLS-encrypted WebRTC data channel           │
+             │     ▶ FRAME_TYPE_IP  (raw IP for VPN/TUN)      │
+             │     ▶ FRAME_TYPE_QUIC (QUIC for SOCKS5)        │
+             └──────────────┐                  ┌──────────────┘
+                            ▼                  ▼
+                  ┌────────────────────────────────────┐
+                  │   LiveKit SFU  ·  meet-*.ble.ir    │
+                  │   relays the data channel only —   │
+                  │   does NOT touch the open internet │
+                  └────────────────────────────────────┘
+                                                                ┌──────────┐
+                                        server NAT egress ─────►│   open   │
+                                                                │ internet │
+                                                                └──────────┘
 ```
 
-- **Bale signaling WS** — call setup and Bale-side push events. Dropped once the call is up; brought back automatically when needed.
-- **LiveKit SFU** — Bale-operated WebRTC server that relays the DTLS-encrypted data channel between client and server. Carries raw IP packets between the two ends.
-- **Server** owns the egress NAT to the open internet. The SFU just relays; it doesn't route to the internet itself.
-- Bale operates both the signaling WS and the SFU, so they can see traffic metadata and any payload that isn't itself end-to-end encrypted (see the [privacy note](#%EF%B8%8F-privacy--encryption) above).
+Two channels per session, both terminated at Bale infrastructure:
+
+**Signaling — Bale WS at `next-ws.bale.ai`.** Call setup RPCs and push events. Owned by `bale-signaling-rust`. The lifecycle is driven by a rule engine in `WsClient`:
+
+> `desired_up = token && !user_disconnect && ( server_active || (foreground && !call_active) )`
+
+So in client mode the WS is **automatically paused while a call is in progress** (the push channel is unnecessary mid-call) and resumed when the call ends. In server mode it stays up unconditionally so `callReceived` pushes can reach the daemon.
+
+**Transport — LiveKit DTLS-encrypted data channel.** The published audio track's encoded payload is hijacked (via a custom `FrameTransformer`) and replaced with our own bytes — the SFU sees opaque "audio" and relays it; on the other end we replace the bytes back. One byte at the start tags each frame:
+
+- `'I'` (0x49) — **raw IP packets** for VPN / TUN mode. Client kernel TUN reads IP → ships → server side either kernel-TUN (the host kernel forwards via iptables MASQUERADE / pf) or userspace NAT (per-flow Rust TCP/UDP state machines).
+- `'Q'` (0x51) — **QUIC datagrams** for SOCKS5 mode. Client's local SOCKS5 listener wraps app traffic into a QUIC stream → server's QUIC acceptor demuxes and opens host sockets per SOCKS5 dial.
+
+Both modes can be active on one tunnel — apps choose by configuring SOCKS5 vs going through the VPN system route.
+
+**Server NAT** owns egress to the open internet. The SFU just relays the DTLS channel; it never sees the unwrapped tunnel data and doesn't route to the internet itself.
+
+**What Bale sees**: signaling metadata (who calls whom, when, for how long), the IP addresses your traffic ends up reaching, and any plaintext-protocol payloads. The SOCKS5/QUIC layer adds TLS-1.3 between client and server but uses **self-signed certs with no CA validation**, so an active adversary at the SFU can transparent-MITM it. Treat the tunnel as "IP reachability" not "end-to-end privacy" — use HTTPS at the app level. Details in the [privacy note](#%EF%B8%8F-privacy--encryption) above.
 
 ---
 

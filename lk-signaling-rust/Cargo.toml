@@ -1,0 +1,26 @@
+# lk-signaling-rust — generic signaling abstraction for LiveKit-backed
+# tunnels. Defines the Signaling trait that any provider (Bale today,
+# others later) implements. Pure interface crate: no transport code,
+# no protocol code, no provider-specific knowledge.
+#
+#   lk-signaling/  the trait crate. Producing a TransportSession
+#                  (LK url + token + opaque peer id) is the entire
+#                  job; consumers feed the session into `lktunnel`.
+#
+# Consumers:
+#   - bale-signaling-rust (the only impl today)
+#   - bale-vpn-headless-rust, bale-vpn-rust (via the impl)
+#   - bale-vpn-android JNI shim (via the impl)
+[workspace]
+resolver = "2"
+members  = ["lk-signaling"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"

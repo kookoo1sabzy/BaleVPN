@@ -1,0 +1,72 @@
+# Single Rust binary replacing the Node bale-vpn application.
+[package]
+name        = "bale-vpn"
+version     = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Bale VPN — single Rust binary (headless or GUI) replacing bale-vpn-node."
+
+[[bin]]
+name = "bale-vpn"
+path = "src/main.rs"
+
+[features]
+# Desktop webview shell **on by default** so a plain
+# `cargo build --release` produces the GUI binary that opens
+# a webview unless `--headless` is passed.
+#
+# Server builds opt out:
+#   cargo build --release --no-default-features
+# That drops the tao + wry deps + skips webview wiring; the
+# binary stays headless-only (HTTP UI still works).
+default = ["gui"]
+gui     = ["dep:tao", "dep:wry", "dep:muda"]
+
+[dependencies]
+# The signaling stack — three crates layered top-down.
+lk-signaling   = { path = "../../lk-signaling-rust/lk-signaling" }
+bale-signaling = { path = "../../bale-signaling-rust/bale-signaling", features = ["lktunnel"] }
+lktunnel       = { path = "../../lktunnel-rust/lktunnel" }
+
+# Async runtime + concurrency primitives.
+tokio = { version = "1", features = [
+    "rt-multi-thread", "sync", "macros", "time", "signal", "io-util", "net", "fs",
+] }
+parking_lot = "0.12"
+async-trait = "0.1"
+
+# libc — TUNSETIFF / SIOCSIFADDR ioctls for the Linux kernel-TUN
+# path. Unix-only; the userspace-NAT path doesn't need it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# CLI parsing.
+clap = { version = "4", features = ["derive"] }
+
+# Config + token persistence. JSON — matches the file format
+# the Node app used so an existing `~/.bale-vpn_config.json`
+# round-trips without re-auth.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging.
+log        = "0.4"
+env_logger = "0.11"
+
+# HTTP UI — axum 0.7 with tower-http for static-file / CORS / etc.
+# Same surface as the Node `http-server.js` so the existing HTML/JS
+# frontend can be served verbatim once it's ported in.
+axum       = { version = "0.7", features = ["macros"] }
+tower      = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+
+# GUI deps — optional, gated by the `gui` feature. `tao` is the
+# windowing / event-loop crate (cross-platform), `wry` is the
+# webview that hosts the HTML/JS UI served by the embedded
+# axum server, `muda` provides the native menubar (so macOS
+# routes Cmd+C / Cmd+V into the webview). All three are
+# maintained by the Tauri team but kept at a level below Tauri
+# itself so we don't pull in the whole framework.
+tao        = { version = "0.30", optional = true }
+wry        = { version = "0.45", optional = true }
+muda       = { version = "0.13", optional = true }

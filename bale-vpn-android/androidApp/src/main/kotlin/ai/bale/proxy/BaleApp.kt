@@ -10,7 +10,8 @@ import androidx.lifecycle.ProcessLifecycleOwner
 
 private const val TAG = "BaleProxy"
 
-/** Wires app-process foreground state into BaleConnection.reconcile(). */
+/** Pushes app-process foreground state into the Rust WS rule engine
+ *  via BaleSignaling.setForeground. */
 class BaleApp : Application() {
     override fun onCreate() {
         super.onCreate()
@@ -23,7 +24,6 @@ class BaleApp : Application() {
         // "cannot locate symbol lktunnel_inject_packet".
         //
         BaleConnection.init(this)
-        UserCache.init(this)
         installMainLoopCrashRecovery()
         installNativeErrorPoller()
         // Single load-time sanity check — the LK runtime and NAT
@@ -37,12 +37,10 @@ class BaleApp : Application() {
         }
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
-                BaleConnection.isForeground = true
-                BaleConnection.reconcile()
+                BaleConnection.signaling?.setForeground(true)
             }
             override fun onStop(owner: LifecycleOwner) {
-                BaleConnection.isForeground = false
-                BaleConnection.reconcile()
+                BaleConnection.signaling?.setForeground(false)
             }
         })
     }

@@ -1,0 +1,23 @@
+# lk-signaling — the generic trait crate. No transport, no
+# protocol, no provider-specific code; just the Signaling trait
+# plus the small set of types it produces and consumes.
+[package]
+name        = "lk-signaling"
+version     = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Generic signaling abstraction that produces LiveKit TransportSessions."
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+# Async methods in object-safe traits — native AFIT works in `dyn
+# Trait` only with extra constraints (each method must be self-
+# contained). `async-trait` keeps the trait dyn-safe with one
+# attribute; drop it later if Rust's native support lands the
+# missing pieces.
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }

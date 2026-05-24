@@ -21,6 +21,7 @@ path       = "src/libjni.rs"
 
 [dependencies]
 lktunnel       = { path = "../../../lktunnel-rust/lktunnel" }
+jni-shared     = { path = "../jni-shared" }
 # Direct dep purely to call `livekit::webrtc::android::initialize_android`
 # from JNI_OnLoad. Without that hook, webrtc-sys's PeerConnectionFactory
 # constructor SIGSEGVs the moment Room::connect starts — its AdmProxy

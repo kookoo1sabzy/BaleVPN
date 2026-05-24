@@ -1,0 +1,127 @@
+name: bale-vpn-rust binaries
+
+# CI for the desktop binary that replaced the Node app.
+#
+#   - push / PR: build the binary on Linux + macOS + Windows so a
+#     change that breaks the GUI feature (tao/wry) or the
+#     userspace-NAT path (Windows-only quirks) gets caught early.
+#   - tag `v*`: also package + attach the binaries to the GitHub
+#     Release. The release tag is shared with the Android workflow,
+#     so a single `git tag v0.1.0 && git push --tags` ships APK +
+#     desktop binaries together.
+#
+# The headless variant (no GUI) is built alongside the GUI one
+# on the same matrix runner — `--no-default-features` drops tao /
+# wry, useful for server deployments. The two outputs are
+# uploaded as separate artifacts.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for softprops/action-gh-release on tags
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os:           ubuntu-latest
+            artifact_os:  linux-x86_64
+            bin_ext:      ''
+          - os:           macos-latest
+            artifact_os:  macos-aarch64
+            bin_ext:      ''
+          - os:           windows-latest
+            artifact_os:  windows-x86_64
+            bin_ext:      '.exe'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: bale-vpn-rust
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # webrtc-sys / livekit transitively need GTK + audio dev
+      # headers on Linux. macOS gets these via system frameworks;
+      # Windows ships the WebView2 runtime that wry uses.
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev \
+            libglib2.0-dev libgtk-3-dev \
+            libpulse-dev libasound2-dev \
+            libdbus-1-dev libudev-dev \
+            libsoup-3.0-dev libwebkit2gtk-4.1-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            lktunnel-rust/patches/.cache
+            lktunnel-rust/target
+            bale-vpn-rust/target
+          key: bale-vpn-rust-${{ runner.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'lktunnel-rust/patches/*.patch', 'bale-vpn-rust/Cargo.toml') }}
+          restore-keys: |
+            bale-vpn-rust-${{ runner.os }}-
+
+      - name: Apply vendor crate patches
+        working-directory: lktunnel-rust
+        run: ./patches/apply.sh
+
+      # GUI binary — default features (`gui` is on by default;
+      # produces the windowed desktop variant). The same binary
+      # respects `--headless` at runtime when the user wants the
+      # HTTP-only mode on a desktop machine, but the headless build
+      # below is the right pick for server deployments where the
+      # tao / wry deps would otherwise add ~50MB of native libs.
+      - name: cargo build --release  (gui)
+        run: cargo build -p bale-vpn --release
+
+      - name: Stage GUI artifact
+        run: |
+          mkdir -p ../release-staging
+          cp target/release/bale-vpn${{ matrix.bin_ext }} \
+             ../release-staging/bale-vpn-gui-${{ matrix.artifact_os }}${{ matrix.bin_ext }}
+
+      # Headless binary — drops tao + wry. Same source, just the
+      # `gui` feature off. Lands as a separate artifact so server
+      # deployers can grab a smaller binary without the desktop
+      # libs.
+      - name: cargo build --release --no-default-features  (headless)
+        run: cargo build -p bale-vpn --release --no-default-features
+
+      - name: Stage headless artifact
+        run: |
+          cp target/release/bale-vpn${{ matrix.bin_ext }} \
+             ../release-staging/bale-vpn-headless-${{ matrix.artifact_os }}${{ matrix.bin_ext }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bale-vpn-${{ matrix.artifact_os }}
+          path: release-staging/*
+          if-no-files-found: error
+
+      - name: Attach binaries to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-staging/*
