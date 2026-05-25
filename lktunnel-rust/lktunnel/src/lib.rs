@@ -256,11 +256,13 @@ struct TunnelInner {
     /// Total inbound packets dropped at `INBOUND_QUEUE_CAP`. Surfaced
     /// in logs on power-of-two boundaries.
     inbound_drops: AtomicU64,
-    /// Outgoing RTP transport handle. Set once `Room::connect` succeeds
-    /// and the local video track has been published. Owned here so its
-    /// dummy-frame producer task stays alive for the tunnel's lifetime;
-    /// dropped on teardown.
-    rtp_sender: Mutex<Option<Arc<rtp::RtpSender>>>,
+    /// Outgoing RTP transport handles — one per parallel carrier track
+    /// (see [`rtp::TRACK_COUNT`]). Set once `Room::connect` succeeds and
+    /// the local audio tracks have been published. Owned here so each
+    /// track's dummy-frame producer task stays alive for the tunnel's
+    /// lifetime; dropped on teardown. The send loop stripes outbound
+    /// frames round-robin across them.
+    rtp_senders: Mutex<Vec<Arc<rtp::RtpSender>>>,
     /// Incoming RTP transport handles, one per remote video track we've
     /// subscribed to. Kept alive while their RtpReceivers are valid;
     /// libwebrtc's scoped_refptr inside the transformer pins the C++
@@ -372,7 +374,7 @@ fn build_loopback_inner() -> (Arc<TunnelInner>, tokio::sync::mpsc::Receiver<Vec<
         connected:     Arc::new(AtomicBool::new(false)),
         inbound:       Mutex::new(VecDeque::with_capacity(INBOUND_QUEUE_CAP)),
         inbound_drops: AtomicU64::new(0),
-        rtp_sender:    Mutex::new(None),
+        rtp_senders:   Mutex::new(Vec::new()),
         rtp_receivers: Mutex::new(Vec::new()),
         on_ip_override: Mutex::new(None),
         quic_rx_tx:    Mutex::new(None),
@@ -508,7 +510,7 @@ impl LkTunnel {
             connected:     Arc::new(AtomicBool::new(false)),
             inbound:       Mutex::new(VecDeque::with_capacity(INBOUND_QUEUE_CAP)),
             inbound_drops: AtomicU64::new(0),
-            rtp_sender:    Mutex::new(None),
+            rtp_senders:   Mutex::new(Vec::new()),
             rtp_receivers: Mutex::new(Vec::new()),
             on_ip_override: Mutex::new(None),
             quic_rx_tx:    Mutex::new(None),
@@ -1285,30 +1287,38 @@ async fn run_connect_task(
     };
     inner.room.lock().replace(Arc::clone(&room));
 
-    // Publish our outgoing video track and install the byte-substitution
-    // FrameTransformer on its RtpSender. This is the actual tunnel
-    // transport — see rtp.rs for the why (SCTP DPI fingerprint avoidance).
-    let rtp_sender = match rtp::publish(&room).await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            log::warn!("LkTunnel[{id}]: rtp::publish failed: {e}");
-            if let Some(inner) = weak.upgrade() {
-                let _ = inner.state_tx.send(TunnelState::Failed(e.clone()));
+    // Publish our outgoing audio carrier tracks and install the
+    // byte-substitution FrameTransformer on each one's RtpSender. This
+    // is the actual tunnel transport — see rtp.rs for the why (SCTP DPI
+    // fingerprint avoidance). We publish TRACK_COUNT parallel tracks and
+    // stripe outbound frames across them to exceed Opus's per-track
+    // 510 kbps ceiling.
+    let mut senders: Vec<Arc<rtp::RtpSender>> = Vec::with_capacity(rtp::TRACK_COUNT);
+    for index in 0..rtp::TRACK_COUNT {
+        match rtp::publish(&room, index).await {
+            Ok(s) => senders.push(Arc::new(s)),
+            Err(e) => {
+                log::warn!("LkTunnel[{id}]: rtp::publish track {index} failed: {e}");
+                if let Some(inner) = weak.upgrade() {
+                    let _ = inner.state_tx.send(TunnelState::Failed(e.clone()));
+                }
+                emit_event(&on_event, EventKind::Error, e);
+                let _ = room.close().await;
+                return;
             }
-            emit_event(&on_event, EventKind::Error, e);
-            let _ = room.close().await;
-            return;
         }
-    };
-    inner.rtp_sender.lock().replace(Arc::clone(&rtp_sender));
+    }
+    *inner.rtp_senders.lock() = senders.clone();
 
     let weak_for_sender = std::sync::Weak::clone(&weak);
-    let rtp_for_sender = Arc::clone(&rtp_sender);
+    let senders_for_loop = senders;
     let sender = runtime().spawn(async move {
         let mut send_rx = send_rx;
         let mut drops:    u64 = 0;
         let mut sent:     u64 = 0;
         let mut packets:  u64 = 0;
+        // Round-robin cursor into `senders_for_loop` for striping.
+        let mut next_track: usize = 0;
         let mut batch: Vec<u8> = Vec::with_capacity(rtp::MAX_FRAME_BYTES);
 
         // Opportunistic packing: at every wakeup, take the first packet
@@ -1328,53 +1338,64 @@ async fn run_connect_task(
         // → DrainPoller parks quinn → quinn's per-stream flow control
         // kicks in. Without this, quinn happily pushes datagrams that
         // we silently drop, and TCP-over-QUIC sees collapse.
+        // Stripe each batch across the parallel carrier tracks. `next`
+        // is the round-robin cursor: we try tracks starting there and
+        // send to the first whose transformer queue accepts the frame,
+        // so load spreads evenly and a momentarily-full track is just
+        // skipped. We only block (backpressure) when EVERY track's queue
+        // is full — which is what propagates flow control back up to
+        // quinn (mpsc fills → AsyncUdpSocket WouldBlock → quinn parks).
         async fn flush_with_backpressure(
             batch: &mut Vec<u8>,
             sent:  &mut u64,
             cumulative_waits: &mut u64,
             packets: u64,
-            rtp:   &rtp::RtpSender,
+            senders: &[Arc<rtp::RtpSender>],
+            next:  &mut usize,
         ) {
-            if batch.is_empty() { return; }
+            if batch.is_empty() || senders.is_empty() { return; }
             // Encoder runs at ~50 Hz (20ms ticks). On overflow, retry
             // with a short backoff that doesn't burn CPU but doesn't
             // wait through more than one encoder tick either.
             const RETRY_MS: u64 = 5;
+            let n = senders.len();
             // Local wait counter: tracks just *this* flush. Logged once
             // on entry into backpressure and once on recovery — no
             // power-of-two spam.
             let mut local_waits = 0u64;
-            while !rtp.send(batch) {
+            loop {
+                // One sweep across all tracks, starting at the cursor.
+                for off in 0..n {
+                    let i = (*next + off) % n;
+                    if senders[i].send(batch) {
+                        *next = (i + 1) % n;
+                        if local_waits > 0 {
+                            log::warn!(
+                                "rtp send drained after {local_waits} waits (~{}ms)",
+                                local_waits * RETRY_MS,
+                            );
+                            *cumulative_waits = cumulative_waits.saturating_add(local_waits);
+                        }
+                        *sent = sent.saturating_add(1);
+                        if sent.is_power_of_two() {
+                            log::debug!(
+                                "rtp send checkpoint: enqueued {sent} frames packing \
+                                 {packets} ip-packets total (last_frame={}B, track={i}, \
+                                 cumulative_waits={cumulative_waits})",
+                                batch.len(),
+                            );
+                        }
+                        batch.clear();
+                        return;
+                    }
+                }
+                // Every track's queue was full this sweep.
                 if local_waits == 0 {
-                    // First time we couldn't push this batch — emit one
-                    // line so the operator knows we're pacing.
-                    log::warn!(
-                        "rtp send queue full — backpressuring (depth={})",
-                        rtp.queue_depth(),
-                    );
+                    log::warn!("rtp send: all {n} carrier tracks' queues full — backpressuring");
                 }
                 local_waits = local_waits.saturating_add(1);
                 tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
             }
-            if local_waits > 0 {
-                // Came out of backpressure — log once.
-                log::warn!(
-                    "rtp send drained after {local_waits} waits (~{}ms)",
-                    local_waits * RETRY_MS,
-                );
-                *cumulative_waits = cumulative_waits.saturating_add(local_waits);
-            }
-            *sent = sent.saturating_add(1);
-            if sent.is_power_of_two() {
-                log::debug!(
-                    "rtp send checkpoint: enqueued {sent} frames packing \
-                     {packets} ip-packets total (last_frame={}B, depth={}, \
-                     cumulative_waits={cumulative_waits})",
-                    batch.len(),
-                    rtp.queue_depth(),
-                );
-            }
-            batch.clear();
         }
 
         loop {
@@ -1396,7 +1417,7 @@ async fn run_connect_task(
                         packets = packets.saturating_add(1);
                         if !rtp::push_packed(&mut batch, &next) {
                             flush_with_backpressure(
-                                &mut batch, &mut sent, &mut drops, packets, &rtp_for_sender,
+                                &mut batch, &mut sent, &mut drops, packets, &senders_for_loop, &mut next_track,
                             ).await;
                             rtp::push_packed(&mut batch, &next);
                         }
@@ -1407,7 +1428,7 @@ async fn run_connect_task(
             }
 
             flush_with_backpressure(
-                &mut batch, &mut sent, &mut drops, packets, &rtp_for_sender,
+                &mut batch, &mut sent, &mut drops, packets, &senders_for_loop, &mut next_track,
             ).await;
 
             if let Some(inner) = weak_for_sender.upgrade() {
@@ -1417,7 +1438,7 @@ async fn run_connect_task(
         }
         // Final flush (channel closed mid-batch).
         flush_with_backpressure(
-            &mut batch, &mut sent, &mut drops, packets, &rtp_for_sender,
+            &mut batch, &mut sent, &mut drops, packets, &senders_for_loop, &mut next_track,
         ).await;
     });
     inner.sender_task.lock().replace(sender.abort_handle());

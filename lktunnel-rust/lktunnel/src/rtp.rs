@@ -46,6 +46,11 @@ const DUMMY_CHANNELS:    u32 = 1;
 /// 20 ms frame at 48 kHz = 960 samples. Matches the Opus packetisation
 /// cadence so the encoder is fed exactly one packet per Transform()
 /// call.
+///
+/// A 10 ms cadence was tried to double the frame rate and regressed
+/// throughput: more packets = more RTP/UDP header overhead, and if the
+/// SFU's bandwidth estimate is per-peer-connection the extra packets
+/// just add loss/jitter the congestion controller backs off from.
 const DUMMY_FRAME_MS:        u32 = 20;
 const DUMMY_SAMPLES_PER_FRAME: u32 =
     DUMMY_SAMPLE_RATE / 1000 * DUMMY_FRAME_MS;
@@ -55,9 +60,27 @@ const DUMMY_SAMPLES_PER_FRAME: u32 =
 /// trigger.
 const DUMMY_QUEUE_MS: u32 = 100;
 
-/// Track name on the LK wire. The peer subscribes by track kind, not
-/// name, so this is just for log readability.
+/// Track name prefix on the LK wire. The peer subscribes by track
+/// kind, not name, so this is just for log readability — each of the
+/// `TRACK_COUNT` parallel tracks gets a `tunnel-<index>` suffix.
 const TRACK_NAME: &str = "tunnel";
+
+/// Number of parallel audio carrier tracks the sender publishes.
+/// The send loop stripes frames round-robin across them; the receive
+/// side needs no count (it attaches a receiver to every remote track
+/// and funnels them into one dispatch).
+///
+/// Kept at 1 — multi-track was tried and regressed throughput. Two
+/// reasons: (a) WebRTC bandwidth estimation is per peer-connection, so
+/// N tracks split one budget rather than multiplying it; (b) — the
+/// killer — per-frame round-robin striping across tracks with
+/// independent jitter buffers delivers packets badly out of order, and
+/// the transport above (TCP-over-TUN, QUIC-over-tunnel) reads that
+/// reordering as loss → cwnd collapse. A working multi-track design
+/// would need per-FLOW pinning (hash each connection to one track so it
+/// stays in-order), which only helps concurrent-flow workloads, not a
+/// single big transfer. The plumbing below stays so that's revivable.
+pub const TRACK_COUNT: usize = 1;
 
 /// Wire-format ceiling per Opus frame at 510 kbps × 20 ms (Opus's hard
 /// per-packet limit per RFC 6716). Sender packs as many length-prefixed
@@ -117,17 +140,19 @@ pub struct RtpReceiver {
 /// task that pushes a silent 20 ms PCM frame at 50 Hz to keep the
 /// Opus encoder live.
 ///
-/// Must be called after `Room::connect` returns and only once per
-/// tunnel.
-pub async fn publish(room: &Arc<Room>) -> Result<RtpSender, String> {
+/// Must be called after `Room::connect` returns. `index` distinguishes
+/// the parallel carrier tracks (`tunnel-0`, `tunnel-1`, …); call once
+/// per track, up to [`TRACK_COUNT`].
+pub async fn publish(room: &Arc<Room>, index: usize) -> Result<RtpSender, String> {
     let source = NativeAudioSource::new(
         AudioSourceOptions::default(),
         DUMMY_SAMPLE_RATE,
         DUMMY_CHANNELS,
         DUMMY_QUEUE_MS,
     );
+    let name = format!("{TRACK_NAME}-{index}");
     let track = LocalAudioTrack::create_audio_track(
-        TRACK_NAME,
+        &name,
         RtcAudioSource::Native(source.clone()),
     );
 
