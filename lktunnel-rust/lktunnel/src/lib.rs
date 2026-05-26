@@ -344,8 +344,11 @@ static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
 #[doc(hidden)]
 pub fn connect_loopback() -> (LkTunnel, LkTunnel) {
     crate::dispatcher::init();
-    let (a_inner, a_send_rx) = build_loopback_inner();
-    let (b_inner, b_send_rx) = build_loopback_inner();
+    // `a` is the client side (drives `enable_socks5_server`); `b` is the
+    // server side (`start_server`). The roles must match those calls'
+    // guards, same as a real `connect` / `connect_server` pair.
+    let (a_inner, a_send_rx) = build_loopback_inner(TunnelRole::Client);
+    let (b_inner, b_send_rx) = build_loopback_inner(TunnelRole::Server);
     spawn_loopback_forwarder(a_send_rx, Arc::clone(&b_inner));
     spawn_loopback_forwarder(b_send_rx, Arc::clone(&a_inner));
     a_inner.connected.store(true, Ordering::Relaxed);
@@ -355,7 +358,7 @@ pub fn connect_loopback() -> (LkTunnel, LkTunnel) {
     (LkTunnel { inner: a_inner }, LkTunnel { inner: b_inner })
 }
 
-fn build_loopback_inner() -> (Arc<TunnelInner>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+fn build_loopback_inner(role: TunnelRole) -> (Arc<TunnelInner>, tokio::sync::mpsc::Receiver<Vec<u8>>) {
     let id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
     let (send_tx, send_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(SEND_QUEUE_CAP);
     let (state_tx, _state_rx) = tokio::sync::watch::channel(TunnelState::Connecting);
@@ -382,7 +385,7 @@ fn build_loopback_inner() -> (Arc<TunnelInner>, tokio::sync::mpsc::Receiver<Vec<
         connect_lock:  tokio::sync::Mutex::new(()),
         socks5_handle: Mutex::new(None),
         quic_server_handle: Mutex::new(None),
-        role: TunnelRole::Client,
+        role,
     });
     (inner, send_rx)
 }
@@ -1295,7 +1298,12 @@ async fn run_connect_task(
     // 510 kbps ceiling.
     let mut senders: Vec<Arc<rtp::RtpSender>> = Vec::with_capacity(rtp::TRACK_COUNT);
     for index in 0..rtp::TRACK_COUNT {
-        match rtp::publish(&room, index).await {
+        let published = if rtp::USE_VIDEO_CARRIER {
+            rtp::publish_video(&room).await
+        } else {
+            rtp::publish(&room, index).await
+        };
+        match published {
             Ok(s) => senders.push(Arc::new(s)),
             Err(e) => {
                 log::warn!("LkTunnel[{id}]: rtp::publish track {index} failed: {e}");
@@ -1319,7 +1327,8 @@ async fn run_connect_task(
         let mut packets:  u64 = 0;
         // Round-robin cursor into `senders_for_loop` for striping.
         let mut next_track: usize = 0;
-        let mut batch: Vec<u8> = Vec::with_capacity(rtp::MAX_FRAME_BYTES);
+        let frame_cap = rtp::max_frame_bytes();
+        let mut batch: Vec<u8> = Vec::with_capacity(frame_cap);
 
         // Opportunistic packing: at every wakeup, take the first packet
         // off the channel (blocking), then greedily drain any others
@@ -1404,7 +1413,7 @@ async fn run_connect_task(
                 Some(b) => b,
                 None    => break,
             };
-            rtp::push_packed(&mut batch, &first);
+            rtp::push_packed(&mut batch, &first, frame_cap);
             packets = packets.saturating_add(1);
 
             // Drain any additional packets that have already arrived,
@@ -1415,11 +1424,11 @@ async fn run_connect_task(
                 match send_rx.try_recv() {
                     Ok(next) => {
                         packets = packets.saturating_add(1);
-                        if !rtp::push_packed(&mut batch, &next) {
+                        if !rtp::push_packed(&mut batch, &next, frame_cap) {
                             flush_with_backpressure(
                                 &mut batch, &mut sent, &mut drops, packets, &senders_for_loop, &mut next_track,
                             ).await;
-                            rtp::push_packed(&mut batch, &next);
+                            rtp::push_packed(&mut batch, &next, frame_cap);
                         }
                     }
                     Err(TryRecvError::Empty)        => break,
@@ -1674,19 +1683,17 @@ fn dispatch_payload(
     }
 }
 
-/// Attach a receiver-side FrameTransformer to a newly-subscribed
-/// remote audio track and stash the handle on TunnelInner so it stays
-/// alive. Non-audio tracks (e.g. video) are ignored — the tunnel
-/// rides Opus to side-step the Android JNI video-encoder crash.
+/// Attach a receiver-side FrameTransformer to a newly-subscribed remote
+/// carrier track and stash the handle on TunnelInner so it stays alive.
+/// Handles both audio and video tracks — the carrier kind is the
+/// peer's send-side choice, and the frame format is identical either
+/// way, so we attach to whichever the peer publishes.
 fn attach_rtp_receiver(
     weak:  &std::sync::Weak<TunnelInner>,
     track: livekit::track::RemoteTrack,
     on_ip: &Arc<dyn Fn(&[u8]) + Send + Sync>,
 ) {
-    let livekit::track::RemoteTrack::Audio(audio) = track else {
-        log::debug!("attach_rtp_receiver: ignoring non-audio track");
-        return;
-    };
+    use livekit::track::RemoteTrack;
     let Some(inner) = weak.upgrade() else { return };
     let on_ip = Arc::clone(on_ip);
     // QUIC inbound: try to push to inner.quic_rx_tx (set by
@@ -1709,10 +1716,13 @@ fn attach_rtp_receiver(
     });
     let on_data: Arc<dyn Fn(&[u8]) + Send + Sync> =
         Arc::new(move |payload: &[u8]| dispatch_payload(payload, &on_ip, &on_quic));
-    match rtp::attach_remote(&audio, on_data) {
+    let (attached, sid) = match &track {
+        RemoteTrack::Audio(audio) => (rtp::attach_remote(audio, on_data), audio.sid()),
+        RemoteTrack::Video(video) => (rtp::attach_remote_video(video, on_data), video.sid()),
+    };
+    match attached {
         Ok(receiver) => {
-            log::info!("LkTunnel[{}]: rtp receiver attached on track sid={}",
-                       inner.id, audio.sid());
+            log::info!("LkTunnel[{}]: rtp receiver attached on track sid={sid}", inner.id);
             inner.rtp_receivers.lock().push(receiver);
         }
         Err(e) => log::warn!("LkTunnel[{}]: rtp::attach_remote failed: {e}", inner.id),
