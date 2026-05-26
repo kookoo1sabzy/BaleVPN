@@ -329,6 +329,12 @@ class MainActivity : BaseActivity() {
         tvSocks5Status.visibility = View.VISIBLE
         val newText = if (bound == 0) {
             "Failed — check logcat"
+        } else if (!BaleVpnService.quicConnected()) {
+            // Listener is bound but the QUIC handshake to the peer is
+            // still warming — the proxy can't carry traffic yet, so don't
+            // advertise the address. The 500 ms poll re-calls this and
+            // flips to the address once QUIC is up.
+            "Connecting…"
         } else {
             val lan = getLocalLanIpv4()
             if (lan != null)

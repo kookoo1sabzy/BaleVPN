@@ -491,9 +491,163 @@ diff -urN a/src/raw_bytes_transformer.rs b/src/raw_bytes_transformer.rs
 +    }
 +}
 
---- a/src/video_encoder_factory.cpp	2006-07-24 03:21:28
-+++ b/src/video_encoder_factory.cpp	2026-05-24 12:35:06
-@@ -143,7 +143,20 @@
+--- a/src/video_encoder_factory.cpp
++++ b/src/video_encoder_factory.cpp
+@@ -36,6 +36,13 @@
+ #include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
+ #include "api/video_codecs/video_encoder_factory_template_libvpx_vp9_adapter.h"
+ 
++// Passthrough VP8 encoder support.
++#include "api/video/encoded_image.h"
++#include "api/video/video_frame_type.h"
++#include "modules/video_coding/codecs/interface/common_constants.h"
++#include "modules/video_coding/include/video_codec_interface.h"
++#include "modules/video_coding/include/video_error_codes.h"
++
+ #ifdef WEBRTC_ANDROID
+ #include "livekit/android.h"
+ #endif
+@@ -131,7 +138,139 @@
+ }
+ 
+ }  // namespace
++
++// ── Passthrough VP8 encoder ───────────────────────────────────────────
++//
++// lktunnel publishes a fake video track only to drive Transform() — the
++// RawBytesFrameTransformer replaces the encoded payload with tunnel bytes
++// before packetisation, so the *real* VP8 bitstream is always discarded.
++// Running libvpx to produce bytes we immediately throw away is pure waste:
++// it costs CPU (a phone can't sustain VIDEO_FPS encoding full frames), and
++// libvpx's rate controller / frame-dropper can skip frames, starving the
++// Transform() cadence that carries our data.
++//
++// This encoder does no encoding. Every Encode() call synthesises a tiny
++// stub EncodedImage with VP8 codec-specific info and hands it straight to
++// the callback — never drops, never rate-limits. Result: Transform() fires
++// once per fed frame at the full source rate, with ~zero CPU. Frame type
++// is keyframe on init / when the pipeline requests one (PLI), delta
++// otherwise, so the receiver's frame buffer can start and recover.
++class PassthroughVp8Encoder : public webrtc::VideoEncoder {
++ public:
++  PassthroughVp8Encoder() = default;
++  ~PassthroughVp8Encoder() override = default;
++
++  int32_t InitEncode(const webrtc::VideoCodec* codec, int32_t, size_t) override {
++    return InitImpl(codec);
++  }
++  int InitEncode(const webrtc::VideoCodec* codec,
++                 const webrtc::VideoEncoder::Settings&) override {
++    return InitImpl(codec);
++  }
++
++  int32_t RegisterEncodeCompleteCallback(
++      webrtc::EncodedImageCallback* callback) override {
++    callback_ = callback;
++    return WEBRTC_VIDEO_CODEC_OK;
++  }
++
++  int32_t Release() override {
++    callback_ = nullptr;
++    return WEBRTC_VIDEO_CODEC_OK;
++  }
++
++  int32_t Encode(
++      const webrtc::VideoFrame& frame,
++      const std::vector<webrtc::VideoFrameType>* frame_types) override {
++    if (!callback_)
++      return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
++
++    bool keyframe = force_keyframe_;
++    if (frame_types && !frame_types->empty() &&
++        (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey) {
++      keyframe = true;
++    }
++    force_keyframe_ = false;
++
++    // Stub payload. Content/size are irrelevant: the FrameTransformer
++    // overwrites these bytes with queued tunnel data before the
++    // packetiser runs. A non-empty buffer is all the pipeline needs.
++    static const uint8_t kStub[16] = {0};
++    auto buffer = webrtc::EncodedImageBuffer::Create(kStub, sizeof(kStub));
++
++    webrtc::EncodedImage image;
++    image.SetEncodedData(buffer);
++    image.set_size(sizeof(kStub));
++    image.SetFrameType(keyframe ? webrtc::VideoFrameType::kVideoFrameKey
++                                : webrtc::VideoFrameType::kVideoFrameDelta);
++    image._encodedWidth = width_;
++    image._encodedHeight = height_;
++    image.SetRtpTimestamp(frame.rtp_timestamp());
++    image.capture_time_ms_ = frame.render_time_ms();
++    image.qp_ = 0;
++
++    webrtc::CodecSpecificInfo codec_specific;
++    codec_specific.codecType = webrtc::kVideoCodecVP8;
++    // nonReference: each carrier frame is disposable — nothing depends on
++    // it. We carry independent tunnel bytes per frame, so the receiver's
++    // VP8 frame buffer should never hold/await a frame on account of
++    // references. Reduces the dependency-gating latency/drops that
++    // throttle the tunnel (audio has no such machinery).
++    codec_specific.codecSpecific.VP8.nonReference = true;
++    codec_specific.codecSpecific.VP8.temporalIdx = webrtc::kNoTemporalIdx;
++    codec_specific.codecSpecific.VP8.layerSync = false;
++    codec_specific.codecSpecific.VP8.keyIdx = webrtc::kNoKeyIdx;
+ 
++    callback_->OnEncodedImage(image, &codec_specific);
++    return WEBRTC_VIDEO_CODEC_OK;
++  }
++
++  // Never rate-limit: dropping frames here would starve the tunnel.
++  void SetRates(const RateControlParameters&) override {}
++
++  EncoderInfo GetEncoderInfo() const override {
++    EncoderInfo info;
++    info.implementation_name = "PassthroughVP8";
++    info.is_hardware_accelerated = false;
++    info.has_trusted_rate_controller = true;
++    info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
++    return info;
++  }
++
++ private:
++  int InitImpl(const webrtc::VideoCodec* codec) {
++    if (codec) {
++      width_ = codec->width;
++      height_ = codec->height;
++    }
++    force_keyframe_ = true;  // first frame after init must be a keyframe
++    return WEBRTC_VIDEO_CODEC_OK;
++  }
++
++  webrtc::EncodedImageCallback* callback_ = nullptr;
++  int width_ = 0;
++  int height_ = 0;
++  bool force_keyframe_ = true;
++};
++
++// Factory that advertises VP8 and hands back a PassthroughVp8Encoder.
++// Registered ahead of the software template in InternalFactory so VP8
++// resolves to passthrough; H264/H265/VP9/AV1 are unaffected.
++class PassthroughVp8EncoderFactory : public webrtc::VideoEncoderFactory {
++ public:
++  std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
++    return {webrtc::SdpVideoFormat(webrtc::kVp8CodecName)};
++  }
++
++  std::unique_ptr<webrtc::VideoEncoder> Create(
++      const webrtc::Environment&,
++      const webrtc::SdpVideoFormat& /*format*/) override {
++    // Only ever called for VP8: this factory advertises VP8 alone, and
++    // InternalFactory::Create gates on IsSameCodec before reaching here.
++    return std::make_unique<PassthroughVp8Encoder>();
++  }
++};
++
+ using Factory = webrtc::VideoEncoderFactoryTemplate<
+     webrtc::LibvpxVp8EncoderTemplateAdapter,
+ #if defined(WEBRTC_USE_H264)
+@@ -143,14 +282,41 @@
      webrtc::LibvpxVp9EncoderTemplateAdapter>;
  
  VideoEncoderFactory::InternalFactory::InternalFactory() {
@@ -515,9 +669,31 @@ diff -urN a/src/raw_bytes_transformer.rs b/src/raw_bytes_transformer.rs
    factories_.push_back(livekit_ffi::CreateObjCVideoEncoderFactory());
  #endif
  
---- a/src/video_decoder_factory.cpp	2006-07-24 03:21:28
-+++ b/src/video_decoder_factory.cpp	2026-05-24 12:35:29
-@@ -42,7 +42,11 @@
+-#ifdef WEBRTC_ANDROID
++  // Android HW (Java/MediaCodec) video encoder factory disabled: it
++  // routes through JNI and constructs the Java DefaultVideoEncoderFactory
++  // whose ctor wants a live EglBase.Context. The LiveKit Rust SDK runs
++  // libwebrtc headless (no Activity / SurfaceView / EglBase), so that
++  // ctor SIGSEGVs during PeerConnectionFactory creation. We only publish
++  // a fake VP8 carrier track whose encoded output is discarded by the
++  // RawBytesFrameTransformer — quality / HW accel are irrelevant — so the
++  // pure-C++ software libvpx VP8 encoder from the template factory below
++  // is sufficient and has no JNI/EGL dependency. Forcing software VP8
++  // this way is what lets the video carrier work on Android at all.
++#if 0  // was: #ifdef WEBRTC_ANDROID
+   factories_.push_back(CreateAndroidVideoEncoderFactory());
+ #endif
+ 
++  // VP8 → passthrough (no real encode). Pushed first so it wins the
++  // VP8 lookup in InternalFactory::Create over the software template.
++  factories_.push_back(std::make_unique<PassthroughVp8EncoderFactory>());
++
+   const PreferredHwEncoderConfig preferred_hw_encoder =
+       GetPreferredHwEncoderConfig();
+   if (preferred_hw_encoder.encoder == PreferredHwEncoder::kVaapi) {
+--- a/src/video_decoder_factory.cpp
++++ b/src/video_decoder_factory.cpp
+@@ -42,11 +42,21 @@
  namespace livekit_ffi {
  
  VideoDecoderFactory::VideoDecoderFactory() {
@@ -528,5 +704,16 @@ diff -urN a/src/raw_bytes_transformer.rs b/src/raw_bytes_transformer.rs
 +  // are sufficient for PeerConnectionFactory construction.
 +#if 0  // was: #ifdef __APPLE__
    factories_.push_back(livekit_ffi::CreateObjCVideoDecoderFactory());
+ #endif
+ 
+-#ifdef WEBRTC_ANDROID
++  // Android HW (Java/MediaCodec) video decoder factory disabled — same
++  // JNI/EglBase.Context headless-crash rationale as the encoder factory
++  // in `video_encoder_factory.cpp`. The receive-side RawBytesFrameTransformer
++  // drops each frame before the decoder runs, so software VP8 decode (or
++  // none) is harmless; what matters is not invoking the Java factory at
++  // PeerConnectionFactory construction.
++#if 0  // was: #ifdef WEBRTC_ANDROID
+   factories_.push_back(CreateAndroidVideoDecoderFactory());
  #endif
  

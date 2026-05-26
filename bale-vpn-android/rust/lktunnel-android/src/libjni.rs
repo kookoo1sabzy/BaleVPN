@@ -284,6 +284,14 @@ pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeIsConnected<'l>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeIsQuicConnected<'l>(
+    _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong,
+) -> jboolean {
+    let up = with_tunnel(handle, |t| t.is_quic_connected()).unwrap_or(false);
+    if up { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_ai_bale_proxy_LkTunnelNative_nativeStartServer<'l>(
     _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong,
 ) {

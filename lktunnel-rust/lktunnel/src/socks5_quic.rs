@@ -202,23 +202,31 @@ pub(crate) async fn enable_listener(
             match listener.accept().await {
                 Ok((tcp, peer)) => {
                     log::debug!("socks5: accepted {peer}");
-                    // Snapshot the current connection — may be a
-                    // freshly-reconnected one if the keeper rotated.
-                    let conn = {
-                        let Some(inner) = weak_inner.upgrade() else { break };
-                        let client = inner.quic_client.lock().clone();
-                        client.map(|c| c.connection.clone())
-                    };
-                    let Some(conn) = conn else {
-                        // QUIC isn't up yet (initial dial pending or
-                        // keeper is reconnecting). The polite thing is
-                        // to refuse with a SOCKS5 error so the client
-                        // sees a clean failure instead of a hang.
-                        log::warn!("socks5: no QUIC connection — refusing accept");
-                        drop(tcp);
-                        continue;
-                    };
+                    // Handle each connection in its own task so the accept
+                    // loop stays responsive. The task snapshots the current
+                    // QUIC connection (which may be a freshly-reconnected one
+                    // if the keeper rotated). If QUIC isn't up yet — enable
+                    // binds the listener before the background handshake
+                    // finishes, or the keeper is mid-reconnect — wait briefly
+                    // rather than refusing, so a client connecting right after
+                    // enable doesn't get a spurious failure.
+                    let weak = weak_inner.clone();
                     crate::runtime().spawn(async move {
+                        let mut conn = None;
+                        for _ in 0..100 {  // up to ~10s (100 × 100 ms)
+                            let Some(inner) = weak.upgrade() else { return };
+                            if let Some(c) = inner.quic_client.lock().clone() {
+                                conn = Some(c.connection.clone());
+                                break;
+                            }
+                            drop(inner);
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        let Some(conn) = conn else {
+                            log::warn!("socks5: no QUIC connection after wait — refusing {peer}");
+                            drop(tcp);
+                            return;
+                        };
                         if let Err(e) = pump_socks5_conn(tcp, conn).await {
                             log::debug!("socks5: per-conn ended: {e}");
                         }

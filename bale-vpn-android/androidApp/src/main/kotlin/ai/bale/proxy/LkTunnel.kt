@@ -180,6 +180,15 @@ class LkTunnel : DataTransport, AutoCloseable {
         return LkTunnelNative.nativeEnableSocks5(h, port)
     }
 
+    /** True once the persistent QUIC client to the peer is up. The
+     *  SOCKS5 listener binds before this completes (enable is async), so
+     *  the UI gates the displayed proxy address on this — a bound
+     *  listener with no QUIC can't actually reach the peer yet. */
+    fun isQuicConnected(): Boolean {
+        val h = handle; if (h == 0L) return false
+        return LkTunnelNative.nativeIsQuicConnected(h)
+    }
+
     /** Idempotent — aborts the SOCKS5 accept loop. The persistent
      *  QUIC client connection stays up so re-enabling SOCKS5 later
      *  is instantaneous (no fresh handshake). The QUIC client is
@@ -355,6 +364,7 @@ internal object LkTunnelNative {
     ): Long
 
     @JvmStatic external fun nativeIsConnected(handle: Long): Boolean
+    @JvmStatic external fun nativeIsQuicConnected(handle: Long): Boolean
     @JvmStatic external fun nativeStartServer(handle: Long)
     /** Construct a server-role tunnel (vs `nativeConnect`'s
      *  client default). The role is fixed at construction; the

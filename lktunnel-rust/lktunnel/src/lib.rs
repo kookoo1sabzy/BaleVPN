@@ -686,6 +686,15 @@ impl LkTunnel {
         self.inner.connected.load(Ordering::Relaxed)
     }
 
+    /// `true` once the persistent QUIC client to the peer is up. The UI
+    /// uses this to show the SOCKS5 proxy address only when it's actually
+    /// usable: `enable_socks5_server` binds the listener before the
+    /// background QUIC handshake completes, so a bound listener alone
+    /// doesn't mean LAN clients can reach the peer yet.
+    pub fn is_quic_connected(&self) -> bool {
+        self.inner.quic_client.lock().is_some()
+    }
+
     /// Per-tunnel diagnostic id, monotonically assigned at connect.
     pub fn id(&self) -> u64 { self.inner.id }
 
@@ -998,7 +1007,14 @@ impl LkTunnel {
         if self.inner.socks5_handle.lock().is_some() {
             return Err(socks5_quic::Socks5Error::AlreadyEnabled);
         }
-        self.ensure_quic_client().await?;
+        // Bind the listener first; do NOT block on the QUIC handshake.
+        // `ensure_quic_client` retries until the peer's acceptor is up
+        // (can take seconds), and awaiting it here made this call block —
+        // which on the Android client gated VPN bring-up behind QUIC. The
+        // accept loop already refuses connections cleanly while QUIC isn't
+        // up yet (see `enable_listener`), and the keeper / client-role
+        // auto-warm brings it online in the background, so binding ahead
+        // of QUIC is safe.
         let handle = socks5_quic::enable_listener(self.clone(), port).await?;
         let addr = handle.local_addr;
         {
@@ -1009,6 +1025,14 @@ impl LkTunnel {
             }
             *slot = Some(handle);
         }
+        // Warm QUIC in the background. Idempotent — the client-role
+        // auto-warm on peer-joined may already have it in flight.
+        let this = self.clone();
+        runtime().spawn(async move {
+            if let Err(e) = this.ensure_quic_client().await {
+                log::warn!("SOCKS5: background QUIC warm failed: {e}");
+            }
+        });
         log::info!("SOCKS5: enabled at {addr}");
         Ok(addr)
     }

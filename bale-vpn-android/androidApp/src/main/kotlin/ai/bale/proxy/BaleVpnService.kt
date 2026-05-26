@@ -121,9 +121,10 @@ class BaleVpnService : VpnService() {
 
         /** Enable the LAN-facing SOCKS5 listener on the live VPN tunnel.
          *  Returns the bound port (matches `port` unless `0` was passed
-         *  for OS-assign), or `0` on failure / no live tunnel. Blocks
-         *  briefly on the QUIC handshake — callers should run from a
-         *  worker thread. */
+         *  for OS-assign), or `0` on failure / no live tunnel. Returns as
+         *  soon as the listener binds; the QUIC handshake to the peer
+         *  warms in the background, so a non-zero return does NOT mean the
+         *  proxy is usable yet — gate on [`quicConnected`]. */
         @JvmStatic
         fun enableSocks5(port: Int): Int {
             val t = liveTransport ?: return 0
@@ -131,6 +132,12 @@ class BaleVpnService : VpnService() {
             socks5Port = bound
             return bound
         }
+
+        /** True once the QUIC client to the peer is up — i.e. the SOCKS5
+         *  proxy can actually carry traffic. The UI shows the proxy
+         *  address only when this is true. */
+        @JvmStatic
+        fun quicConnected(): Boolean = liveTransport?.isQuicConnected() ?: false
 
         /** Tear down the SOCKS5 listener. Idempotent. */
         @JvmStatic
@@ -344,6 +351,9 @@ class BaleVpnService : VpnService() {
             // retries with backoff for up to 30s so this call
             // succeeds even when the server side comes up slightly
             // after we do.
+            // SOCKS5 enable returns as soon as the listener binds — the
+            // QUIC handshake is warmed in the background on the Rust side
+            // (enable_socks5_server), so this no longer blocks VPN bring-up.
             if (socks5Enabled) {
                 Log.d(TAG, "VPN: enabling SOCKS5 on port $socks5PortPref")
                 val bound = transport.enableSocks5Server(socks5PortPref)
