@@ -18,6 +18,10 @@ mod client;
 mod config;
 mod daemon;
 mod server;
+// Kernel-TUN device open/configure — Unix-only (uses `std::os::fd::RawFd`
+// + TUNSETIFF/utun ioctls). Windows server/client run userspace NAT and
+// never touch a kernel TUN, so the module isn't compiled there.
+#[cfg(unix)]
 mod tun;
 mod ui;
 

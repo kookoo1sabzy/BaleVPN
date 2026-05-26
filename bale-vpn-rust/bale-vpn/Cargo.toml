@@ -35,11 +35,6 @@ tokio = { version = "1", features = [
 parking_lot = "0.12"
 async-trait = "0.1"
 
-# libc — TUNSETIFF / SIOCSIFADDR ioctls for the Linux kernel-TUN
-# path. Unix-only; the userspace-NAT path doesn't need it.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # CLI parsing.
 clap = { version = "4", features = ["derive"] }
 
@@ -70,3 +65,15 @@ tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 tao        = { version = "0.30", optional = true }
 wry        = { version = "0.45", optional = true }
 muda       = { version = "0.13", optional = true }
+
+# libc — TUNSETIFF / SIOCSIF* ioctls for the Linux/macOS kernel-TUN
+# path. Unix-only; the userspace-NAT path (and Windows) don't need it.
+#
+# MUST stay at the END of this file: a `[target.…]` table header
+# terminates the plain `[dependencies]` table, so any cross-platform
+# dependency listed *after* it silently becomes Unix-only. That is
+# exactly the bug this placement fixes — when this block sat mid-list,
+# clap / serde / axum / … all became cfg(unix) and the Windows build
+# failed with "unresolved import `clap`".
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

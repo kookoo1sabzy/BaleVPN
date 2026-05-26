@@ -102,9 +102,16 @@ jobs:
       # bale-vpn-rust — the single Rust binary replacing the
       # deleted Node app. Builds for host, exercises the HTTP
       # UI + axum routes + signaling wiring at compile time.
-      - name: cargo build (bale-vpn-rust)
+      #
+      # Headless (`--no-default-features`): this fast job doesn't install
+      # the GUI deps (libsoup-3.0 / webkit2gtk that `wry` needs via the
+      # default `gui` feature), and shouldn't — the windowed build is
+      # covered by bale-vpn-rust.yml, which does install them. Building
+      # the headless binary here keeps the compile-time coverage (axum /
+      # signaling / NAT wiring) without dragging webkit into the test job.
+      - name: cargo build (bale-vpn-rust, headless)
         working-directory: bale-vpn-rust
-        run: cargo build --workspace --release
+        run: cargo build -p bale-vpn --release --no-default-features
 
       # ── Signaling stack ──────────────────────────────────────
       #

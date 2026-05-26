@@ -328,18 +328,24 @@ async fn run_server(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
 
     let nat_mode = state.cfg.read().await.nat_mode.clone();
     if nat_mode == "kernel" {
-        // Pre-flight: open + drop a TUN once so privilege failures
-        // surface at daemon-start, not at first-call time.
-        // `bale_pf<K>` uses an out-of-pool slot index so the
-        // probe can't race a real session's slot allocation.
-        let probe_name = format!("bale_pf{KERNEL_TUN_SLOT_LIMIT}");
-        let probe_addr = format!("10.8.{}.1", KERNEL_TUN_SLOT_LIMIT);
-        match crate::tun::open_server_tun(&probe_name, &probe_addr, 24, 1400) {
-            Ok(_) => log::info!("server: kernel TUN privilege check OK"),
-            Err(e) => return Err(format!(
-                "server: kernel TUN open failed ({e}) — re-run with --nat-mode userspace, \
-                 or `setcap cap_net_admin+eip $(which bale-vpn)` (Linux) / run as root (macOS) first"
-            ).into()),
+        // Kernel TUN is Unix-only; Windows has no device we ship.
+        #[cfg(not(unix))]
+        return Err("server: kernel NAT mode is Unix-only — re-run with --nat-mode userspace".into());
+        #[cfg(unix)]
+        {
+            // Pre-flight: open + drop a TUN once so privilege failures
+            // surface at daemon-start, not at first-call time.
+            // `bale_pf<K>` uses an out-of-pool slot index so the
+            // probe can't race a real session's slot allocation.
+            let probe_name = format!("bale_pf{KERNEL_TUN_SLOT_LIMIT}");
+            let probe_addr = format!("10.8.{}.1", KERNEL_TUN_SLOT_LIMIT);
+            match crate::tun::open_server_tun(&probe_name, &probe_addr, 24, 1400) {
+                Ok(_) => log::info!("server: kernel TUN privilege check OK"),
+                Err(e) => return Err(format!(
+                    "server: kernel TUN open failed ({e}) — re-run with --nat-mode userspace, \
+                     or `setcap cap_net_admin+eip $(which bale-vpn)` (Linux) / run as root (macOS) first"
+                ).into()),
+            }
         }
     } else if nat_mode != "userspace" {
         return Err(format!("unknown --nat-mode: {nat_mode}").into());
@@ -401,6 +407,13 @@ async fn run_server(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
             // once a slot frees).
             let mut slot_used: Option<u8> = None;
             let nat_ok = if nat_mode == "kernel" {
+                // Kernel TUN is Unix-only. On non-Unix this arm is
+                // unreachable (config preflight rejects kernel mode), but
+                // it must still compile — fall back to userspace NAT.
+                #[cfg(not(unix))]
+                { let _ = &slots; tunnel.start_server().is_ok() }
+                #[cfg(unix)]
+                {
                 match slots.alloc_kernel_slot() {
                     Some(k) => {
                         let name = format!("bale{k}");
@@ -437,6 +450,7 @@ async fn run_server(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
                                     fallback userspace NAT for {peer_id}");
                         tunnel.start_server().is_ok()
                     }
+                }
                 }
             } else {
                 match tunnel.start_server() {
@@ -598,6 +612,9 @@ async fn run_client(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
     // the tunnel directly (full system VPN). The caller is
     // expected to set up routing (`ip route add default dev
     // bale-c0`) — we don't touch the routing table from here.
+    // Kernel-TUN client attach is Unix-only; on Windows the host VPN
+    // path isn't available (userspace NAT / SOCKS5 only).
+    #[cfg(unix)]
     if client_tun {
         match crate::tun::open_client_tun("bale-c0", "10.8.0.2", 24, 1400) {
             Ok(dev) => {
@@ -614,6 +631,10 @@ async fn run_client(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
                 "client: --client-tun set but TUN open failed ({e}); SOCKS5 still up"
             ),
         }
+    }
+    #[cfg(not(unix))]
+    if client_tun {
+        log::warn!("client: --client-tun is Unix-only; ignoring on this OS (SOCKS5 still up)");
     }
 
     // Publish to ClientState so the HTTP UI can show status +
