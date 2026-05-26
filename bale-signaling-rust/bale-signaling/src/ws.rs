@@ -936,6 +936,7 @@ impl WsClient {
         let alive = slot.is_some();
         match (want, alive) {
             (true, false) => {
+                log::info!("WS: rule satisfied — bringing connection up");
                 let token = self.access_token.lock().clone().unwrap_or_default();
                 self.running.store(true, Ordering::Relaxed);
                 let me = self.clone();
@@ -943,6 +944,14 @@ impl WsClient {
                 *slot = Some(handle);
             }
             (false, true) => {
+                log::info!(
+                    "WS: rule no longer satisfied — tearing connection down \
+                     (call_active={} foreground={} server_active={} user_disconnect={})",
+                    self.call_active.load(Ordering::Relaxed),
+                    self.foreground.load(Ordering::Relaxed),
+                    self.server_active.load(Ordering::Relaxed),
+                    self.user_disconnect.load(Ordering::Relaxed),
+                );
                 self.running.store(false, Ordering::Relaxed);
                 self.ready.store(false, Ordering::Relaxed);
                 if let Some(h) = slot.take() { h.abort(); }
@@ -1458,6 +1467,14 @@ async fn attempt_session(ws: &Arc<WsClient>, token: &str) -> SessionOutcome {
         })
     };
 
+    // Abort the writer / liveness / set_online tasks when this
+    // function's future is dropped — covers the run-loop *abort* the
+    // rule engine uses to pause the WS for a call (the tail cleanup
+    // only runs on a normal reader-loop exit). Without it the writer
+    // (WS sink) and liveness (pinger) outlive the abort and keep the
+    // socket connected.
+    let _guards = [AbortOnDrop(writer), AbortOnDrop(liveness), AbortOnDrop(set_online)];
+
     // Reader inline. Returns once the WS closes or hits a
     // terminal condition (version mismatch, 4401 close, zombie
     // shutdown).
@@ -1609,10 +1626,20 @@ async fn attempt_session(ws: &Arc<WsClient>, token: &str) -> SessionOutcome {
         }
     }
 
-    writer.abort();
-    liveness.abort();
-    set_online.abort();
     outcome
+}
+
+/// Aborts the wrapped task when dropped. The per-connection child
+/// tasks (writer / liveness / set_online) must die when
+/// `attempt_session`'s future is dropped — including when the rule
+/// engine *aborts* the run loop to pause the WS for a call. A plain
+/// `JoinHandle` drop only detaches, so without this guard that abort
+/// orphans the writer (which owns the WS sink) and the liveness task
+/// (which keeps pinging), leaving the socket connected while the UI
+/// shows the WS paused.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 /// Wall-clock ms since the Unix epoch. Returns 0 on the
