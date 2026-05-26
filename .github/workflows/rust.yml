@@ -26,7 +26,9 @@ jobs:
         # cfg(unix) gating regressions in lktunnel's TUN / NAT code —
         # the prebuilt webrtc-sys for Windows is well-supported, but
         # our own crate has Unix-only paths that need to stay gated.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macos-latest is Apple Silicon (arm64); macos-26-intel covers
+        # the x86_64 mac-x64 webrtc-sys path that ships in releases.
+        os: [ubuntu-latest, macos-latest, macos-26-intel, windows-latest]
     runs-on: ${{ matrix.os }}
     # `apply.sh` is bash; PowerShell (Windows-latest's default) can't
     # parse it. git-bash is preinstalled on Windows runners — use it
@@ -50,6 +52,22 @@ jobs:
             libglib2.0-dev libgtk-3-dev \
             libpulse-dev libasound2-dev \
             libdbus-1-dev libudev-dev
+
+      # macos-26-intel (and other newer slimmed runner images) don't ship
+      # rustup, which dtolnay/rust-toolchain assumes is preinstalled — so
+      # the next step can't put cargo on PATH ("cargo: command not found").
+      # Install rustup if missing and add ~/.cargo/bin to PATH. No-op on
+      # images that already have it.
+      - name: Ensure rustup + stable toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Make cargo usable in THIS step too (sanity-check the install).
+          "$HOME/.cargo/bin/cargo" --version || true
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable

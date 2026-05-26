@@ -39,6 +39,20 @@ jobs:
           - os:           macos-latest
             artifact_os:  macos-aarch64
             bin_ext:      ''
+          # macos-latest is Apple Silicon (arm64). macos-26-intel is the
+          # Intel (x86_64) runner — build natively there so the release
+          # ships a macOS Intel binary too. webrtc-sys downloads the
+          # matching mac-x64 libwebrtc on this runner; no cross-compile.
+          #
+          # This restores the macOS Intel binary dropped (unintentionally)
+          # in 8336ed4 "QUIC integration", when the Node-app's
+          # node-binaries.yml — which built it via this same macos-26-intel
+          # runner — was replaced by bale-vpn-rust.yml. Last shipped in
+          # v1.3.2. Runner label matches ab6397f "Use a new OSX 64x builder"
+          # (the project moved off macos-13 deliberately).
+          - os:           macos-26-intel
+            artifact_os:  macos-x86_64
+            bin_ext:      ''
           - os:           windows-latest
             artifact_os:  windows-x86_64
             bin_ext:      '.exe'
@@ -65,6 +79,22 @@ jobs:
             libdbus-1-dev libudev-dev \
             libsoup-3.0-dev libwebkit2gtk-4.1-dev
 
+      # macos-26-intel (and other newer slimmed runner images) don't ship
+      # rustup, which dtolnay/rust-toolchain assumes is preinstalled — so
+      # the next step can't put cargo on PATH and the build fails with
+      # "cargo: command not found". Install rustup if missing and add
+      # ~/.cargo/bin to PATH. No-op on images that already have it.
+      - name: Ensure rustup + stable toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Make cargo usable in THIS step too (sanity-check the install).
+          "$HOME/.cargo/bin/cargo" --version || true
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -78,9 +108,13 @@ jobs:
             lktunnel-rust/patches/.cache
             lktunnel-rust/target
             bale-vpn-rust/target
-          key: bale-vpn-rust-${{ runner.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'lktunnel-rust/patches/*.patch', 'bale-vpn-rust/Cargo.toml') }}
+          # Key on artifact_os, not runner.os: macos-latest (arm64) and
+          # macos-26-intel (x86_64) both report runner.os == "macOS", so a
+          # shared key would let the Intel runner restore the arm64
+          # runner's ~/.cargo/bin + target (wrong-arch toolchain/objects).
+          key: bale-vpn-rust-${{ matrix.artifact_os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'lktunnel-rust/patches/*.patch', 'bale-vpn-rust/Cargo.toml') }}
           restore-keys: |
-            bale-vpn-rust-${{ runner.os }}-
+            bale-vpn-rust-${{ matrix.artifact_os }}-
 
       - name: Apply vendor crate patches
         working-directory: lktunnel-rust
