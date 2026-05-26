@@ -24,6 +24,7 @@ pub mod dispatcher;
 pub mod errors;
 pub mod ipv6;
 pub mod nat;
+pub mod rtc;
 pub mod rtp;
 pub(crate) mod quic_tunnel;
 pub mod server;
@@ -34,8 +35,7 @@ pub mod socks5_quic;
 #[cfg(unix)]
 pub mod tun;
 
-use livekit::prelude::*;
-use livekit::{Room, RoomOptions};
+use crate::rtc::{Engine, EngineEvent};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -219,9 +219,9 @@ struct TunnelInner {
     id:          u64,
     /// rx/tx byte/packet totals — exposed via [`LkTunnel::stats`].
     counters:    Arc<counters::Counters>,
-    /// Set by the connect task once `Room::connect` resolves; `None`
+    /// Set by the connect task once [`Engine::connect`] resolves; `None`
     /// in the brief window before that and after teardown takes it.
-    room:        Mutex<Option<Arc<Room>>>,
+    engine:      Mutex<Option<Arc<Engine>>>,
     /// Lifecycle state. Sender lives in the connect task; subscribers
     /// (e.g. [`LkTunnel::await_connected`]) borrow_and_update to wait.
     state_tx:    tokio::sync::watch::Sender<TunnelState>,
@@ -256,18 +256,15 @@ struct TunnelInner {
     /// Total inbound packets dropped at `INBOUND_QUEUE_CAP`. Surfaced
     /// in logs on power-of-two boundaries.
     inbound_drops: AtomicU64,
-    /// Outgoing RTP transport handles — one per parallel carrier track
-    /// (see [`rtp::TRACK_COUNT`]). Set once `Room::connect` succeeds and
-    /// the local audio tracks have been published. Owned here so each
-    /// track's dummy-frame producer task stays alive for the tunnel's
-    /// lifetime; dropped on teardown. The send loop stripes outbound
-    /// frames round-robin across them.
-    rtp_senders: Mutex<Vec<Arc<rtp::RtpSender>>>,
-    /// Incoming RTP transport handles, one per remote video track we've
-    /// subscribed to. Kept alive while their RtpReceivers are valid;
-    /// libwebrtc's scoped_refptr inside the transformer pins the C++
-    /// side until the track unpublishes.
-    rtp_receivers: Mutex<Vec<rtp::RtpReceiver>>,
+    /// Outgoing carrier senders — one per parallel track (see
+    /// [`rtp::TRACK_COUNT`]). Set once [`Engine::connect`] succeeds and the
+    /// local Opus carrier tracks have been published. Owned here so each
+    /// track's writer task stays alive for the tunnel's lifetime; dropped
+    /// on teardown. The send loop stripes outbound frames round-robin
+    /// across them. (Receive is owned by the [`Engine`] internally —
+    /// `on_track` → `read_rtp` → `on_packet` — so there's no receiver
+    /// handle to keep alive here.)
+    rtp_senders: Mutex<Vec<Arc<rtc::RtpSender>>>,
     /// Optional caller-supplied IP packet handler. When set, it takes
     /// precedence over NAT / TUN routing in `inject_inbound_ip`. Used
     /// by shim layers that want to do their own packet routing (e.g.
@@ -365,7 +362,7 @@ fn build_loopback_inner(role: TunnelRole) -> (Arc<TunnelInner>, tokio::sync::mps
     let inner = Arc::new(TunnelInner {
         id,
         counters:      Arc::new(counters::Counters::new()),
-        room:          Mutex::new(None),
+        engine:        Mutex::new(None),
         state_tx,
         task:          Mutex::new(None),
         sender_task:   Mutex::new(None),
@@ -378,7 +375,6 @@ fn build_loopback_inner(role: TunnelRole) -> (Arc<TunnelInner>, tokio::sync::mps
         inbound:       Mutex::new(VecDeque::with_capacity(INBOUND_QUEUE_CAP)),
         inbound_drops: AtomicU64::new(0),
         rtp_senders:   Mutex::new(Vec::new()),
-        rtp_receivers: Mutex::new(Vec::new()),
         on_ip_override: Mutex::new(None),
         quic_rx_tx:    Mutex::new(None),
         quic_client:   Mutex::new(None),
@@ -501,7 +497,7 @@ impl LkTunnel {
         let inner = Arc::new(TunnelInner {
             id,
             counters:      Arc::new(counters::Counters::new()),
-            room:          Mutex::new(None),
+            engine:        Mutex::new(None),
             state_tx,
             task:          Mutex::new(None),
             sender_task:   Mutex::new(None),
@@ -514,7 +510,6 @@ impl LkTunnel {
             inbound:       Mutex::new(VecDeque::with_capacity(INBOUND_QUEUE_CAP)),
             inbound_drops: AtomicU64::new(0),
             rtp_senders:   Mutex::new(Vec::new()),
-            rtp_receivers: Mutex::new(Vec::new()),
             on_ip_override: Mutex::new(None),
             quic_rx_tx:    Mutex::new(None),
             quic_client:   Mutex::new(None),
@@ -1248,13 +1243,10 @@ impl TunnelInner {
         // unstick instead of waiting forever.
         let drained: Vec<_> = self.drain_waiters.lock().drain(..).collect();
         for w in drained { w(); }
-        // Close the room if it was dialled.
-        if let Some(room) = self.room.lock().take() {
-            runtime().spawn(async move {
-                if let Err(e) = room.close().await {
-                    log::warn!("LkTunnel: room.close failed: {e}");
-                }
-            });
+        // Close the engine (signal WS + both PeerConnections) if it was
+        // brought up.
+        if let Some(engine) = self.engine.lock().take() {
+            runtime().spawn(async move { engine.close().await; });
         }
     }
 }
@@ -1281,65 +1273,52 @@ async fn run_connect_task(
     on_ip:     Arc<dyn Fn(&[u8]) + Send + Sync>,
     on_event:  Arc<dyn Fn(Event) + Send + Sync>,
 ) {
-    log::info!("LkTunnel[{id}]::connect: dialing {url} token={token}");
-    // Default ICE policy — let libwebrtc pick the best candidate pair
-    // (host / srflx / relay in priority order). We previously forced
-    // Relay-only when investigating an SCTP-over-DTLS DPI-fingerprint
-    // theory, but the SFU's advertised TURN didn't establish; now
-    // that tunnel traffic rides RTP-over-SRTP instead of SCTP, the
-    // fingerprint concern is moot.
-    let room_options = RoomOptions::default();
-    // Phase 1: dial.
-    let (room, rx) = match Room::connect(&url, &token, room_options).await {
+    log::info!("LkTunnel[{id}]::connect: dialing {url}");
+
+    // Receive-side dispatch: the engine unpacks each carrier frame and
+    // calls this once per length-prefixed packet. The leading frame-type
+    // byte routes it — 'I' → `on_ip` (NAT/TUN), 'Q' → the QUIC channel if
+    // one is up (set by `enable_quic_*`). `on_quic` is built here (not in
+    // a per-track attach) because the engine owns the single receive path.
+    let quic_weak = std::sync::Weak::clone(&weak);
+    let on_quic: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
+        let Some(inner) = quic_weak.upgrade() else { return };
+        inner.counters.bump_rx(bytes.len());
+        let tx = inner.quic_rx_tx.lock().clone();
+        if let Some(tx) = tx {
+            // Best-effort: a full receiver queue means quinn isn't
+            // draining fast enough → drop, same as a UDP buffer overflow.
+            let _ = tx.try_send(bytes::Bytes::copy_from_slice(bytes));
+        }
+    });
+    let on_packet: Arc<dyn Fn(&[u8]) + Send + Sync> = {
+        let on_ip = Arc::clone(&on_ip);
+        Arc::new(move |payload: &[u8]| dispatch_payload(payload, &on_ip, &on_quic))
+    };
+
+    // Phase 1: join the SFU, bring up both PeerConnections, publish the
+    // carrier track(s). `Engine::connect` does the LiveKit two-PC
+    // handshake on webrtc-rs and returns the publish-side senders.
+    let (engine, senders, event_rx) = match Engine::connect(id, &url, &token, on_packet).await {
         Ok(x) => x,
         Err(e) => {
-            let msg = e.to_string();
-            log::warn!("LkTunnel[{id}]: Room::connect failed: {msg}");
+            log::warn!("LkTunnel[{id}]: Engine::connect failed: {e}");
             if let Some(inner) = weak.upgrade() {
-                let _ = inner.state_tx.send(TunnelState::Failed(msg.clone()));
+                let _ = inner.state_tx.send(TunnelState::Failed(e.clone()));
             }
-            emit_event(&on_event, EventKind::Error, msg);
+            emit_event(&on_event, EventKind::Error, e);
             emit_event(&on_event, EventKind::Disconnected, "connect failed".into());
             return;
         }
     };
-    let room = Arc::new(room);
 
-    // Phase 2: stow the room on `inner` and spawn the sender task.
-    // If the user dropped all handles during dial, weak.upgrade fails
-    // — close the room we just opened and bail.
+    // Phase 2: stow the engine on `inner` and spawn the sender task. If
+    // the user dropped all handles during the handshake, close and bail.
     let Some(inner) = weak.upgrade() else {
-        let _ = room.close().await;
+        engine.close().await;
         return;
     };
-    inner.room.lock().replace(Arc::clone(&room));
-
-    // Publish our outgoing audio carrier tracks and install the
-    // byte-substitution FrameTransformer on each one's RtpSender. This
-    // is the actual tunnel transport — see rtp.rs for the why (SCTP DPI
-    // fingerprint avoidance). We publish TRACK_COUNT parallel tracks and
-    // stripe outbound frames across them to exceed Opus's per-track
-    // 510 kbps ceiling.
-    let mut senders: Vec<Arc<rtp::RtpSender>> = Vec::with_capacity(rtp::TRACK_COUNT);
-    for index in 0..rtp::TRACK_COUNT {
-        let published = if rtp::USE_VIDEO_CARRIER {
-            rtp::publish_video(&room).await
-        } else {
-            rtp::publish(&room, index).await
-        };
-        match published {
-            Ok(s) => senders.push(Arc::new(s)),
-            Err(e) => {
-                log::warn!("LkTunnel[{id}]: rtp::publish track {index} failed: {e}");
-                if let Some(inner) = weak.upgrade() {
-                    let _ = inner.state_tx.send(TunnelState::Failed(e.clone()));
-                }
-                emit_event(&on_event, EventKind::Error, e);
-                let _ = room.close().await;
-                return;
-            }
-        }
-    }
+    inner.engine.lock().replace(Arc::clone(&engine));
     *inner.rtp_senders.lock() = senders.clone();
 
     let weak_for_sender = std::sync::Weak::clone(&weak);
@@ -1383,7 +1362,7 @@ async fn run_connect_task(
             sent:  &mut u64,
             cumulative_waits: &mut u64,
             packets: u64,
-            senders: &[Arc<rtp::RtpSender>],
+            senders: &[Arc<rtc::RtpSender>],
             next:  &mut usize,
         ) {
             if batch.is_empty() || senders.is_empty() { return; }
@@ -1479,84 +1458,58 @@ async fn run_connect_task(
 
     // Phase 3: run the event loop. Updates state_tx on Connected /
     // Disconnected. Drops `connected` flag at exit.
-    run_tunnel_loop(weak, connected, room, rx, on_ip, on_event).await;
+    run_tunnel_loop(weak, connected, engine, event_rx, on_event).await;
 }
 
 async fn run_tunnel_loop(
     weak:      std::sync::Weak<TunnelInner>,
     connected: Arc<AtomicBool>,
-    room:      Arc<Room>,
-    mut rx:    tokio::sync::mpsc::UnboundedReceiver<RoomEvent>,
-    on_ip:     Arc<dyn Fn(&[u8]) + Send + Sync>,
+    engine:    Arc<Engine>,
+    mut rx:    tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
     on_event:  Arc<dyn Fn(Event) + Send + Sync>,
 ) {
-    // Seed-from-roster for late joiners — LK only fires
-    // ParticipantConnected for participants joining AFTER our connect
-    // returns, so a server accepting into an already-populated room
-    // misses everyone.
+    // Peer-wait. The engine seeds its roster from the JoinResponse and
+    // emits a `PeerJoined` for every already-present participant, so an
+    // already-populated room satisfies this immediately (the events are
+    // buffered on the unbounded channel); otherwise we wait up to
+    // PEER_WAIT_MS for the first join.
     let mut peer_count: u32 = 0;
-    for (_, p) in room.remote_participants().iter() {
-        peer_count += 1;
-        emit_event(&on_event, EventKind::PeerJoined, p.identity().as_str().to_string());
-    }
-
-    // Pre-Connected wait if needed.
-    if peer_count == 0 {
-        log::info!("LkTunnel: waiting up to {}s for first peer", PEER_WAIT_MS / 1000);
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(PEER_WAIT_MS);
-        let joined = loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Err(_)        => break false,
-                Ok(None)      => break false,
-                Ok(Some(ev))  => match ev {
-                    RoomEvent::ParticipantConnected(p) => {
-                        peer_count = 1;
-                        emit_event(&on_event, EventKind::PeerJoined,
-                            p.identity().as_str().to_string());
-                        break true;
+    log::info!("LkTunnel: waiting up to {}s for first peer", PEER_WAIT_MS / 1000);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(PEER_WAIT_MS);
+    let joined = loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Err(_)        => break false,
+            Ok(None)      => break false,
+            Ok(Some(ev))  => match ev {
+                EngineEvent::PeerJoined(id) => {
+                    peer_count += 1;
+                    emit_event(&on_event, EventKind::PeerJoined, id);
+                    break true;
+                }
+                EngineEvent::PeerLeft(id) => {
+                    emit_event(&on_event, EventKind::PeerLeft, id);
+                }
+                EngineEvent::Disconnected(msg) => {
+                    log::info!("LkTunnel: disconnected during peer-wait — {msg}");
+                    if let Some(inner) = weak.upgrade() {
+                        let _ = inner.state_tx.send(TunnelState::Failed(msg.clone()));
                     }
-                    RoomEvent::TrackSubscribed { track, .. } => {
-                        attach_rtp_receiver(&weak, track, &on_ip);
-                    }
-                    RoomEvent::Disconnected { reason } => {
-                        let msg = format!("{reason:?}");
-                        log::info!("LkTunnel: disconnected during peer-wait — reason={msg}");
-                        if let Some(inner) = weak.upgrade() {
-                            let _ = inner.state_tx.send(TunnelState::Failed(msg.clone()));
-                        }
-                        emit_event(&on_event, EventKind::Disconnected, msg);
-                        return;
-                    }
-                    // Same policy as the main loop: don't ride out the
-                    // SDK's reconnect. Close + bail so the caller fails
-                    // fast instead of stalling out the storm.
-                    RoomEvent::Reconnecting => {
-                        log::info!("LkTunnel: reconnecting during peer-wait — closing");
-                        let r = Arc::clone(&room);
-                        tokio::spawn(async move { r.close().await.ok(); });
-                        let msg = "reconnecting during peer-wait";
-                        if let Some(inner) = weak.upgrade() {
-                            let _ = inner.state_tx.send(TunnelState::Failed(msg.into()));
-                        }
-                        emit_event(&on_event, EventKind::Disconnected, msg.into());
-                        return;
-                    }
-                    _ => {}
+                    emit_event(&on_event, EventKind::Disconnected, msg);
+                    return;
                 }
             }
-        };
-        if !joined {
-            log::warn!("LkTunnel: no peer joined within {}s — closing room",
-                PEER_WAIT_MS / 1000);
-            let r = Arc::clone(&room);
-            tokio::spawn(async move { r.close().await.ok(); });
-            let msg = "no peer joined within timeout";
-            if let Some(inner) = weak.upgrade() {
-                let _ = inner.state_tx.send(TunnelState::Failed(msg.into()));
-            }
-            emit_event(&on_event, EventKind::Error, msg.into());
-            return;
         }
+    };
+    if !joined {
+        log::warn!("LkTunnel: no peer joined within {}s — closing", PEER_WAIT_MS / 1000);
+        let e = Arc::clone(&engine);
+        tokio::spawn(async move { e.close().await; });
+        let msg = "no peer joined within timeout";
+        if let Some(inner) = weak.upgrade() {
+            let _ = inner.state_tx.send(TunnelState::Failed(msg.into()));
+        }
+        emit_event(&on_event, EventKind::Error, msg.into());
+        return;
     }
 
     // Peer is in — flip to Connected.
@@ -1595,10 +1548,10 @@ async fn run_tunnel_loop(
         }
     }
 
-    // Main loop. The LK SDK doesn't always deliver ParticipantDisconnected
-    // promptly when a peer drops ungracefully (m144 waits out the
-    // signaling-stream timeout, ~30 s). A 2 s probe of the roster
-    // closes the room within one tick even if no event fires.
+    // Main loop. The SFU doesn't always send a Disconnected participant
+    // update promptly when a peer drops ungracefully, so a 2 s roster
+    // probe (`engine.peer_present()`) closes the tunnel within one tick
+    // even if no event fires.
     let mut probe = tokio::time::interval(Duration::from_secs(2));
     probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     probe.tick().await;  // skip the immediate first tick
@@ -1606,53 +1559,27 @@ async fn run_tunnel_loop(
     loop {
         tokio::select! {
             ev = rx.recv() => match ev {
-                None => break,
-                Some(event) => match event {
-                    RoomEvent::ParticipantConnected(p) => {
-                        peer_count += 1;
-                        emit_event(&on_event, EventKind::PeerJoined,
-                            p.identity().as_str().to_string());
-                    }
-                    RoomEvent::ParticipantDisconnected(p) => {
-                        peer_count = peer_count.saturating_sub(1);
-                        emit_event(&on_event, EventKind::PeerLeft,
-                            p.identity().as_str().to_string());
-                    }
-                    RoomEvent::TrackSubscribed { track, .. } => {
-                        attach_rtp_receiver(&weak, track, &on_ip);
-                    }
-                    RoomEvent::Disconnected { reason } => {
-                        let msg = format!("{reason:?}");
-                        log::info!("LkTunnel: room disconnected — reason={msg}");
-                        emit_event(&on_event, EventKind::Disconnected, msg);
-                        break;
-                    }
-                    // We don't ride out the SDK's auto-reconnect. Its
-                    // resume/restart storm runs ~30-50s while the roster
-                    // is unreliable, and our 2s probe + the peer thrash
-                    // against it. Bail on the first Reconnecting signal:
-                    // closing the room aborts the engine's reconnect, and
-                    // the Disconnected event lets the daemon redial fresh.
-                    RoomEvent::Reconnecting => {
-                        log::info!("LkTunnel: room reconnecting — tearing down (reconnect disabled)");
-                        let r = Arc::clone(&room);
-                        tokio::spawn(async move { r.close().await.ok(); });
-                        emit_event(&on_event, EventKind::Disconnected, "reconnecting".into());
-                        break;
-                    }
-                    _ => {}
+                None => break,  // engine signal task ended
+                Some(EngineEvent::PeerJoined(id)) => {
+                    peer_count += 1;
+                    emit_event(&on_event, EventKind::PeerJoined, id);
+                }
+                Some(EngineEvent::PeerLeft(id)) => {
+                    peer_count = peer_count.saturating_sub(1);
+                    emit_event(&on_event, EventKind::PeerLeft, id);
+                }
+                Some(EngineEvent::Disconnected(msg)) => {
+                    log::info!("LkTunnel: engine disconnected — {msg}");
+                    emit_event(&on_event, EventKind::Disconnected, msg);
+                    break;
                 }
             },
             _ = probe.tick() => {
-                if room.remote_participants().is_empty() {
-                    log::info!("LkTunnel: room empty — closing (peer left without firing Disconnected)");
-                    let r = Arc::clone(&room);
-                    tokio::spawn(async move { r.close().await.ok(); });
-                    // Push Disconnected ourselves and exit — the m144
-                    // SDK doesn't reliably fire it back after we close
-                    // an already-empty room.
-                    emit_event(&on_event, EventKind::Disconnected,
-                        "room empty".into());
+                if !engine.peer_present() {
+                    log::info!("LkTunnel: room empty — closing (peer left without an update)");
+                    let e = Arc::clone(&engine);
+                    tokio::spawn(async move { e.close().await; });
+                    emit_event(&on_event, EventKind::Disconnected, "room empty".into());
                     break;
                 }
             }
@@ -1707,51 +1634,11 @@ fn dispatch_payload(
     }
 }
 
-/// Attach a receiver-side FrameTransformer to a newly-subscribed remote
-/// carrier track and stash the handle on TunnelInner so it stays alive.
-/// Handles both audio and video tracks — the carrier kind is the
-/// peer's send-side choice, and the frame format is identical either
-/// way, so we attach to whichever the peer publishes.
-fn attach_rtp_receiver(
-    weak:  &std::sync::Weak<TunnelInner>,
-    track: livekit::track::RemoteTrack,
-    on_ip: &Arc<dyn Fn(&[u8]) + Send + Sync>,
-) {
-    use livekit::track::RemoteTrack;
-    let Some(inner) = weak.upgrade() else { return };
-    let on_ip = Arc::clone(on_ip);
-    // QUIC inbound: try to push to inner.quic_rx_tx (set by
-    // `LkTunnel::enable_quic_*`). If no QUIC channel is configured the
-    // 'Q' frame is silently dropped — same shape as 'I' frames when no
-    // override / NAT / TUN is set yet. Counts toward this tunnel's rx
-    // counters so the JS/UI bandwidth display covers QUIC traffic
-    // alongside IP traffic.
-    let quic_weak = std::sync::Arc::downgrade(&inner);
-    let on_quic: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
-        let Some(inner) = quic_weak.upgrade() else { return };
-        inner.counters.bump_rx(bytes.len());
-        let tx = inner.quic_rx_tx.lock().clone();
-        if let Some(tx) = tx {
-            // Datagram is best-effort: a full receiver queue means
-            // quinn isn't draining fast enough → drop, same as a UDP
-            // socket buffer overflow. quinn handles real loss via ARQ.
-            let _ = tx.try_send(bytes::Bytes::copy_from_slice(bytes));
-        }
-    });
-    let on_data: Arc<dyn Fn(&[u8]) + Send + Sync> =
-        Arc::new(move |payload: &[u8]| dispatch_payload(payload, &on_ip, &on_quic));
-    let (attached, sid) = match &track {
-        RemoteTrack::Audio(audio) => (rtp::attach_remote(audio, on_data), audio.sid()),
-        RemoteTrack::Video(video) => (rtp::attach_remote_video(video, on_data), video.sid()),
-    };
-    match attached {
-        Ok(receiver) => {
-            log::info!("LkTunnel[{}]: rtp receiver attached on track sid={sid}", inner.id);
-            inner.rtp_receivers.lock().push(receiver);
-        }
-        Err(e) => log::warn!("LkTunnel[{}]: rtp::attach_remote failed: {e}", inner.id),
-    }
-}
+// Receive is owned by `rtc::Engine`: its subscriber `on_track` callback
+// reads RTP, unpacks each carrier frame (`rtp::unpack`), and invokes the
+// `on_packet` closure built in `run_connect_task` (which is just
+// `dispatch_payload` bound to this tunnel's `on_ip` + `on_quic`). There's
+// no per-track attach step on this side anymore.
 
 // ── Process-wide tokio runtime ─────────────────────────────────────
 

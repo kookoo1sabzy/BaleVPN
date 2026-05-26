@@ -9,20 +9,9 @@ package ai.bale.proxy
 object LkNative {
 
     init {
-        // The LK Rust SDK's `webrtc-sys` doesn't statically link
-        // libwebrtc on Android — it delegates back through the
-        // prefixed Java factories (livekit.org.webrtc.*), whose JNI
-        // methods live in liblkjingle_peerconnection_so.so (bundled
-        // by io.github.webrtc-sdk:android-prefixed). Without this
-        // load, `Room::connect` blows up the first time it
-        // instantiates SoftwareVideoEncoderFactory with
-        // UnsatisfiedLinkError on `nativeCreateFactory`.
-        //
-        // Loaded BEFORE `lktunnel` because the Rust .so's
-        // `JNI_OnLoad` immediately calls `initialize_android`, which
-        // touches the prefixed Java factories on its way through
-        // webrtc-sys's Android shim.
-        System.loadLibrary("lkjingle_peerconnection_so")
+        // The transport is webrtc-rs (pure Rust), statically linked into
+        // liblktunnel.so — there's no separate libwebrtc native lib
+        // (liblkjingle_peerconnection_so.so) to load anymore.
         System.loadLibrary("lktunnel")
     }
 

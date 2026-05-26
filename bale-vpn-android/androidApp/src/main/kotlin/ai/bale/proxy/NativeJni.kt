@@ -17,9 +17,9 @@ internal object NativeJni {
     private const val TAG = "NativeBridge"
 
     init {
-        // Triggering LkNative.<clinit> guarantees the
-        // `lkjingle_peerconnection_so → lktunnel` load order; NativeJni's
-        // externs work even when LkNative hasn't been touched yet.
+        // Triggering LkNative.<clinit> guarantees liblktunnel.so is
+        // loaded, so NativeJni's externs resolve even when LkNative
+        // hasn't been touched yet.
         LkNative.nativeVersion()
     }
 

@@ -41,8 +41,8 @@ jobs:
             bin_ext:      ''
           # macos-latest is Apple Silicon (arm64). macos-26-intel is the
           # Intel (x86_64) runner — build natively there so the release
-          # ships a macOS Intel binary too. webrtc-sys downloads the
-          # matching mac-x64 libwebrtc on this runner; no cross-compile.
+          # ships a macOS Intel binary too (the webrtc-rs stack is pure
+          # Rust, so this is a plain native build, no cross-compile).
           #
           # This restores the macOS Intel binary dropped (unintentionally)
           # in 8336ed4 "QUIC integration", when the Node-app's
@@ -65,9 +65,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # webrtc-sys / livekit transitively need GTK + audio dev
-      # headers on Linux. macOS gets these via system frameworks;
-      # Windows ships the WebView2 runtime that wry uses.
+      # The GUI feature (tao + wry) needs GTK / glib / libsoup /
+      # webkit2gtk dev headers on Linux. macOS gets these via system
+      # frameworks; Windows ships the WebView2 runtime that wry uses.
+      # (No audio/libwebrtc headers anymore — the transport is webrtc-rs.)
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
@@ -75,8 +76,6 @@ jobs:
           sudo apt-get install -y \
             pkg-config libssl-dev \
             libglib2.0-dev libgtk-3-dev \
-            libpulse-dev libasound2-dev \
-            libdbus-1-dev libudev-dev \
             libsoup-3.0-dev libwebkit2gtk-4.1-dev
 
       # macos-26-intel (and other newer slimmed runner images) don't ship
@@ -105,20 +104,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin
-            lktunnel-rust/patches/.cache
             lktunnel-rust/target
             bale-vpn-rust/target
           # Key on artifact_os, not runner.os: macos-latest (arm64) and
           # macos-26-intel (x86_64) both report runner.os == "macOS", so a
           # shared key would let the Intel runner restore the arm64
           # runner's ~/.cargo/bin + target (wrong-arch toolchain/objects).
-          key: bale-vpn-rust-${{ matrix.artifact_os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'lktunnel-rust/patches/*.patch', 'bale-vpn-rust/Cargo.toml') }}
+          key: bale-vpn-rust-${{ matrix.artifact_os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'bale-vpn-rust/Cargo.toml') }}
           restore-keys: |
             bale-vpn-rust-${{ matrix.artifact_os }}-
-
-      - name: Apply vendor crate patches
-        working-directory: lktunnel-rust
-        run: ./patches/apply.sh
 
       # GUI binary — default features (`gui` is on by default;
       # produces the windowed desktop variant). The same binary

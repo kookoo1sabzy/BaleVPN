@@ -19,14 +19,19 @@ description = "LiveKit-backed tunnel client: session-keyed connect/send/recv ove
 crate-type = ["lib"]
 
 [dependencies]
-# TLS via Mozilla's webpki-roots bundle — bakes the CA list into the
-# `.so` at compile time. The `rustls-tls-native-roots` alternative
-# uses `rustls-native-certs`, which scans for the OS trust store at
-# unix-y paths (e.g. /etc/ssl/certs/) that don't exist on Android —
-# system CAs live under /system/etc/security/cacerts/ as DER files
-# and require Android's TrustManager to read. webpki-roots side-steps
-# all that for the cost of an occasional crate version bump.
-livekit     = { version = "0.7", features = ["rustls-tls-webpki-roots"] }
+# Pure-Rust WebRTC stack (ICE/DTLS/SRTP/RTP) — replaces libwebrtc. No
+# C++, no NDK, no webrtc-sys. Drives the carrier media tracks in `rtc.rs`.
+webrtc      = "0.11"
+# Reused from the (otherwise dropped) LiveKit SDK: the signal-client
+# WebSocket and the protobuf wire types. `livekit-api` is patched to send
+# `sdk=js` (impersonate the JS SDK). webpki-roots bakes the CA bundle into
+# the binary — the native-roots alternative scans unix trust-store paths
+# that don't exist on Android (system CAs live under /system/etc/security/
+# cacerts as DER and need Android's TrustManager).
+livekit-api      = { version = "0.4", features = ["signal-client-tokio", "rustls-tls-webpki-roots"] }
+livekit-protocol = "0.7.7"
+# Trickle ICE candidates cross the wire as JSON (RTCIceCandidateInit).
+serde_json  = "1"
 tokio       = { version = "1",   features = ["rt-multi-thread", "sync", "macros"] }
 parking_lot = "0.12"
 once_cell   = "1"

@@ -95,7 +95,7 @@ fn main() {
             // logs noisily about it. Bump back to `warn` if you
             // need to debug a real quinn endpoint issue.
             "info,lktunnel=info,bale_signaling=info,bale_vpn=info,\
-             livekit=warn,webrtc_sys=warn,libwebrtc=warn,\
+             webrtc=warn,livekit_api=warn,\
              quinn::endpoint=off",
         ),
     )

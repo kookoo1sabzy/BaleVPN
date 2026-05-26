@@ -1,155 +1,48 @@
-//! RTP transport — substitute tunnel bytes for the encoded payload of a
-//! published audio track, and extract bytes from the remote peer's
-//! audio track on receive. See vendor/webrtc-sys/include/livekit/raw_-
-//! bytes_transformer.h for the C++ side.
+//! Carrier framing — pack many length-prefixed IP/QUIC packets into a
+//! single carrier payload and unpack them on the far side.
 //!
-//! Why not data channels: SCTP-over-DTLS (the WebRTC data-channel
-//! transport) appears to be DPI-fingerprinted on some networks. RTP
-//! (Opus over SRTP) is structurally indistinguishable from a normal
-//! voice call and survives. Same WebRTC peer connection, same
-//! SRTP / ICE / DTLS — just a different multiplex.
+//! The carrier itself is a WebRTC media track (Opus over SRTP) driven by
+//! the pure-Rust [`crate::rtc`] engine: each carrier "frame" is the
+//! payload of one RTP packet, and we substitute our own bytes for the
+//! codec payload. RTP (Opus over SRTP) is structurally indistinguishable
+//! from a normal voice call and survives DPI that fingerprints
+//! SCTP-over-DTLS data channels — same peer connection, same ICE / DTLS /
+//! SRTP, just a different multiplex.
 //!
-//! Why audio and not video: on Android, the libwebrtc Rust SDK's
-//! default video encoder factory routes through Java
-//! (`SoftwareVideoEncoderFactory.nativeCreate`) which SEGV's during
-//! initialisation — the Rust SDK doesn't ship the EGL/class-loader
-//! plumbing the Java factory expects. Opus is a pure-C codec with no
-//! JNI path, so audio tracks side-step the issue entirely. The
-//! FrameTransformer hook attaches to RtpSender / RtpReceiver
-//! regardless of media kind, so the byte-substitution behaviour is
-//! identical.
-//!
-//! Encoder feeding: WebRTC's RtpSender only calls Transform() when
-//! the encoder has produced a frame. With a real audio source the
-//! encoder runs at the capture rate; with none it never fires. We
-//! push a silent (all-zero PCM) 20 ms frame every 20 ms so
-//! Transform() gets called at 50 Hz and our queued tunnel packets
-//! actually go out.
+//! This module is transport-agnostic: it knows nothing about webrtc-rs or
+//! LiveKit, only the on-wire packing shape. [`crate::rtc`] owns the track
+//! plumbing and calls [`push_packed`] (send) / [`unpack`] (receive).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-
-use livekit::options::{AudioEncoding, TrackPublishOptions, VideoEncoding};
-use livekit::prelude::*;
-use livekit::webrtc::audio_frame::AudioFrame;
-use livekit::webrtc::audio_source::native::NativeAudioSource;
-use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
-use livekit::webrtc::native::raw_bytes_transformer::{
-    RawBytesFrameTransformer, RawBytesObserver,
-};
-use livekit::webrtc::video_frame::{I420Buffer, VideoFrame, VideoRotation};
-use livekit::webrtc::video_source::native::NativeVideoSource;
-use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
-use livekit::Room;
-
-/// Opus sample rate (48 kHz mono). Standard for WebRTC voice.
-const DUMMY_SAMPLE_RATE: u32 = 48_000;
-const DUMMY_CHANNELS:    u32 = 1;
-/// 20 ms frame at 48 kHz = 960 samples. Matches the Opus packetisation
-/// cadence so the encoder is fed exactly one packet per Transform()
-/// call.
-///
-/// A 10 ms cadence was tried to double the frame rate and regressed
-/// throughput: more packets = more RTP/UDP header overhead, and if the
-/// SFU's bandwidth estimate is per-peer-connection the extra packets
-/// just add loss/jitter the congestion controller backs off from.
-const DUMMY_FRAME_MS:        u32 = 20;
-const DUMMY_SAMPLES_PER_FRAME: u32 =
-    DUMMY_SAMPLE_RATE / 1000 * DUMMY_FRAME_MS;
-/// libwebrtc-side audio source queue, in ms. ~100 ms is the SDK's
-/// default — plenty of jitter buffering, no perceivable latency cost
-/// since the "audio" is just silence we're using as a Transform()
-/// trigger.
-const DUMMY_QUEUE_MS: u32 = 100;
-
-/// Track name prefix on the LK wire. The peer subscribes by track
-/// kind, not name, so this is just for log readability — each of the
-/// `TRACK_COUNT` parallel tracks gets a `tunnel-<index>` suffix.
-const TRACK_NAME: &str = "tunnel";
-
-/// Number of parallel audio carrier tracks the sender publishes.
-/// The send loop stripes frames round-robin across them; the receive
-/// side needs no count (it attaches a receiver to every remote track
-/// and funnels them into one dispatch).
-///
-/// Kept at 1 — multi-track was tried and regressed throughput. Two
-/// reasons: (a) WebRTC bandwidth estimation is per peer-connection, so
-/// N tracks split one budget rather than multiplying it; (b) — the
-/// killer — per-frame round-robin striping across tracks with
-/// independent jitter buffers delivers packets badly out of order, and
-/// the transport above (TCP-over-TUN, QUIC-over-tunnel) reads that
-/// reordering as loss → cwnd collapse. A working multi-track design
-/// would need per-FLOW pinning (hash each connection to one track so it
-/// stays in-order), which only helps concurrent-flow workloads, not a
-/// single big transfer. The plumbing below stays so that's revivable.
-pub const TRACK_COUNT: usize = 1;
-
-/// Wire-format ceiling per Opus frame at 510 kbps × 20 ms (Opus's hard
+/// Wire-format ceiling per carrier frame at 510 kbps × 20 ms (Opus's hard
 /// per-packet limit per RFC 6716). Sender packs as many length-prefixed
 /// IP packets as fit under this; receiver unpacks the inverse.
 pub const MAX_FRAME_BYTES: usize = 1275;
 
-// ── Video carrier ─────────────────────────────────────────────────────
-//
-// An Opus audio track caps a single carrier at 50 fps × 1275 B ≈ 510 kbps,
-// and measurements show downloads pinned right at that ceiling (full
-// frames, max frame rate). A video track lifts the ceiling: each encoded
-// frame can be tens of KB and the SFU allocates video far more bandwidth.
-// The byte-substitution FrameTransformer is media-kind-agnostic (it
-// replaces the encoded frame bytes before packetisation either way), so
-// the only difference from audio is the source/track type and the larger
-// per-frame budget.
-//
-/// Use a video track as the carrier instead of audio. Send-side choice;
-/// the receive side attaches to whichever kind the peer publishes, so
-/// the two ends don't have to match.
+/// Number of parallel carrier tracks the sender publishes. The send loop
+/// stripes frames round-robin across them; the receive side needs no
+/// count (it attaches to every remote track and funnels them into one
+/// dispatch).
 ///
-/// Works on every platform, including Android. Two pieces make it go:
-///   * Send-side: [`publish_video`]'s producer writes a *varying* luma
-///     pattern into the I420 buffer each tick (via `data_mut()`), so
-///     VP8's frame-dropper sees real change and emits an encoded frame
-///     every tick — that's what drives `Transform()` and thus our queued
-///     tunnel bytes out. (A static frame emits one keyframe then drops
-///     everything, which is why this used to produce no data.)
-///   * Android: the vendored webrtc-sys is patched to skip the Java/
-///     MediaCodec video encoder+decoder factories (they need an
-///     EglBase.Context the headless SDK has no way to provide, and
-///     SIGSEGV on init) and fall through to the pure-C++ software libvpx
-///     VP8 encoder. The encoded pixels never reach the wire anyway —
-///     `RawBytesFrameTransformer` replaces them with tunnel bytes — so
-///     software VP8 with no HW/EGL dependency is exactly what we want.
-///
-/// A video track lifts the carrier ceiling well past Opus's 510 kbps:
-/// each frame can be tens of KB and the SFU allocates video far more
-/// bandwidth (see [`MAX_VIDEO_FRAME_BYTES`]).
+/// Kept at 1 — multi-track was tried and regressed throughput. Two
+/// reasons: (a) WebRTC bandwidth estimation is per peer-connection, so
+/// N tracks split one budget rather than multiplying it; (b) — the
+/// killer — per-frame round-robin striping across tracks with independent
+/// jitter buffers delivers packets badly out of order, and the transport
+/// above (QUIC-over-tunnel) reads that reordering as loss → cwnd collapse.
+/// A working multi-track design would need per-FLOW pinning (hash each
+/// connection to one track so it stays in-order), which only helps
+/// concurrent-flow workloads, not a single big transfer. The plumbing
+/// stays so that's revivable.
+pub const TRACK_COUNT: usize = 1;
+
+/// Use a video track as the carrier instead of audio. Not yet implemented
+/// on the webrtc-rs engine (audio Opus only); kept so [`max_frame_bytes`]
+/// and the send-loop sizing have a single switch when video lands.
 pub const USE_VIDEO_CARRIER: bool = false;
 
-/// Dummy-source resolution. Doesn't affect the substituted payload, but
-/// the SFU's bandwidth allocation keys partly off the declared frame
-/// size — 640×360 signals a real video stream without a heavy encode.
-const VIDEO_WIDTH:  u32 = 640;
-const VIDEO_HEIGHT: u32 = 360;
-/// Frames per second the dummy producer feeds → Transform() rate.
-///
-/// High, because each frame is now small (one RTP packet — see
-/// [`MAX_VIDEO_FRAME_BYTES`]) so throughput = fps × frame size. The
-/// passthrough VP8 encoder emits a frame per fed frame at ~zero CPU,
-/// so a high rate is cheap. 90 × 1100 B ≈ 0.8 Mbps, comfortably above
-/// the Opus carrier's 510 kbps; raise further once measured stable.
-const VIDEO_FPS: u32 = 60;
-/// Per-track max bitrate hint to the SFU pacer. Sized to the small-frame
-/// rate with headroom, not the old 8 Mbps fantasy — overshooting the
-/// real path just made the pacer queue and drop.
-const VIDEO_MAX_BITRATE: u64 = 2_000_000;
-/// Per-frame packing ceiling for the video carrier. Kept to a single
-/// RTP packet (~1100 B) so a frame is NEVER fragmented: audio worked
-/// precisely because each frame was one packet, while 32 KB frames
-/// fragmented into ~22 packets and a single lost packet dropped the
-/// whole frame — collapsing throughput and starving the QUIC handshake
-/// that rides the same carrier. Small single-packet frames make the
-/// video carrier as loss-tolerant as the audio one; throughput comes
-/// from [`VIDEO_FPS`] instead of frame size.
+/// Per-frame packing ceiling for the (future) video carrier. Kept to a
+/// single RTP packet so a frame is never fragmented — audio worked
+/// precisely because each frame was one packet.
 pub const MAX_VIDEO_FRAME_BYTES: usize = 1100;
 
 /// The active carrier's per-frame packing ceiling. Send loop sizes its
@@ -158,17 +51,16 @@ pub const fn max_frame_bytes() -> usize {
     if USE_VIDEO_CARRIER { MAX_VIDEO_FRAME_BYTES } else { MAX_FRAME_BYTES }
 }
 
-/// Append a length-prefixed IP packet to a batch buffer. Returns true
-/// if the packet was appended (or the packet would overflow but the
-/// batch is empty, in which case it's appended anyway — single oversize
-/// packets just go in their own frame). Returns false when the batch
-/// already holds at least one packet AND the new packet wouldn't fit;
-/// caller flushes the batch, then re-calls to start a fresh one.
+/// Append a length-prefixed IP packet to a batch buffer. Returns true if
+/// the packet was appended (or the packet would overflow but the batch is
+/// empty, in which case it's appended anyway — single oversize packets
+/// just go in their own frame). Returns false when the batch already
+/// holds at least one packet AND the new packet wouldn't fit; caller
+/// flushes the batch, then re-calls to start a fresh one.
 ///
 /// Wire shape per packet inside a frame:
 ///   [u16 BE length][packet bytes]
-/// Multiple entries are concatenated. The receiver's `on_data` parses
-/// the same way.
+/// Multiple entries are concatenated. [`unpack`] parses the inverse.
 pub fn push_packed(batch: &mut Vec<u8>, packet: &[u8], max: usize) -> bool {
     if packet.len() > u16::MAX as usize { return true; }
     let needed = batch.len() + 2 + packet.len();
@@ -178,277 +70,18 @@ pub fn push_packed(batch: &mut Vec<u8>, packet: &[u8], max: usize) -> bool {
     true
 }
 
-/// Keeps the published local track alive for the tunnel's lifetime.
-/// Which variant depends on the carrier kind ([`USE_VIDEO_CARRIER`]).
-enum CarrierTrack {
-    Audio(LocalAudioTrack),
-    Video(LocalVideoTrack),
-}
-
-/// Sender-side handle. Owns the local carrier track + transformer; drop
-/// stops the dummy frame producer via `_frame_producer`'s AbortHandle.
-pub struct RtpSender {
-    transformer: RawBytesFrameTransformer,
-    _track:      CarrierTrack,
-    _frame_producer: tokio::task::AbortHandle,
-}
-
-impl RtpSender {
-    /// Try to enqueue a packet. Returns false on queue overflow — caller
-    /// drops the packet (RTP semantics: lossy is expected).
-    pub fn send(&self, data: &[u8]) -> bool {
-        self.transformer.send(data)
+/// Inverse of [`push_packed`]: walk a received carrier frame and invoke
+/// `on_packet` once per length-prefixed entry. A truncated/garbled
+/// trailer breaks the loop without erroring — the lossy carrier can
+/// deliver a corrupt frame and the transport above (QUIC) retransmits at
+/// L4.
+pub fn unpack(frame: &[u8], mut on_packet: impl FnMut(&[u8])) {
+    let mut i = 0usize;
+    while i + 2 <= frame.len() {
+        let len = ((frame[i] as usize) << 8) | (frame[i + 1] as usize);
+        i += 2;
+        if len == 0 || i + len > frame.len() { break; }
+        on_packet(&frame[i..i + len]);
+        i += len;
     }
-
-    pub fn queue_depth(&self) -> usize {
-        self.transformer.queue_depth()
-    }
-}
-
-/// Receiver-side handle. Keep alive while the corresponding remote
-/// track is subscribed — drop releases the transformer reference but
-/// libwebrtc still holds its scoped_refptr internally until the track
-/// ends.
-pub struct RtpReceiver {
-    _transformer: RawBytesFrameTransformer,
-}
-
-/// Publish the tunnel's outgoing audio track and install the byte-
-/// substitution transformer on its RtpSender. Spawns a background
-/// task that pushes a silent 20 ms PCM frame at 50 Hz to keep the
-/// Opus encoder live.
-///
-/// Must be called after `Room::connect` returns. `index` distinguishes
-/// the parallel carrier tracks (`tunnel-0`, `tunnel-1`, …); call once
-/// per track, up to [`TRACK_COUNT`].
-pub async fn publish(room: &Arc<Room>, index: usize) -> Result<RtpSender, String> {
-    let source = NativeAudioSource::new(
-        AudioSourceOptions::default(),
-        DUMMY_SAMPLE_RATE,
-        DUMMY_CHANNELS,
-        DUMMY_QUEUE_MS,
-    );
-    let name = format!("{TRACK_NAME}-{index}");
-    let track = LocalAudioTrack::create_audio_track(
-        &name,
-        RtcAudioSource::Native(source.clone()),
-    );
-
-    let options = TrackPublishOptions {
-        source: TrackSource::Microphone,
-        // dtx=false: Opus DTX (Discontinuous Transmission) detects
-        // silent input — which is exactly what our dummy producer
-        // feeds — and stops emitting RTP packets. With no packets
-        // there's no Transform() call and our queued tunnel bytes
-        // never go out. Disabling DTX forces the encoder to produce
-        // a packet every 20 ms regardless of input silence.
-        dtx: false,
-        // red=false: Opus RED (RFC 2198) packetises each Opus payload
-        // inside a redundancy envelope. Mixing that with our
-        // payload-substitution FrameTransformer is murky; the simpler
-        // plain-Opus path is byte-stable for the substitution.
-        red: false,
-        // Max-bitrate cap to keep the SFU's TWCC / publisher pacer
-        // from throttling us. Opus's hard ceiling is 510 kbps; that
-        // sizes each 20 ms frame at ~1275 bytes, enough headroom to
-        // fit an MTU-size IP packet in one frame after VP8-style
-        // packetisation. The encoder still runs at lower effective
-        // bitrate on the silent input — this is purely the ceiling
-        // the publisher is allowed to push.
-        audio_encoding: Some(AudioEncoding { max_bitrate: 510_000 }),
-        ..Default::default()
-    };
-
-    room.local_participant()
-        .publish_track(LocalTrack::Audio(track.clone()), options)
-        .await
-        .map_err(|e| format!("publish_track: {e}"))?;
-
-    let transceiver = track
-        .transceiver()
-        .ok_or_else(|| "transceiver not set on local track".to_string())?;
-    let sender = transceiver.sender();
-    let transformer = RawBytesFrameTransformer::new_for_rtp_sender(sender);
-
-    // Silent-frame producer. NativeAudioSource::new() zeroes its
-    // internal buffer; AudioFrame::new() does the same — both layers
-    // produce true silence with no per-tick work beyond the
-    // allocation. Opus DTX (discontinuous transmission) is *disabled*
-    // for us implicitly because the silent payload still goes through
-    // the FrameTransformer before reaching the wire, so we always get
-    // a Transform() call per frame.
-    let producer = crate::runtime().spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(DUMMY_FRAME_MS as u64));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            let frame = AudioFrame::new(
-                DUMMY_SAMPLE_RATE,
-                DUMMY_CHANNELS,
-                DUMMY_SAMPLES_PER_FRAME,
-            );
-            if let Err(e) = source.capture_frame(&frame).await {
-                log::warn!("rtp dummy frame capture failed: {e}");
-            }
-        }
-    });
-
-    Ok(RtpSender {
-        transformer,
-        _track: CarrierTrack::Audio(track),
-        _frame_producer: producer.abort_handle(),
-    })
-}
-
-/// Video-carrier analogue of [`publish`]. Publishes a video track fed by
-/// a black-frame producer at [`VIDEO_FPS`], installs the same byte-
-/// substitution transformer on its RtpSender, and asks the SFU for a
-/// high bitrate so the per-frame budget ([`MAX_VIDEO_FRAME_BYTES`]) can
-/// actually be used. Desktop only — see the module header re: the
-/// Android video-encoder crash.
-pub async fn publish_video(room: &Arc<Room>) -> Result<RtpSender, String> {
-    let source = NativeVideoSource::new(
-        VideoResolution { width: VIDEO_WIDTH, height: VIDEO_HEIGHT },
-        false, // not screencast
-    );
-    let track = LocalVideoTrack::create_video_track(
-        TRACK_NAME,
-        RtcVideoSource::Native(source.clone()),
-    );
-
-    let options = TrackPublishOptions {
-        source: TrackSource::Camera,
-        video_encoding: Some(VideoEncoding {
-            max_bitrate:   VIDEO_MAX_BITRATE,
-            max_framerate: VIDEO_FPS as f64,
-        }),
-        ..Default::default()
-    };
-
-    room.local_participant()
-        .publish_track(LocalTrack::Video(track.clone()), options)
-        .await
-        .map_err(|e| format!("publish_track(video): {e}"))?;
-
-    let transceiver = track
-        .transceiver()
-        .ok_or_else(|| "transceiver not set on local video track".to_string())?;
-    let sender = transceiver.sender();
-    let transformer = RawBytesFrameTransformer::new_for_rtp_sender(sender);
-
-    // Varying-frame producer. The frame *content* never reaches the wire
-    // (the transformer replaces the encoded payload with tunnel bytes),
-    // but it must *change* every tick: VP8's frame-dropper skips an
-    // unchanged frame, and a skipped frame means no Transform() call and
-    // no tunnel bytes go out. So we fill the luma plane with a per-frame
-    // pattern that shifts each tick, forcing the encoder to emit a frame
-    // at VIDEO_FPS.
-    //
-    // A fresh buffer per tick (not one reused buffer mutated in place):
-    // capture_frame hands the buffer into the encoder pipeline, which may
-    // still hold a reference when the next tick fires — mutating in place
-    // would race that read. The ~345 KB/frame alloc churn at 30 fps is
-    // negligible.
-    let producer = crate::runtime().spawn(async move {
-        let mut tick = tokio::time::interval(
-            Duration::from_micros(1_000_000 / VIDEO_FPS as u64));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let start = std::time::Instant::now();
-        let mut counter: u32 = 0;
-        loop {
-            tick.tick().await;
-            counter = counter.wrapping_add(1);
-            let mut buffer = I420Buffer::new(VIDEO_WIDTH, VIDEO_HEIGHT);
-            {
-                // Flat luma at a per-frame-incrementing value: the frame
-                // *changes* every tick (so VP8's frame-dropper doesn't skip
-                // it) but is trivially cheap to encode (uniform plane +
-                // uniform temporal delta). Full-frame noise was correct for
-                // "not dropped" but pinned software libvpx so hard on a
-                // phone that it couldn't sustain VIDEO_FPS — starving the
-                // Transform() cadence that carries our bytes. Content is
-                // irrelevant: the encoded pixels are replaced with tunnel
-                // bytes before packetisation.
-                let (y, _u, _v) = buffer.data_mut();
-                y.fill(counter as u8);
-            }
-            let frame = VideoFrame {
-                rotation:       VideoRotation::VideoRotation0,
-                timestamp_us:   start.elapsed().as_micros() as i64,
-                frame_metadata: None,
-                buffer,
-            };
-            source.capture_frame(&frame);
-        }
-    });
-
-    Ok(RtpSender {
-        transformer,
-        _track: CarrierTrack::Video(track),
-        _frame_producer: producer.abort_handle(),
-    })
-}
-
-/// Unpacks each arriving carrier frame and forwards every length-prefixed
-/// packet to `forward`. Shared by the audio and video receive paths —
-/// the frame is the same `[u16 BE length][bytes]…` shape regardless of
-/// which track kind carried it.
-struct Observer {
-    forward: Arc<dyn Fn(&[u8]) + Send + Sync>,
-    counter: AtomicU64,
-}
-impl RawBytesObserver for Observer {
-    fn on_data(&self, data: &[u8]) {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            log::debug!("rtp recv checkpoint: {n} frames (last len={})", data.len());
-        }
-        // Unpack — mirror of `push_packed`. Each entry is
-        // [u16 BE length][bytes]; iterate and forward each.
-        // Truncated/garbled trailers break the loop without erroring;
-        // the lossy transport can deliver a corrupt frame and the
-        // sender's TCP/QUIC layer will retransmit at L4.
-        let mut i = 0usize;
-        while i + 2 <= data.len() {
-            let len = ((data[i] as usize) << 8) | (data[i + 1] as usize);
-            i += 2;
-            if len == 0 || i + len > data.len() { break; }
-            (self.forward)(&data[i..i + len]);
-            i += len;
-        }
-    }
-}
-
-fn make_observer(on_data: Arc<dyn Fn(&[u8]) + Send + Sync>) -> Arc<dyn RawBytesObserver> {
-    Arc::new(Observer { forward: on_data, counter: AtomicU64::new(0) })
-}
-
-/// Install the byte-extraction transformer on a remote audio track's
-/// RtpReceiver. Fires `on_data(bytes)` for every arriving frame; the
-/// decoded audio is discarded (we never attached an audio sink).
-pub fn attach_remote(
-    track: &RemoteAudioTrack,
-    on_data: Arc<dyn Fn(&[u8]) + Send + Sync>,
-) -> Result<RtpReceiver, String> {
-    let transceiver = track
-        .transceiver()
-        .ok_or_else(|| "transceiver not set on remote track".to_string())?;
-    let transformer = RawBytesFrameTransformer::new_for_rtp_receiver(
-        transceiver.receiver(), make_observer(on_data));
-    Ok(RtpReceiver { _transformer: transformer })
-}
-
-/// Video-carrier analogue of [`attach_remote`]. The transformer fires
-/// after depacketisation/reassembly, so it sees the full reassembled
-/// frame regardless of how many RTP packets the packetiser split it into.
-pub fn attach_remote_video(
-    track: &RemoteVideoTrack,
-    on_data: Arc<dyn Fn(&[u8]) + Send + Sync>,
-) -> Result<RtpReceiver, String> {
-    let transceiver = track
-        .transceiver()
-        .ok_or_else(|| "transceiver not set on remote video track".to_string())?;
-    let transformer = RawBytesFrameTransformer::new_for_rtp_receiver(
-        transceiver.receiver(), make_observer(on_data));
-    Ok(RtpReceiver { _transformer: transformer })
 }

@@ -22,16 +22,7 @@ lto           = "thin"
 codegen-units = 1
 panic         = "abort"
 
-# Mirror lktunnel-rust's vendored crate patches — bale-signaling
-# now path-deps on lktunnel and needs the same patched livekit /
-# libwebrtc / webrtc-sys / livekit-api. Cargo's `[patch]` table
-# does NOT propagate across separate workspaces; each consuming
-# workspace must redeclare it.
-#
-# To recreate vendor/: run `cd ../lktunnel-rust && ./patches/apply.sh`.
-# Both this and bale-vpn-rust point to the same vendor/ tree.
-[patch.crates-io]
-webrtc-sys  = { path = "../lktunnel-rust/vendor/webrtc-sys" }
-libwebrtc   = { path = "../lktunnel-rust/vendor/libwebrtc" }
-livekit     = { path = "../lktunnel-rust/vendor/livekit" }
-livekit-api = { path = "../lktunnel-rust/vendor/livekit-api" }
+# No vendored-crate patch — the libwebrtc transport is gone. When the
+# optional `lktunnel` feature is enabled, bale-signaling path-deps on
+# lktunnel, which now uses crates.io webrtc-rs + livekit-api +
+# livekit-protocol (pure Rust, no patch).

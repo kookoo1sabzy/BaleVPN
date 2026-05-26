@@ -1,9 +1,7 @@
-# Windows MSVC: link against the static C runtime (/MT) to match the
-# prebuilt libwebrtc.lib and webrtc-sys's C++ shims, which are compiled
-# /MT. Rust defaults to the dynamic CRT (/MD) on this target, and mixing
-# /MT with /MD trips the MSVC linker with LNK2038 ("mismatch detected
-# for 'RuntimeLibrary': value 'MT_StaticRelease' doesn't match value
-# 'MD_DynamicRelease'"). Only affects the Windows-MSVC target — Linux,
-# macOS, and Android (aarch64-linux-android) builds are untouched.
+# Windows MSVC: statically link the C runtime (/MT) so the binary is
+# self-contained — no dependency on the VC++ redistributable DLLs
+# (VCRUNTIME140.dll …) being installed on the user's machine. Rust
+# defaults to the dynamic CRT (/MD). Only affects the Windows-MSVC
+# target — Linux, macOS, and Android builds are untouched.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

@@ -45,13 +45,9 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # The Android Rust workspace patches webrtc-sys / libwebrtc /
-      # livekit / livekit-api via [patch.crates-io] = path = "vendor/…".
-      # The vendor/ tree is gitignored — it's regenerated from a
-      # pristine crates.io copy + the patches in lktunnel-rust/patches/
-      # by apply.sh. Must run BEFORE any cargo step (including the one
-      # gradle's cargoBuild task triggers), otherwise cargo can't
-      # resolve the patched paths.
+      # The Rust transport is webrtc-rs (pure Rust) — no vendored
+      # webrtc-sys/libwebrtc/livekit, no [patch.crates-io], no apply.sh.
+      # gradle's cargoBuild task cross-compiles the workspace directly.
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -64,10 +60,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin
-            lktunnel-rust/patches/.cache
             lktunnel-rust/target
             bale-vpn-android/rust/target
-          key: rust-${{ runner.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'bale-vpn-android/rust/Cargo.lock', 'lktunnel-rust/patches/*.patch') }}
+          key: rust-${{ runner.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'bale-vpn-android/rust/Cargo.lock') }}
           restore-keys: |
             rust-${{ runner.os }}-
 
@@ -76,10 +71,6 @@ jobs:
         # the step a no-op on cache hits (cargo install would otherwise
         # still spend a few seconds checking versions).
         run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk --locked
-
-      - name: Apply vendor crate patches
-        working-directory: lktunnel-rust
-        run: ./patches/apply.sh
 
       - name: Derive version from tag
         if: startsWith(github.ref, 'refs/tags/v')

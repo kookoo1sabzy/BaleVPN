@@ -8,8 +8,8 @@ plugins {
 android {
     namespace  = "ai.bale.proxy"
     compileSdk = 34
-    // Pin the NDK version webrtc-sys was built against (m144).
-    // cargo-ndk uses this to cross-compile the Rust crates.
+    // Pinned NDK (cargo-ndk uses it to cross-compile the Rust crates).
+    // r28 supports the API 24 floor webrtc-rs needs (getifaddrs).
     ndkVersion = "28.0.13004108"
     val tagVersion = System.getenv("BALE_VERSION_NAME")?.takeIf { it.isNotBlank() }
     val parsedVersionCode = tagVersion
@@ -25,7 +25,10 @@ android {
 
     defaultConfig {
         applicationId = "ai.bale.proxy"
-        minSdk        = 21
+        // 24 (Android 7.0) is required by the webrtc-rs transport: it
+        // links getifaddrs/freeifaddrs for network-interface enumeration,
+        // which Android's libc only exposes at API >= 24. ~98% of devices.
+        minSdk        = 24
         targetSdk     = 34
         versionCode   = parsedVersionCode ?: 1
         versionName   = tagVersion ?: "1.0"
@@ -101,10 +104,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.lifecycle:lifecycle-process:2.7.0")
-    // webrtc-sdk-android-prefixed — pulls in the Java sidecars that
-    // the Rust LiveKit SDK on Android delegates to via JNI. Version
-    // must match the one webrtc-sys 0.3.31 was built against (m144).
-    implementation("io.github.webrtc-sdk:android-prefixed:144.7559.05")
+    // No webrtc-sdk AAR — the transport is webrtc-rs (pure Rust), so there
+    // are no libwebrtc Java sidecars to load.
 }
 
 // ── Rust → JNI shim build ───────────────────────────────────────────────
@@ -136,9 +137,15 @@ val cargoBuild by tasks.registering(Exec::class) {
     val homeCargoBin = "${System.getProperty("user.home")}/.cargo/bin"
     environment("PATH", "$homeCargoBin:${System.getenv("PATH") ?: ""}")
     val cargo = "$homeCargoBin/cargo"
+    // Link the native libs against the same API level as `minSdk`.
+    // cargo-ndk otherwise defaults to API 21, but the webrtc-rs transport
+    // links getifaddrs/freeifaddrs which Android's libc only provides at
+    // API >= 24 — so without this the .so fails to link once webrtc-rs is
+    // in the shim. Kept in sync with `minSdk` (24) above.
+    val apiLevel = (android.defaultConfig.minSdk ?: 24).toString()
     commandLine(
         listOf(cargo, "ndk") + rustAbiArgs +
-            listOf("-o", rustJniLibs.absolutePath, "build") + cargoProfileFlag
+            listOf("--platform", apiLevel, "-o", rustJniLibs.absolutePath, "build") + cargoProfileFlag
     )
     // Source-set inputs — anything a human edit would touch.
     inputs.file("$rustDir/Cargo.toml")

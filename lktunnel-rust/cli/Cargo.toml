@@ -26,8 +26,3 @@ parking_lot = "0.12"
 # limit by default, which we burn through in seconds once a browser is
 # opening 50+ parallel connections through the NAT.
 libc        = "0.2"
-
-[target.'cfg(target_os = "macos")'.build-dependencies]
-# Used to discover the prebuilt libwebrtc.a path from build.rs — see
-# the script for why we need -force_load explicitly on macOS.
-webrtc-sys-build = "0.3.16"

@@ -19,11 +19,9 @@ const TAG: &str = "lktunnel";
 //
 //   1. Initialise android_logger so the core `lktunnel` crate's `log`
 //      calls land in logcat.
-//   2. Hand the JavaVM to libwebrtc's Android shim. Without this the
-//      Rust LK SDK crashes inside `Room::connect` on the first
-//      tokio-runtime callback that wants to touch JNI (hardware
-//      codec / AAudio path init). The Android JVM-context lives in
-//      webrtc-sys globals after this call.
+//   2. Boot the dispatcher thread and cache the JavaVM (for off-thread
+//      JNI callbacks). The transport is webrtc-rs (pure Rust), so there's
+//      no libwebrtc Android shim to hand the JavaVM to anymore.
 /// GlobalRef to `ai.bale.proxy.NativeJni`. Bound in `JNI_OnLoad`,
 /// never cleared (process-lifetime). The error-drain JNI fn looks
 /// `onNativeError` up by name on each batch — cheap, since the path
@@ -38,15 +36,11 @@ pub extern "C" fn JNI_OnLoad(vm: JavaVM, _: *mut c_void) -> jint {
             .with_max_level(log::LevelFilter::Info)
             .with_tag(TAG),
     );
-    log::info!("JNI_OnLoad: registering JavaVM with libwebrtc");
-    // Required even though we never add an audio/video track. webrtc-sys'
-    // PeerConnectionFactory constructor unconditionally creates an
-    // `AdmProxy`, which calls `CreateAudioDeviceModule(kPlatformDefaultAudio)`
-    // → Android Java ADM → needs JavaVM. Without this hook,
-    // Room::connect SEGVs in `lktunnel-rt` (tokio thread). The ADM then
-    // sits idle: no audio track ever added, so the platform-side
-    // recording / playout threads never start.
-    livekit::webrtc::android::initialize_android(&vm);
+    log::info!("JNI_OnLoad: lktunnel native init");
+    // No libwebrtc JVM/ADM hook needed anymore — the transport is
+    // webrtc-rs (pure Rust); there's no PeerConnectionFactory / Android
+    // audio device manager to initialise. webrtc-rs does its own network
+    // interface enumeration via getifaddrs (hence minSdk 24).
     // Boot the Rust dispatcher thread now. Idempotent — subsequent
     // callers (server, tun) just post work onto it.
     lktunnel::dispatcher::init();

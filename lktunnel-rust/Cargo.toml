@@ -27,17 +27,8 @@ lto           = "thin"
 codegen-units = 1
 panic         = "abort"
 
-# Vendored copies of livekit, libwebrtc and webrtc-sys so we can extend
-# their FFI surface. We need to add a `webrtc::FrameTransformerInterface`
-# subclass (the public injection point libwebrtc exposes for E2EE) to
-# substitute raw tunnel bytes for the encoded video payload between the
-# encoder and the RTP packetizer — that lets us ride RTP instead of SCTP
-# data channels, which appear to be DPI-fingerprinted on some networks.
-# All three crates are tightly version-coupled (webrtc-sys 0.3.31 ↔
-# libwebrtc 0.3.33 ↔ livekit 0.7.40) so they have to be vendored as a
-# set.
-[patch.crates-io]
-webrtc-sys  = { path = "vendor/webrtc-sys" }
-libwebrtc   = { path = "vendor/libwebrtc" }
-livekit     = { path = "vendor/livekit" }
-livekit-api = { path = "vendor/livekit-api" }
+# The libwebrtc carrier is gone — the transport now rides `webrtc-rs`
+# (pure Rust) via the `rtc` module in `lktunnel`, with the reused
+# crates.io `livekit-api` (signal client; `sdk=js` is set through
+# `SignalSdkOptions`, no fork needed) and `livekit-protocol` (wire
+# types). No vendored crates, no webrtc-sys/libwebrtc/livekit patch.
