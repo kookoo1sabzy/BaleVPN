@@ -32,9 +32,13 @@ android {
         targetSdk     = 34
         versionCode   = parsedVersionCode ?: 1
         versionName   = tagVersion ?: "1.0"
-        // ABIs the Rust workspace cross-compiles for; cargo-ndk
-        // emits one .so per ABI into ../rust/jniLibs/<abi>/.
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+        // Packaged ABIs are chosen per build type (below) — do NOT set
+        // abiFilters here. defaultConfig.abiFilters merges (set union)
+        // into every build type, so anything listed here is forced into
+        // ALL of them (that's why release was shipping x86_64). cargo-ndk
+        // cross-compiles all three ABIs regardless via its own `-t` list
+        // and stages them in ../rust/jniLibs; abiFilters only selects
+        // which of those get packaged into the APK.
     }
     // The Rust workspace stages its output into ../rust/jniLibs
     // in the standard cargo-ndk <abi>/<lib>.so layout. Picked up
@@ -68,7 +72,10 @@ android {
                 "proguard-rules.pro"
             )
             signingConfig = signingConfigs.getByName("debug")
-            ndk { abiFilters += listOf("arm64-v8a") }
+            // arm64 covers ~all modern devices; armv7 keeps old 32-bit
+            // phones working. No x86_64 — that's emulators only, not worth
+            // ~7 MB in a shipped release.
+            ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
             if (hasReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
