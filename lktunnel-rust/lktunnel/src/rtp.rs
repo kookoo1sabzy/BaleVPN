@@ -35,21 +35,11 @@ pub const MAX_FRAME_BYTES: usize = 1275;
 /// stays so that's revivable.
 pub const TRACK_COUNT: usize = 1;
 
-/// Use a video track as the carrier instead of audio. Not yet implemented
-/// on the webrtc-rs engine (audio Opus only); kept so [`max_frame_bytes`]
-/// and the send-loop sizing have a single switch when video lands.
-pub const USE_VIDEO_CARRIER: bool = false;
-
-/// Per-frame packing ceiling for the (future) video carrier. Kept to a
-/// single RTP packet so a frame is never fragmented — audio worked
-/// precisely because each frame was one packet.
-pub const MAX_VIDEO_FRAME_BYTES: usize = 1100;
-
-/// The active carrier's per-frame packing ceiling. Send loop sizes its
-/// batch buffer and `push_packed` cap against this.
-pub const fn max_frame_bytes() -> usize {
-    if USE_VIDEO_CARRIER { MAX_VIDEO_FRAME_BYTES } else { MAX_FRAME_BYTES }
-}
+/// The carrier's per-frame packing ceiling. Send loop sizes its batch
+/// buffer and the `push_packed` cap against this. A thin accessor (rather
+/// than using `MAX_FRAME_BYTES` directly) so a per-carrier cap has a single
+/// place to live if the carrier ever becomes configurable.
+pub const fn max_frame_bytes() -> usize { MAX_FRAME_BYTES }
 
 /// Append a length-prefixed IP packet to a batch buffer. Returns true if
 /// the packet was appended (or the packet would overflow but the batch is
