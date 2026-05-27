@@ -379,12 +379,13 @@ fn wire_pc(
             log::info!("rtc[{id}]: {label} PC → {s}");
             let event_tx = event_tx.clone();
             Box::pin(async move {
-                if matches!(
-                    s,
-                    RTCPeerConnectionState::Failed
-                        | RTCPeerConnectionState::Closed
-                        | RTCPeerConnectionState::Disconnected
-                ) {
+                // Only `Failed`/`Closed` are terminal. `Disconnected` is a
+                // TRANSIENT ICE state — a brief connectivity blip (e.g. the
+                // app backgrounding, a Wi-Fi↔cellular hop) — that webrtc-rs
+                // recovers from on its own. Tearing down on it killed the
+                // tunnel on every background→foreground cycle, so we ignore
+                // it and wait for either recovery or a real `Failed`.
+                if matches!(s, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
                     let _ = event_tx.send(EngineEvent::Disconnected(format!("{label} PC {s}")));
                 }
             })
