@@ -160,48 +160,44 @@ For contributors:
              │ signaling                                signaling
              │ (paused while a client call is active)          │
              ▼                                                 ▼
-    ┌─────────────────┐                              ┌─────────────────┐
-    │     client      │                              │     server      │
-    │  Rust  /  Android                              │  Rust  /  Android
-    │                 │                              │                 │
-    │  apps → SOCKS5  │                              │ kernel TUN OR   │
-    │  apps → TUN     │                              │ userspace NAT   │
-    └────────┬────────┘                              └────────┬────────┘
-             │                                                │
-             │   DTLS-encrypted WebRTC data channel           │
-             │     ▶ FRAME_TYPE_IP  (raw IP for VPN/TUN)      │
-             │     ▶ FRAME_TYPE_QUIC (QUIC for SOCKS5)        │
-             └──────────────┐                  ┌──────────────┘
-                            ▼                  ▼
+    ┌──────────────────────┐            ┌───────────────────────┐
+    │        client        │            │        server         │
+    │    Rust / Android    │            │    Rust / Android     │
+    │                      │            │                       │
+    │ apps → SOCKS5 → QUIC │            │ QUIC → SOCKS5 fan-out │
+    │ apps → TUN (raw IP)  │            │ raw IP → TUN / NAT    │
+    └──────────┬───────────┘            └───────────┬───────────┘
+               │                                    │
+               └─────────────────┬──────────────────┘
+                                 │
+             WebRTC RTP media carrier (Opus / SRTP)
+               ▶ 'I'  raw IP packets   (TUN / VPN mode)
+               ▶ 'Q'  QUIC datagrams   (carry SOCKS5 streams)
+                                 │
+                                 ▼
                   ┌────────────────────────────────────┐
                   │   LiveKit SFU  ·  meet-*.ble.ir    │
-                  │   relays the data channel only —   │
+                  │   relays the RTP media carrier —   │
                   │   does NOT touch the open internet │
                   └────────────────────────────────────┘
-                                                                ┌──────────┐
-                                        server NAT egress ─────►│   open   │
-                                                                │ internet │
-                                                                └──────────┘
+                                                          ┌──────────┐
+   server egress: QUIC → host sockets, raw IP → NAT ────► │   open   │
+                                                          │ internet │
+                                                          └──────────┘
 ```
 
-Two channels per session, both terminated at Bale infrastructure:
+**Transport — a WebRTC RTP media carrier (Opus over SRTP), on the pure-Rust `webrtc-rs` stack.** Each peer runs the two-PeerConnection model (publisher + subscriber). Tunnel bytes are written **directly** as the RTP payload of an "audio" track (`write_sample`) — no codec, no data channel; the SFU sees opaque Opus RTP and relays it, and the far end reads the bytes straight off `read_rtp`. RTP-over-SRTP is structurally indistinguishable from an ordinary voice call and survives DPI that fingerprints SCTP data channels. Writing the payload ourselves (instead of through an encoder) also removes the per-track bitrate ceiling a real codec would impose.
 
-**Signaling — Bale WS at `next-ws.bale.ai`.** Call setup RPCs and push events. Owned by `bale-signaling-rust`. The lifecycle is driven by a rule engine in `WsClient`:
+A single leading byte tags each frame, selecting one of **two modes** that can run concurrently on the same tunnel:
 
-> `desired_up = token && !user_disconnect && ( server_active || (foreground && !call_active) )`
+- `'I'` (0x49) — **VPN / TUN mode (raw IP).** The client's kernel TUN reads IP packets → ships them across → the server forwards them via kernel TUN (host-kernel NAT: iptables MASQUERADE / pf) or userspace NAT (per-flow Rust TCP/UDP state machines). The RTP carrier is lossy, so the guest's own TCP handles any retransmission end-to-end.
+- `'Q'` (0x51) — **SOCKS5 over QUIC.** Because the RTP carrier is lossy (best-effort, like UDP), the SOCKS5 path runs a **QUIC** connection layered on top of it to get reliability + congestion control: the client's local SOCKS5 listener feeds each proxied TCP connection into a QUIC stream → quinn's datagrams cross the carrier as `'Q'` frames → the server's QUIC acceptor demuxes the streams and opens a host socket per SOCKS5 dial. So QUIC is the transport that carries SOCKS5; the RTP carrier just ferries QUIC's datagrams.
 
-So in client mode the WS is **automatically paused while a call is in progress** (the push channel is unnecessary mid-call) and resumed when the call ends. In server mode it stays up unconditionally so `callReceived` pushes can reach the daemon.
+Apps choose between them by configuring SOCKS5 vs. using the system VPN route.
 
-**Transport — LiveKit DTLS-encrypted data channel.** The published audio track's encoded payload is hijacked (via a custom `FrameTransformer`) and replaced with our own bytes — the SFU sees opaque "audio" and relays it; on the other end we replace the bytes back. One byte at the start tags each frame:
+**Server NAT** owns egress to the open internet. The SFU only relays the media carrier; it never sees the unwrapped tunnel data and doesn't route to the internet itself.
 
-- `'I'` (0x49) — **raw IP packets** for VPN / TUN mode. Client kernel TUN reads IP → ships → server side either kernel-TUN (the host kernel forwards via iptables MASQUERADE / pf) or userspace NAT (per-flow Rust TCP/UDP state machines).
-- `'Q'` (0x51) — **QUIC datagrams** for SOCKS5 mode. Client's local SOCKS5 listener wraps app traffic into a QUIC stream → server's QUIC acceptor demuxes and opens host sockets per SOCKS5 dial.
-
-Both modes can be active on one tunnel — apps choose by configuring SOCKS5 vs going through the VPN system route.
-
-**Server NAT** owns egress to the open internet. The SFU just relays the DTLS channel; it never sees the unwrapped tunnel data and doesn't route to the internet itself.
-
-**What Bale sees**: signaling metadata (who calls whom, when, for how long), the IP addresses your traffic ends up reaching, and any plaintext-protocol payloads. The SOCKS5/QUIC layer adds TLS-1.3 between client and server but uses **self-signed certs with no CA validation**, so an active adversary at the SFU can transparent-MITM it. Treat the tunnel as "IP reachability" not "end-to-end privacy" — use HTTPS at the app level. Details in the [privacy note](#%EF%B8%8F-privacy--encryption) above.
+**Privacy.** The relay sees the IP addresses your traffic reaches and any plaintext-protocol payloads. The SOCKS5/QUIC layer adds TLS 1.3 between client and server, but with **self-signed certs and no CA validation**, so an active adversary at the relay can transparently MITM it. Treat the tunnel as "IP reachability," not end-to-end privacy — use HTTPS at the app level. Details in the [privacy note](#%EF%B8%8F-privacy--encryption) above.
 
 ---
 

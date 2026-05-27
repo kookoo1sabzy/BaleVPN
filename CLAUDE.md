@@ -10,7 +10,7 @@ A reverse-engineering research project for the **Bale messenger** web app (`web.
 - **`bale-vpn-android/`** — Android app that runs as either VPN **client** (device-wide TUN via `VpnService`, optional LAN-facing SOCKS5) or VPN **server** (userspace NAT, no root). Mode-toggle in the app's main screen.
 
 Both apps consume the same Rust stack:
-- `lktunnel-rust/` — LiveKit-backed transport, QUIC channel, userspace NAT
+- `lktunnel-rust/` — WebRTC transport on **`webrtc-rs`** (pure Rust, no libwebrtc) + QUIC channel + userspace NAT. Reuses crates.io `livekit-api` (signal client) + `livekit-protocol` (wire types); no vendored crates, no patches.
 - `lk-signaling-rust/` — generic signaling trait
 - `bale-signaling-rust/` — Bale impl (WS client + RPCs + auth + contacts), single source of truth for the protocol
 
@@ -127,7 +127,7 @@ Calls from callers in neither list land in a **pending** state with a notificati
 
 ## Architecture overview
 
-Both Rust and Android peers join a LiveKit room established via a Bale call between two contacts; IP packets travel between the peers over the resulting encrypted link. The transport (`lktunnel-rust/`) and the Bale protocol (`bale-signaling-rust/`) are shared crates; the `bale-vpn-rust` binary consumes them directly, the Android app via JNI shims under `bale-vpn-android/rust/`.
+Both Rust and Android peers join a LiveKit-SFU room established via a Bale call between two contacts, on the pure-Rust **`webrtc-rs`** stack (the LiveKit two-PeerConnection model — publisher + subscriber — driven by the reused `livekit-api` signal client). Tunnel data rides the room's **RTP media carrier**: our bytes are written directly as the payload of one published Opus "audio" track (`write_sample` — no codec, no data channel) and read straight back off the peer's track (`read_rtp`); the SFU relays opaque Opus RTP and never sees the unwrapped data. A one-byte frame tag selects the mode — `'I'` raw IP (VPN/TUN) or `'Q'` QUIC datagrams (which carry SOCKS5, since the carrier is lossy). The transport (`lktunnel-rust/`) and the Bale protocol (`bale-signaling-rust/`) are shared crates; the `bale-vpn-rust` binary consumes them directly, the Android app via JNI shims under `bale-vpn-android/rust/`.
 
 **Client → server flow**: client's kernel TUN reads IP packets → ships them across the link → server-side NAT (kernel-TUN or userspace) forwards to the internet.
 

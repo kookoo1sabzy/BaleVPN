@@ -21,16 +21,9 @@ BaleVPN/
 │       ├── proto/              # Extracted .proto files (regenerated)
 │       └── src/                # WS client + auth + contacts + dispatch
 │
-├── lktunnel-rust/              # LiveKit transport + QUIC + NAT + TUN core
-│   ├── lktunnel/               # ─ the library
-│   ├── cli/                    # ─ standalone CLI (dev/test harness)
-│   ├── patches/                # Patches applied to vendored crates
-│   │   ├── apply.sh            # Regenerates vendor/ from registry + patches
-│   │   ├── libwebrtc-*.patch
-│   │   ├── livekit-*.patch
-│   │   ├── livekit-api-*.patch
-│   │   └── webrtc-sys-*.patch
-│   └── vendor/                 # GITIGNORED; emitted by apply.sh
+├── lktunnel-rust/              # WebRTC (webrtc-rs) transport + QUIC + NAT + TUN core
+│   ├── lktunnel/               # ─ the library (rtc engine, carrier, NAT, TUN)
+│   └── cli/                    # ─ standalone CLI (dev/test harness)
 │
 ├── bale-vpn-rust/              # The unified Rust binary (client / server / GUI)
 │   └── bale-vpn/
@@ -92,7 +85,7 @@ Three "shared core" pure-Rust libraries do the actual work; the desktop binary a
 Edge details:
 
 - `bale-vpn-rust` depends on **all three** core crates: `lk-signaling` + `bale-signaling` + `lktunnel`.
-- `bale-signaling` depends on `lktunnel` — it constructs `LkTunnel`s through `place_call_with_tunnel` / `wrap_incoming_session` so the LK side's lifecycle can drive the WS rule engine without app glue. This pulls the LK transport (and libwebrtc) into anyone using `bale-signaling`. Both consuming workspaces (`bale-signaling-rust` and `bale-vpn-rust`) declare matching `[patch.crates-io]` entries pointing at `lktunnel-rust/vendor/`.
+- `bale-signaling` depends on `lktunnel` — it constructs `LkTunnel`s through `place_call_with_tunnel` / `wrap_incoming_session` so the transport's lifecycle can drive the WS rule engine without app glue. The transport is pure Rust (`webrtc-rs` + crates.io `livekit-api`/`livekit-protocol`), so there's nothing to vendor and no `[patch.crates-io]` anywhere.
 - `bale-signaling-android` depends on `bale-signaling` + `lk-signaling` + `jni-shared`.
 - `lktunnel-android` depends on `lktunnel` + `jni-shared`.
 - `jni-shared` is consumed only by the two Android shims; it carries the generic `HandleRegistry<T>`, the shared tokio runtime, the JavaVM cache, and the async-JNI continuation bridge.
@@ -108,9 +101,9 @@ Two independent channels per session:
 
 1. **Signaling** — Bale's WebSocket at `wss://next-ws.bale.ai/ws/`. Carries the call setup RPCs (`StartCall`, `AcceptCall`, `DiscardCall`), presence (`SetOnline`), contact list, and incoming-call push notifications. Lives in `bale-signaling-rust/`.
 
-2. **Transport** — a LiveKit room joined per active call. The encoded video payload of one published track is repurposed as a raw byte channel that carries QUIC datagrams. Lives in `lktunnel-rust/`. The patches in `lktunnel-rust/patches/` add a `FrameTransformer` to webrtc-sys / libwebrtc that lets us substitute our bytes for the encoded video frame, hidden from LiveKit's media path.
+2. **Transport** — a LiveKit-SFU room joined per active call, on the pure-Rust **`webrtc-rs`** stack (no libwebrtc). Lives in `lktunnel-rust/` (`rtc.rs` = the engine, `rtp.rs` = framing). The tunnel bytes are written **directly** as the RTP payload of one published Opus "audio" track (`TrackLocalStaticSample::write_sample`) — there's no codec and no data channel; the SFU relays opaque Opus RTP and the far end reads the bytes back off `read_rtp`. RTP-over-SRTP looks like an ordinary voice call and survives DPI that fingerprints SCTP data channels.
 
-A `PeerConnectionFactory` initializes once per process; each call gets its own `Room::connect` plus a per-tunnel mio reactor (`dispatcher.rs`) for the QUIC + NAT + TUN side.
+Each call gets its own `rtc::Engine` (LiveKit's two-PeerConnection model — publisher + subscriber — over the reused `livekit-api` signal client, impersonating the JS SDK via `sdk=js`), plus a per-tunnel mio reactor (`dispatcher.rs`) for the QUIC + NAT + TUN side. No global `PeerConnectionFactory` — webrtc-rs builds each PC from an `APIBuilder` (`make_api()`).
 
 ### WS lifecycle policy (input-driven, in the library)
 
@@ -145,7 +138,7 @@ want_up = token.is_some()
 
 - **Rust binary**: `lktunnel-rust` exposes a process-wide `set_global_observer` slot; `BaleSignaling::new` installs one that flips `call_active` on every `Connected` / `Disconnected` event. Gated behind the `lktunnel` Cargo feature on `bale-signaling`, enabled by `bale-vpn-rust`.
 
-- **Android**: the `lktunnel` Cargo feature is OFF on the Android shim (would pull `libwebrtc` into `libbale_signaling.so`, double-linking it against the copy in `liblktunnel.so` and tripping `fdsan` on stdout). Instead, the Kotlin `LkTunnel` wrapper has its own process-wide `globalLifecycleObserver` slot — `NativeObserver.onEvent` chains it on every `connected`/`disconnected`. `BaleConnection.init` installs the observer to forward into `signaling.setCallActive(...)`. Same end behaviour as the Rust binary: any LkTunnel built anywhere auto-pauses the WS, no per-call wiring in `BaleVpnService` / `BaleServerService`.
+- **Android**: the `lktunnel` Cargo feature is OFF on the Android shim — `libbale_signaling.so` and `liblktunnel.so` are separate `.so`s, so enabling it would statically link a second copy of the whole transport (webrtc-rs + quinn + tokio) into the signaling lib for no benefit. Instead, the Kotlin `LkTunnel` wrapper has its own process-wide `globalLifecycleObserver` slot — `NativeObserver.onEvent` chains it on every `connected`/`disconnected`. `BaleConnection.init` installs the observer to forward into `signaling.setCallActive(...)`. Same end behaviour as the Rust binary: any LkTunnel built anywhere auto-pauses the WS, no per-call wiring in `BaleVpnService` / `BaleServerService`.
 
 ### Server-side data flow
 
@@ -179,7 +172,7 @@ In kernel mode each accepted call gets its own `bale<K>` (Linux) or `utunN` (mac
 
 ### Client-side data flow
 
-The two ingress sources are independent — either or both can be active. They use **different frame types** inside the same LiveKit data channel; the server's `LkTunnel` demuxes on the first byte.
+The two ingress sources are independent — either or both can be active. They use **different frame types** inside the same RTP media carrier; the server's `LkTunnel` demuxes on the first byte.
 
 ```
    Local apps                            Host networking stack
@@ -199,12 +192,13 @@ The two ingress sources are independent — either or both can be active. They u
                            │
                            ▼
                   LkTunnel send pipeline
-                  (sender task → audio track)
+                  (sender task → RtpSender)
                            │
                            ▼
-           LiveKit room — one published audio track,
-           encoded Opus payload byte-substituted with
-           our frames via the FrameTransformer patch
+           webrtc-rs RTP carrier — frames written
+           directly as one published Opus track's
+           payload (write_sample); SFU relays opaque
+           Opus, far end reads them off read_rtp
                            │
                            ▼
                  server-side LkTunnel
@@ -220,7 +214,7 @@ The two ingress sources are independent — either or both can be active. They u
                       ── internet ──
 ```
 
-The client opens **one** LiveKit call to the configured server peer. SOCKS5 connections become QUIC streams over a single QUIC connection riding the LK data channel; TUN-routed IP packets ride the **same** data channel but go in as raw `FRAME_TYPE_IP` payloads (no QUIC). The server-side `LkTunnel` peeks the first byte to route each inbound frame to the QUIC acceptor or the NAT/TUN bridge respectively.
+The client opens **one** LiveKit call to the configured server peer. SOCKS5 connections become QUIC streams over a single QUIC connection riding the RTP carrier; TUN-routed IP packets ride the **same** carrier but go in as raw `FRAME_TYPE_IP` payloads (no QUIC — the guest's own TCP handles loss). The server-side `LkTunnel` peeks the first byte to route each inbound frame to the QUIC acceptor or the NAT/TUN bridge respectively.
 
 ### Android JNI bridge
 
@@ -241,39 +235,22 @@ JNI handles are opaque `jlong` ids that index into the registry, so concurrent K
 | Tool | Required for | Notes |
 |---|---|---|
 | Rust stable | every build | `rustup default stable` |
-| `patch` | first build only | Used by `lktunnel-rust/patches/apply.sh` |
 | Python 3 | regenerating protos | `reverse_engineering/extract_proto.py`; not needed if you don't touch the protocol |
 | OpenJDK 17 + Android SDK + NDK | Android build | NDK pinned to `28.0.13004108` in `bale-vpn-android/androidApp/build.gradle.kts` |
 | `cargo-ndk` | Android Rust build | `cargo install cargo-ndk --locked`; auto-installed by the Android workflow |
-| Linux: GTK / GLib / ALSA / Pulse / DBus / udev dev headers | GUI build on Linux | `libgtk-3-dev libwebkit2gtk-4.1-dev libpulse-dev libasound2-dev libdbus-1-dev libudev-dev libsoup-3.0-dev libssl-dev pkg-config` |
+| Linux: GTK / GLib / webkit2gtk dev headers | GUI build on Linux | `libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libssl-dev pkg-config` (the GUI/`wry` deps; the transport is pure Rust, no audio/libwebrtc headers needed) |
 
 ### Step 1 — Rust desktop binary (`bale-vpn-rust`)
 
-The recommended path is the top-level Makefile target — it ensures the vendor tree exists, then builds:
+The transport is pure Rust now (`webrtc-rs` + crates.io `livekit-api`/`livekit-protocol`) — there's no vendored crate tree and no patch step, so a plain `cargo build` works. The Makefile targets are just convenience wrappers:
 
 ```bash
-make build              # GUI binary (default features: tao + wry)
-make build-headless     # headless-only (no tao / wry, smaller binary)
+make build              # = cargo build --release          (GUI: tao + wry)
+make build-headless     # = cargo build --release --no-default-features
+# or directly:
+cd bale-vpn-rust && cargo build --release
 ./bale-vpn-rust/target/release/bale-vpn
 ```
-
-What `make build` does under the hood:
-
-1. Checks `lktunnel-rust/vendor/`. If missing or older than any of the patches, runs `lktunnel-rust/patches/apply.sh` — wipes vendor/, copies fresh upstream sources for webrtc-sys / libwebrtc / livekit / livekit-api from the cargo registry, then applies the four `.patch` files in `lktunnel-rust/patches/` (extended FFI for the byte-substituted FrameTransformer, exposed transceiver accessors, web-SDK signaling impersonation, Apple ObjC video-factory disable).
-2. Runs `cargo build --release` from `bale-vpn-rust/`.
-
-Cargo itself can't trigger step 1 automatically — `[patch.crates-io]` paths are resolved at dependency-resolution time, *before* any `build.rs` runs. So if you bypass the Makefile, you have to call `apply.sh` yourself once per checkout:
-
-```bash
-cd lktunnel-rust && ./patches/apply.sh    # only needed if you skip `make build`
-cd ../bale-vpn-rust && cargo build --release
-```
-
-Cargo features:
-
-| Feature | Default | Pulls in | Effect |
-|---|---|---|---|
-| `gui` | yes | `tao`, `wry`, `muda` | Embedded webview opens at startup; `--headless` skips the window |
 
 Cargo features:
 
@@ -289,7 +266,7 @@ JAVA_HOME=<jdk17> ./gradlew :androidApp:assembleDebug      # debug APK
 JAVA_HOME=<jdk17> ./gradlew :androidApp:assembleRelease    # release APK (needs keystore env vars)
 ```
 
-`assembleDebug` runs the custom `cargoBuild` Gradle task first (`androidApp/build.gradle.kts:128`), which invokes `cargo-ndk` to cross-compile the three JNI crates (`jni-shared`, `lktunnel-android`, `bale-signaling-android`) for `arm64-v8a`, `armeabi-v7a`, and `x86_64`. Output lands in `bale-vpn-android/rust/jniLibs/<abi>/lib*.so`; `androidApp` picks them up via `jniLibs.srcDir(file("../rust/jniLibs"))`.
+`assembleDebug` runs the custom `cargoBuild` Gradle task first, which invokes `cargo-ndk` to cross-compile the three JNI crates (`jni-shared`, `lktunnel-android`, `bale-signaling-android`) for `arm64-v8a`, `armeabi-v7a`, and `x86_64`. Output lands in `bale-vpn-android/rust/jniLibs/<abi>/lib*.so`; `androidApp` picks them up via `jniLibs.srcDir(file("../rust/jniLibs"))`. Which of those ABIs get *packaged* is set per build type via `abiFilters`: **release = arm64-v8a + armeabi-v7a** (no x86_64 — emulators only), debug = arm64-v8a + x86_64.
 
 Release signing reads:
 

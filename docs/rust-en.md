@@ -20,7 +20,7 @@ The Rust application (`bale-vpn-rust/`) is a single-binary **VPN client or serve
 |---|---|---|---|
 | `server --nat-mode userspace` (default) | Server | None | Lower than kernel mode but fully featured (SACK, RACK, TLP, PRR, Window Scaling, Timestamps) |
 | `server --nat-mode kernel` | Server | One-time root (`setcap` + `iptables` on Linux, runs as root on macOS) | Highest — kernel-managed TUN device + native NAT |
-| `client` | Client | None | SOCKS5 proxy on `127.0.0.1:1080` over the call's data channel |
+| `client` | Client | None | SOCKS5 proxy on `127.0.0.1:1080` over the call's RTP carrier (via QUIC) |
 | `client --client-tun` | Client | `CAP_NET_ADMIN` (Linux) or root (macOS) | Above + system TUN at `10.8.0.2/24` so the whole host can route through the tunnel |
 
 The default NAT mode is `userspace` (was `kernel` in the Node app). Pick `kernel` explicitly when you want max throughput and you've done the one-time setup.
@@ -34,11 +34,11 @@ The default NAT mode is `userspace` (was `kernel` in the Node app). Pick `kernel
 ```bash
 git clone <repo>
 cd BaleVPN
-make build                                         # patches + cargo build --release
+make build                                         # = cargo build --release
 ./bale-vpn-rust/target/release/bale-vpn            # opens a window
 ```
 
-`make build` first regenerates `lktunnel-rust/vendor/` from patched crates (only if missing or out-of-date), then runs `cargo build --release`. If you'd rather call cargo directly, run `./patches/apply.sh` once per checkout first — cargo can't auto-trigger it because the patched paths are resolved before any build script runs.
+The transport is pure Rust (`webrtc-rs` + crates.io `livekit-api`/`livekit-protocol`) — no vendored crates and no patch step, so `make build` is just `cargo build --release` (or run `cd bale-vpn-rust && cargo build --release` directly).
 
 For headless / server deployments (smaller binary, no tao/wry deps):
 
@@ -244,7 +244,7 @@ All three (admission, blacklist, max-clients) are persisted to disk on every cha
 
 ## Client mode details
 
-In client mode, the daemon places one call to the configured server peer. The resulting LiveKit data channel carries QUIC, and the local SOCKS5 listener forwards every accepted connection over QUIC to the server, which dials it on the real internet.
+In client mode, the daemon places one call to the configured server peer. The resulting RTP media carrier (webrtc-rs) ferries QUIC, and the local SOCKS5 listener forwards every accepted connection over QUIC to the server, which dials it on the real internet.
 
 - **SOCKS5 only** (`bale-vpn client`): the SOCKS5 listener binds `127.0.0.1:1080` by default. Configure individual apps (browser, curl, etc.) to use this proxy.
 - **SOCKS5 + system TUN** (`bale-vpn client --client-tun`): in addition to SOCKS5, opens a TUN device at `10.8.0.2/24`. You're responsible for the routing — typically:
@@ -287,7 +287,7 @@ Single JSON file at `<binary-dir>/.bale-vpn_config.json`, mode 0600, atomic-rena
   "port":        3001,
   "peerId":      "1234567890",
   "socks5Port":  1080,
-  "admission":   ["1234567890"],
+  "admission":   ["9876543210"],
   "blacklist":   [],
   "maxClients":  5
 }
