@@ -17,6 +17,13 @@
 -keep class ai.bale.proxy.LkTunnel { *; }
 -keep class ai.bale.proxy.LkTunnel$* { *; }
 
+# The async-JNI continuation bridge (jni-shared `spawn_with_continuation`).
+# Rust resolves `onSuccess(Object)` / `onError(String)` BY NAME on the
+# passed-in instance — no Java caller references them, so without this R8
+# renames them and the native call fails at runtime with
+# `NoSuchMethodError: ...NativeContinuation.onSuccess(Ljava/lang/Object;)V`.
+-keep class ai.bale.proxy.NativeContinuation { *; }
+
 # JNI result/marshaling classes the bale-signaling Rust shim looks up
 # via `env.find_class(...)` in JNI_OnLoad (bale-signaling-android
 # libjni.rs) and then constructs / populates by field — e.g.
